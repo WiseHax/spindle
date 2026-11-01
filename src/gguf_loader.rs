@@ -37,6 +37,7 @@ pub enum GgmlType {
     Q5K = 13,
     Q6K = 14,
     Q8K = 15,
+    BF16 = 30,
     Unknown(u32),
 }
 
@@ -57,6 +58,7 @@ impl From<u32> for GgmlType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            30 => Self::BF16,
             other => Self::Unknown(other),
         }
     }

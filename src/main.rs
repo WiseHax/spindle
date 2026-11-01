@@ -18,6 +18,7 @@ mod smollm_chat;
 mod worker_pool;
 mod mmap_file;
 mod probe;
+mod quant;
 mod transformer;
 
 use std::{
@@ -791,8 +792,8 @@ fn parse_cli() -> CliConfig {
 // --------------------------------------------------------------------- main
 
 fn main() -> Result<()> {
-    if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")) {
-        eprintln!("CPU lacks AVX2/FMA");
+    if !(is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c")) {
+        eprintln!("CPU lacks AVX2/FMA/F16C");
         std::process::exit(1);
     }
     let cli = parse_cli();
