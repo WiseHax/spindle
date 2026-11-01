@@ -31,6 +31,9 @@ need roughly a 25% cache hit rate.
 - Temperature / top-k / top-p / min-p sampling with a seed
 - `Q4_0`, `Q4_1`, `Q5_1`, `Q5_K`, `F16`, `BF16` kernels, all kernels tested against a scalar
   dequantizer
+- Memory safety net: KV-cache sized to free RAM, working-set governor (`--reserve`,
+  `--ram-budget`) that shrinks under pressure and recovers, background prefetch of the next
+  layer and chosen experts
 - MoE FFN (softmax router, top-k, shared expert), Qwen2/Qwen3 attention, NEOX RoPE,
   byte-level BPE, stop tokens from metadata, per-layer weights resolved at load time
 
@@ -41,10 +44,9 @@ need roughly a 25% cache hit rate.
    Qwen first, then a Qwen MoE, and compare output against llama.cpp.
 2. **Streaming file layout.** A one-time repack that puts each expert's tensors next to each
    other, 4 KiB aligned, so one large read gets a whole expert. The original GGUF stays as is.
-3. **Expert cache with a memory governor.** Cache experts in RAM, shrink the cache when Windows
-   reports low memory and grow it back when memory frees up. A `--ram-budget` hard limit on top.
-   Test: open a pile of browser tabs mid-generation. It should slow down, not crash, and
-   recover afterwards.
+3. **Expert cache.** The governor now caps memory and recovers under pressure (see "Done"),
+   but which experts stay resident is left to Windows. An explicit cache that keeps the most
+   used experts would raise the hit rate.
 4. **Prefetch on the E-cores.** P-cores do the math. E-cores predict which experts come next and
    issue the reads (IOCP, ~8 in flight) and manage the cache.
 5. **Draft-guided prefetch.** A small draft model runs a few tokens ahead. Running the big

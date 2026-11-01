@@ -27,6 +27,9 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
   `Q4_K`, `Q5_K`, `Q6_K`, each tested against a scalar reference
 - Matvecs split across the P-cores with a persistent thread pool
 - Weights memory-mapped, not copied
+- Memory safety net for models bigger than RAM: the KV-cache is sized to free memory at
+  startup, a governor caps spindle's working set so other apps keep their RAM, and weights
+  that are about to be used are prefetched in large reads from a background thread
 - Multi-turn chat with a KV-cache that slides when it fills up
 - Temperature, top-k, top-p, min-p sampling with a seed
 - `--probe` to measure your RAM and SSD bandwidth
@@ -82,10 +85,15 @@ quits.
 | `--repeat-penalty` | 1.1 | |
 | `--seed` | random | printed at startup, reuse it to get the same replies |
 | `--probe` | | measure RAM/SSD speed instead of chatting |
+| `--reserve` | 1024 | MiB of RAM to always leave free for other apps |
+| `--ram-budget` | | hard cap on spindle's resident memory in MiB |
 | `$env:CHAT_THREADS` | 4 | |
 | `$env:CHAT_CTX` | 1024 | KV-cache length in tokens |
 
 For honest SSD numbers, run `--probe` against a file of 1 GB or more.
+
+`$env:SPINDLE_FORCE_STREAM = "1"` makes spindle treat any model as too big for RAM. Useful for
+testing the low-memory path with a small model.
 
 ## Layout
 
@@ -95,7 +103,8 @@ For honest SSD numbers, run `--probe` against a file of 1 GB or more.
 | `src/quant.rs` | quant formats, AVX2 kernels, scalar reference, kernel tests |
 | `src/gguf_loader.rs` | GGUF parser |
 | `src/worker_pool.rs` | thread pool used for matvecs |
-| `src/mmap_file.rs` | memory-mapped model files, RAM stats |
+| `src/mmap_file.rs` | memory-mapped model files, background prefetcher |
+| `src/memory_guard.rs` | working-set governor |
 | `src/probe.rs` | bandwidth probe |
 | `src/main.rs` | CLI and CPU topology (P-core / E-core detection) |
 | `src/q4k_gemv.rs`, `transformer.rs`, `moe_engine.rs`, `rio_mesh.rs` | older experiments behind the synthetic benchmark, not used by chat |

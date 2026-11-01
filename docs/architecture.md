@@ -130,6 +130,33 @@ by `-n_discard`. RoPE rotations add up, so this gives the same result as recompu
 
 `--temp 0` skips all of that and takes the argmax.
 
+## Not crashing the laptop
+
+Running a model bigger than free RAM fails in three ways, and each has a guard:
+
+1. **A big allocation fails and the process aborts.** The KV-cache is the only large private
+   allocation. At load it is sized to at most a quarter of free RAM and allocated with
+   `try_reserve`, so a tight machine gets a shorter context and a message instead of an abort.
+2. **The desktop freezes.** Mapped weights don't fail allocations, but as they page in, our
+   working set grows and Windows starts trimming other programs. `memory_guard.rs` sets a hard
+   working-set cap with `SetProcessWorkingSetSizeEx` and moves it every 250 ms so that
+   `--reserve` MiB (default 1024) stay free. Over the cap, Windows recycles our own model
+   pages, which go to the standby list and usually come back as soft faults. The cap is only
+   switched on when the model doesn't fit in RAM, or when `--ram-budget` is given.
+3. **4 KiB page faults are slow.** When the model doesn't fit, a background thread issues
+   `PrefetchVirtualMemory` for the next layer's attention weights and, as soon as the router
+   has picked them, for the chosen experts. That turns page faults into large reads that
+   overlap with compute. It runs off the compute thread because the call walks every page,
+   which costs as much as the matvec when pages are already resident.
+
+Tested on the dev laptop with SmolLM2-360M forced into streaming mode:
+
+- `--ram-budget 300` with a 368 MiB model: working set held at 299 MiB, same output, 7.7 tok/s.
+- Another process grabbing 600 MB mid-chat with `--reserve 1200`: the cap dropped to the floor
+  (272 MiB), replies kept going at 13-30 tok/s, the cap grew back once the memory was released,
+  and all four replies finished.
+- `CHAT_CTX=100000`: the KV-cache was shrunk from 8192 to 4365 tokens to fit.
+
 ## The speed limit
 
 Generating a token reads every weight once and does little math per byte, so:
