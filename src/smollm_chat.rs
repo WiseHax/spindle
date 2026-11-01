@@ -10,7 +10,7 @@
 use std::{
     arch::x86_64::*,
     collections::HashMap,
-    io::{Error, ErrorKind, Write},
+    io::{Error, ErrorKind},
     time::Instant,
 };
 
@@ -590,7 +590,7 @@ impl SmolLm2Engine {
         // `SPINDLE_FORCE_STREAM=1` treats any model as too big for RAM, to test that path.
         let force_stream = std::env::var("SPINDLE_FORCE_STREAM").is_ok_and(|v| v == "1");
         let prefetched = !force_stream && raw_bytes.prefetch_if_fits();
-        println!(
+        crate::vlog!(
             "[model:mmap] {:.1} MiB mapped ({})",
             raw_bytes.len() as f64 / (1024.0 * 1024.0),
             if prefetched { "prefetching into page cache" } else { "paged on demand: larger than half of free RAM" }
@@ -619,7 +619,7 @@ impl SmolLm2Engine {
             ));
         }
         if max_seq < wanted {
-            println!("[model:preflight] only {} MiB free: KV-cache shrunk from {wanted} to {max_seq} tokens", avail >> 20);
+            crate::ui::note(&format!("only {} MiB of RAM free: context limited to {max_seq} tokens", avail >> 20));
         }
         let kv_mib = (max_seq * per_pos) as f64 / (1024.0 * 1024.0);
         let alloc = |n: usize| -> std::io::Result<Vec<u16>> {
@@ -630,7 +630,7 @@ impl SmolLm2Engine {
         };
         let k_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
         let v_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
-        println!(
+        crate::vlog!(
             "[model:config] {} | dim={} layers={} heads={}/{} kv (head_dim {}) vocab={} rope_theta={}{} | KV-cache {max_seq} pos = {kv_mib:.1} MiB",
             idx.architecture,
             c.dim,
@@ -644,7 +644,7 @@ impl SmolLm2Engine {
         );
         if c.n_expert > 0 {
             let moe_layers = layers.iter().filter(|l| matches!(l.ffn, FfnKind::Moe(_))).count();
-            println!(
+            crate::vlog!(
                 "[model:moe] {moe_layers} MoE layers, {} of {} experts per token{}",
                 c.n_expert_used,
                 c.n_expert,
@@ -806,7 +806,7 @@ impl SmolLm2Engine {
                 (pinned, Some(first))
             }
             Err(e) => {
-                eprintln!("[warn] layer streaming unavailable ({e}); paging layers instead");
+                crate::ui::note(&format!("layer streaming unavailable ({e}), paging layers instead"));
                 (pinned, None)
             }
         }
@@ -879,7 +879,7 @@ impl SmolLm2Engine {
             }
         }
         self.cur_pos -= n_discard;
-        eprintln!("\n[kv:shift] evicted {n_discard} old tokens (kept {} system + {n_move} recent)", self.n_keep);
+        crate::vlog!("[kv:shift] evicted {n_discard} old tokens (kept {} system + {n_move} recent)", self.n_keep);
     }
 
     /// Feeds `ids` into the KV-cache starting at `cur_pos` and returns the last hidden state.
@@ -1240,13 +1240,16 @@ impl SmolLm2Engine {
         out
     }
 
-    /// Generates a conversational reply to `user_prompt`, printing each token live.
-    /// The KV-cache persists across calls, so earlier turns stay in context; only the new
-    /// user turn is prefilled. Call `reset_kv()` to start a fresh conversation.
-    pub unsafe fn generate_reply(&mut self, user_prompt: &str, max_new_tokens: usize) -> (String, f64, usize) {
-        print!("\n[{}]: ", self.idx.model_name);
-        let _ = std::io::stdout().flush();
-
+    /// Generates a conversational reply to `user_prompt`, passing text to `on_text` as it is
+    /// produced (whole UTF-8 characters only). The KV-cache persists across calls, so earlier
+    /// turns stay in context; only the new user turn is prefilled. Call `reset_kv()` to start
+    /// a fresh conversation. Returns `(reply, seconds, tokens processed)`.
+    pub unsafe fn generate_reply(
+        &mut self,
+        user_prompt: &str,
+        max_new_tokens: usize,
+        on_text: &mut dyn FnMut(&str),
+    ) -> (String, f64, usize) {
         let t0 = Instant::now();
         if self.n_keep == 0 {
             let sys = self.encode_system();
@@ -1282,8 +1285,7 @@ impl SmolLm2Engine {
             };
             let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
             pending.drain(..valid);
-            print!("{piece}");
-            let _ = std::io::stdout().flush();
+            on_text(&piece);
             reply.push_str(&piece);
             recent.push(next_id);
             generated += 1;
@@ -1292,7 +1294,7 @@ impl SmolLm2Engine {
         }
         if !pending.is_empty() {
             let piece = String::from_utf8_lossy(&pending).into_owned();
-            print!("{piece}");
+            on_text(&piece);
             reply.push_str(&piece);
         }
         // Close the assistant turn in the cache (`<|im_end|>\n`) so the next user turn
@@ -1300,7 +1302,6 @@ impl SmolLm2Engine {
         let mut closing = vec![self.im_end];
         closing.extend(self.encode_bpe_segment("\n"));
         self.feed(&closing);
-        println!();
         let secs = t0.elapsed().as_secs_f64();
         (reply, secs, turn_ids.len() + generated)
     }
@@ -1322,7 +1323,7 @@ mod tests {
             let pieces: Vec<String> = ids.iter().map(|&id| format!("{id}:{:?}", eng.idx.vocab[id])).collect();
             println!("\nPrompt: {prompt:?}\nTokens: {}", pieces.join(", "));
             unsafe {
-                let (reply, secs, toks) = eng.generate_reply(prompt, 48);
+                let (reply, secs, toks) = eng.generate_reply(prompt, 48, &mut |_| {});
                 println!("[test:stats] {toks} toks in {secs:.2}s");
                 assert!(!reply.trim().is_empty(), "Expected non-empty reply for prompt {prompt:?}");
             }
