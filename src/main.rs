@@ -912,6 +912,9 @@ fn main() -> Result<()> {
                         (toks as f64) / s,
                         s
                     );
+                    if let Some((mib, touched, total)) = engine.take_moe_stats() {
+                        println!("[moe] {mib:.1} MiB of expert weights read per token, {touched}/{total} experts used this turn");
+                    }
                 }
             }
             return Ok(());
