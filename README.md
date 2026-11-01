@@ -7,7 +7,9 @@ either crawl or take the whole machine down with them. spindle doesn't use llama
 or any ML framework. The GGUF parser, tokenizer, transformer, AVX2 kernels and thread pool
 are all in this repo.
 
-It's early. It runs SmolLM2 135M and 360M today. The goal is to run models bigger than RAM
+It's early. It runs SmolLM2 135M and 360M today, and has code paths for Qwen2/Qwen3 and
+mixture-of-experts models that pass unit tests but haven't been run on a real Qwen or MoE
+file yet. The goal is to run models bigger than RAM
 by streaming weights from the NVMe drive, mostly MoE models. That part isn't done yet; see
 [docs/roadmap.md](docs/roadmap.md).
 
@@ -15,6 +17,11 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
 
 - GGUF v3 parsing (metadata, tensors, vocab, BPE merges)
 - Llama-style models: RMSNorm, RoPE, grouped-query attention, SwiGLU
+- Qwen2/Qwen3 attention details: QKV bias, per-head Q/K norm, NEOX RoPE, `head_dim`
+  different from `dim / heads` (unit-tested, not yet run on a real Qwen file)
+- MoE layers: softmax router, top-k experts, optional shared expert, with per-turn stats on
+  how many MiB of experts each token reads (unit-tested, not yet run on a real MoE file)
+- Byte-level BPE, so non-ASCII text (ñ, emoji, CJK) round-trips instead of being dropped
 - Model sizes read from GGUF metadata, nothing hardcoded
 - AVX2/FMA kernels for `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`,
   `Q4_K`, `Q5_K`, `Q6_K`, each tested against a scalar reference
@@ -24,7 +31,8 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
 - Temperature, top-k, top-p, min-p sampling with a seed
 - `--probe` to measure your RAM and SSD bandwidth
 
-Not yet: `Q2_K`, `Q3_K` and the IQ formats, MoE models, streaming from SSD, Linux/macOS, ARM.
+Not yet: `Q2_K`, `Q3_K` and the IQ formats, explicit SSD streaming and expert caching,
+Linux/macOS, ARM.
 
 ## Speed
 
@@ -83,7 +91,7 @@ For honest SSD numbers, run `--probe` against a file of 1 GB or more.
 
 | | |
 |---|---|
-| `src/smollm_chat.rs` | the engine: forward pass, tokenizer, sampler, chat |
+| `src/smollm_chat.rs` | the engine: forward pass (dense and MoE), tokenizer, sampler, chat |
 | `src/quant.rs` | quant formats, AVX2 kernels, scalar reference, kernel tests |
 | `src/gguf_loader.rs` | GGUF parser |
 | `src/worker_pool.rs` | thread pool used for matvecs |

@@ -31,11 +31,14 @@ need roughly a 25% cache hit rate.
 - Temperature / top-k / top-p / min-p sampling with a seed
 - `Q4_0`, `Q4_1`, `Q5_1`, `Q5_K`, `F16`, `BF16` kernels, all kernels tested against a scalar
   dequantizer
+- MoE FFN (softmax router, top-k, shared expert), Qwen2/Qwen3 attention, NEOX RoPE,
+  byte-level BPE, stop tokens from metadata, per-layer weights resolved at load time
 
 ## Next
 
-1. **MoE support.** Router, top-k experts, shared experts (Qwen MoE style), first running fully
-   from mmap to get correct output before worrying about speed.
+1. **Run a real MoE end to end.** The MoE layer, Qwen attention and NEOX RoPE are written and
+   unit-tested, but no Qwen or MoE GGUF has gone through them yet. Validate on a small dense
+   Qwen first, then a Qwen MoE, and compare output against llama.cpp.
 2. **Streaming file layout.** A one-time repack that puts each expert's tensors next to each
    other, 4 KiB aligned, so one large read gets a whole expert. The original GGUF stays as is.
 3. **Expert cache with a memory governor.** Cache experts in RAM, shrink the cache when Windows

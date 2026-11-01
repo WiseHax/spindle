@@ -20,6 +20,10 @@ them back later. Chat gets slower instead of the laptop running out of memory.
 
 ## Tokenizing
 
+Vocab strings use GPT-2's byte alphabet: every byte maps to a printable char (space is
+`Ġ`, newline `Ċ`). Encoding maps input bytes into that alphabet, decoding maps them back and
+holds partial UTF-8 characters until the rest arrives.
+
 `encode_bpe_segment` splits text GPT-2 style (a leading space sticks to the next word and
 becomes `Ġ`, newlines become `Ċ`), then applies BPE merges in rank order. Turns are wrapped in
 ChatML:
@@ -37,8 +41,30 @@ x -> RMSNorm -> Q,K,V -> RoPE -> store K,V -> attention -> output proj -> add to
   -> RMSNorm -> gate, up -> SiLU(gate) * up -> down proj -> add to x
 ```
 
+Qwen models add a bias to Q, K and V, and Qwen3 RMS-normalizes each Q and K head before
+RoPE. Both are picked up automatically if the tensors exist. All tensor lookups happen once
+at load (`resolve_layers`), so the per-token path never formats a tensor name.
+
 Then a final RMSNorm and the LM head give one logit per vocab entry. The LM head is
 `output.weight` if the model has one, otherwise the embedding matrix.
+
+RoPE comes in two layouts. Llama GGUFs rotate adjacent pairs `(2i, 2i+1)`; Qwen rotates
+`(i, i + head_dim/2)` ("NEOX"). The architecture name decides which.
+
+## Mixture of experts
+
+In an MoE layer the FFN is replaced by `n_expert` smaller FFNs stored as 3D tensors
+(`ffn_gate_exps` is `[dim, n_ff, n_expert]`). A `Mat` view with `.expert(e)` points at one
+expert's slab, so the same matvec kernels work on it. Per token:
+
+1. the router (`ffn_gate_inp`) gives one logit per expert, softmaxed
+2. the top `expert_used_count` experts are picked; their weights are renormalized for Qwen3
+   and Mixtral, not for Qwen2-MoE
+3. each chosen expert runs as a normal SwiGLU block and the outputs are summed by weight
+4. Qwen2-MoE also adds a shared expert scaled by `sigmoid(shared_gate . x)`
+
+Only the chosen experts' pages are touched, which is what makes streaming from SSD
+possible later. The chat prints how many MiB of experts each token read.
 
 Attention is grouped-query (SmolLM2-135M has 9 query heads sharing 3 K/V heads) and uses an
 online softmax, so the score vector is never stored.
