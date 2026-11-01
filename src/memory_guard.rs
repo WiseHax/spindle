@@ -30,8 +30,10 @@ use crate::mmap_file::available_ram_bytes;
 
 pub const MIB: u64 = 1024 * 1024;
 
-/// RAM left free for Windows and other apps unless `--reserve` says otherwise.
-pub const DEFAULT_RESERVE: u64 = 1024 * MIB;
+/// RAM left free for Windows and other apps unless `--reserve` says otherwise. "Available"
+/// already includes the standby cache, which other apps can take instantly, so this doesn't
+/// need to be large. 1 GiB squeezed a 610 MiB model on a busy 8 GB laptop for no benefit.
+pub const DEFAULT_RESERVE: u64 = 512 * MIB;
 /// Ignore cap changes smaller than this to avoid a syscall every tick.
 const HYSTERESIS: u64 = 16 * MIB;
 
@@ -43,6 +45,9 @@ pub struct Budget {
     pub floor: u64,
     /// User limit from `--ram-budget`, if any.
     pub ceiling: Option<u64>,
+    /// Minimum working set. Must cover pinned (`VirtualLock`ed) weights, since Windows only
+    /// lets a process lock about as much as its minimum working set.
+    pub min_ws: u64,
 }
 
 /// Next working-set cap: we may grow into whatever free RAM exceeds the reserve, and must
@@ -66,13 +71,27 @@ pub fn process_counters() -> (u64, u64, u64) {
     }
 }
 
-fn apply_cap(cap: u64) -> bool {
+fn apply_cap(min_ws: u64, cap: u64) -> bool {
     unsafe {
         SetProcessWorkingSetSizeEx(
             GetCurrentProcess(),
-            4 * MIB as usize,
+            min_ws.min(cap) as usize,
             cap as usize,
             QUOTA_LIMITS_HARDWS_MAX_ENABLE | QUOTA_LIMITS_HARDWS_MIN_DISABLE,
+        )
+        .is_ok()
+    }
+}
+
+/// Raises the minimum working set to `bytes` (soft minimum, no hard max) so that much can be
+/// locked. Returns false if Windows refuses.
+pub fn allow_locking(bytes: u64) -> bool {
+    unsafe {
+        SetProcessWorkingSetSizeEx(
+            GetCurrentProcess(),
+            bytes as usize,
+            (bytes + 256 * MIB) as usize,
+            QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE,
         )
         .is_ok()
     }
@@ -100,7 +119,7 @@ impl Governor {
         let (ws, _, _) = process_counters();
         let avail = available_ram_bytes();
         let cap = next_cap(ws, avail, &budget);
-        if !apply_cap(cap) {
+        if !apply_cap(budget.min_ws, cap) {
             return None;
         }
         let status = Arc::new(GovernorStatus::default());
@@ -122,7 +141,7 @@ impl Governor {
                         st.squeezes.fetch_add(1, Ordering::Relaxed);
                     }
                     let cap = next_cap(ws, avail, &budget);
-                    if cap.abs_diff(last) >= HYSTERESIS && apply_cap(cap) {
+                    if cap.abs_diff(last) >= HYSTERESIS && apply_cap(budget.min_ws, cap) {
                         last = cap;
                         st.cap.store(cap, Ordering::Relaxed);
                     }
@@ -152,7 +171,7 @@ mod tests {
     const G: u64 = 1024 * MIB;
 
     fn b(ceiling: Option<u64>) -> Budget {
-        Budget { reserve: G, floor: 300 * MIB, ceiling }
+        Budget { reserve: G, floor: 300 * MIB, ceiling, min_ws: 0 }
     }
 
     #[test]
