@@ -1,0 +1,29 @@
+[package]
+name = "spindle"
+version = "0.1.0"
+edition = "2021"
+description = "LLM inference in Rust for low-RAM Windows laptops"
+license = "MIT"
+readme = "README.md"
+keywords = ["llm", "inference", "gguf", "avx2", "quantization"]
+categories = ["science"]
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+    "Win32_System_Memory",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Networking_WinSock",
+    "Win32_System_ProcessStatus",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+

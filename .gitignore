@@ -1,0 +1,13 @@
+/target
+
+# Model weights and generated benchmark data: never commit these
+*.gguf
+*.bin
+*.safetensors
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
