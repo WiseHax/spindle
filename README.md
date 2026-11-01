@@ -72,12 +72,30 @@ Invoke-WebRequest "https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct-GG
 .\target\release\spindle.exe smollm2-360m-q8_0.gguf --chat
 ```
 
-In the chat, type a message and press Enter. `/clear` forgets the conversation, `exit`
-quits.
+```
+spindle  Qwen3 0.6B Instruct
+qwen3 · 609 MiB · 4 threads · 1024-token context
+type a message, or /help
+
+> What is 2+2?
+2 + 2 = 4
+  34.1 tok/s · 203 tokens · 5.9 s
+```
+
+| In the chat | |
+|---|---|
+| `/clear` | start a new conversation |
+| `/think` | show or hide the model's reasoning (Qwen3 `<think>` blocks are hidden by default) |
+| `/stats` | show or hide memory details after each reply |
+| `/help` | list commands |
+| `/exit`, `exit` | quit |
+
+Without `--chat`, spindle answers `--prompt` once and exits.
 
 | Option | Default | |
 |---|---|---|
 | `--prompt "..."` | | send a first message right away |
+| `--verbose`, `-v` | off | print load, memory and threading details |
 | `--temp` | 0.6 | 0 means greedy |
 | `--top-k` | 40 | |
 | `--top-p` | 0.9 | |
