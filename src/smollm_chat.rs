@@ -16,7 +16,7 @@ use std::{
 
 use crate::{
     gguf_loader::{GgmlType, GgufModelIndex, GgufValue},
-    mmap_file::MappedFile,
+    mmap_file::{MappedFile, Prefetcher},
     quant::{dequant_row, dot_f32_avx2, matvec_rows_avx2, row_bytes, Mat},
     worker_pool::WorkerPool,
 };
@@ -108,16 +108,22 @@ struct Ffn {
     down: Mat,
 }
 
+/// `(file offset, byte length)` of a matrix, for prefetch hints.
+fn span(m: &Mat) -> (usize, usize) {
+    (m.offset, m.rows * row_bytes(m.dtype, m.cols).unwrap_or(0))
+}
+
 impl Ffn {
+    fn spans(&self) -> [(usize, usize); 3] {
+        [span(&self.gate), span(&self.up), span(&self.down)]
+    }
+
     fn expert(self, e: usize) -> Self {
         Self { gate: self.gate.expert(e), up: self.up.expert(e), down: self.down.expert(e) }
     }
 
     fn bytes(&self) -> usize {
-        [self.gate, self.up, self.down]
-            .iter()
-            .map(|m| m.rows * row_bytes(m.dtype, m.cols).unwrap_or(0))
-            .sum()
+        self.spans().iter().map(|s| s.1).sum()
     }
 }
 
@@ -308,6 +314,7 @@ unsafe fn moe_forward(
     x: &[f32],
     out: &mut [f32],
     stats: Option<(&mut MoeStats, usize)>,
+    prefetch: Option<&Prefetcher>,
 ) {
     let mut probs = vec![0.0f32; m.n_expert];
     matvec(pool, base, &m.router, x, &mut probs);
@@ -320,6 +327,11 @@ unsafe fn moe_forward(
     chosen.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
     chosen.truncate(m.n_used);
     let wsum: f32 = chosen.iter().map(|&e| probs[e]).sum();
+
+    // Start reading every chosen expert now, so experts 2..k load while expert 1 computes.
+    if let Some(pf) = prefetch {
+        pf.hint(chosen.iter().flat_map(|&e| m.experts.expert(e).spans()).collect());
+    }
 
     out.fill(0.0);
     let mut tmp = vec![0.0f32; out.len()];
@@ -455,6 +467,9 @@ impl SplitMix64 {
 pub struct SmolLm2Engine {
     pub cfg: ModelConfig,
     pub idx: GgufModelIndex,
+    /// Background prefetch hints, only when the model doesn't fit in RAM. Declared before
+    /// `raw_bytes` so it is dropped (and its thread joined) before the file is unmapped.
+    prefetcher: Option<Prefetcher>,
     /// The GGUF file, memory-mapped read-only (weights are used in place, never copied).
     pub raw_bytes: MappedFile,
     layers: Vec<Layer>,
@@ -523,20 +538,49 @@ impl SmolLm2Engine {
         };
 
         let raw_bytes = MappedFile::open(path)?;
-        let prefetched = raw_bytes.prefetch_if_fits();
+        // `SPINDLE_FORCE_STREAM=1` treats any model as too big for RAM, to test that path.
+        let force_stream = std::env::var("SPINDLE_FORCE_STREAM").is_ok_and(|v| v == "1");
+        let prefetched = !force_stream && raw_bytes.prefetch_if_fits();
         println!(
             "[model:mmap] {:.1} MiB mapped ({})",
             raw_bytes.len() as f64 / (1024.0 * 1024.0),
             if prefetched { "prefetching into page cache" } else { "paged on demand: larger than half of free RAM" }
         );
 
-        // 1024 positions keeps the f32 KV-cache small on 8 GB RAM (135M: ~45 MiB, 1.7B: ~384 MiB).
-        let max_seq = std::env::var("CHAT_CTX")
+        // Preflight: the KV-cache is the one big private allocation. Size it to what's free
+        // (a quarter of available RAM at most) instead of letting a failed allocation abort
+        // the process. 1024 positions is the default.
+        let wanted = std::env::var("CHAT_CTX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1024)
             .clamp(64, c.ctx_len);
-        let kv_mib = (2 * c.n_layers * max_seq * c.kv_dim * 4) as f64 / (1024.0 * 1024.0);
+        let per_pos = 2 * c.n_layers * c.kv_dim * 4;
+        let scratch = c.vocab * 8 + 64 * 1024 * 1024;
+        let avail = crate::mmap_file::available_ram_bytes() as usize;
+        let max_seq = wanted.min((avail / 4).saturating_sub(scratch) / per_pos);
+        if max_seq < 64 {
+            return Err(Error::new(
+                ErrorKind::OutOfMemory,
+                format!(
+                    "not enough free RAM for this model: {} MiB free, need about {} MiB. Close some apps and retry.",
+                    avail >> 20,
+                    ((64 * per_pos + scratch) * 4) >> 20
+                ),
+            ));
+        }
+        if max_seq < wanted {
+            println!("[model:preflight] only {} MiB free: KV-cache shrunk from {wanted} to {max_seq} tokens", avail >> 20);
+        }
+        let kv_mib = (max_seq * per_pos) as f64 / (1024.0 * 1024.0);
+        let alloc = |n: usize| -> std::io::Result<Vec<f32>> {
+            let mut v = Vec::new();
+            v.try_reserve_exact(n).map_err(|_| Error::new(ErrorKind::OutOfMemory, "KV-cache allocation failed"))?;
+            v.resize(n, 0.0);
+            Ok(v)
+        };
+        let k_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
+        let v_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
         println!(
             "[model:config] {} | dim={} layers={} heads={}/{} kv (head_dim {}) vocab={} rope_theta={}{} | KV-cache {max_seq} pos = {kv_mib:.1} MiB",
             idx.architecture,
@@ -561,7 +605,10 @@ impl SmolLm2Engine {
 
         let byte_enc = byte_to_char_table();
         let byte_dec = byte_enc.iter().enumerate().map(|(b, &ch)| (ch, b as u8)).collect();
+        // SAFETY: field order guarantees the prefetcher is dropped before `raw_bytes`.
+        let prefetcher = (!prefetched).then(|| unsafe { Prefetcher::new(&raw_bytes) });
         Ok(Self {
+            prefetcher,
             rope: Rope::new(c.head_dim, c.rope_theta, c.rope_neox),
             cfg: c,
             idx,
@@ -570,8 +617,8 @@ impl SmolLm2Engine {
             embed,
             lm_head,
             output_norm,
-            k_cache: vec![0.0f32; c.n_layers * max_seq * c.kv_dim],
-            v_cache: vec![0.0f32; c.n_layers * max_seq * c.kv_dim],
+            k_cache,
+            v_cache,
             max_seq,
             cur_pos: 0,
             n_keep: 0,
@@ -608,6 +655,16 @@ impl SmolLm2Engine {
     pub fn reset_kv(&mut self) {
         self.cur_pos = 0;
         self.n_keep = 0;
+    }
+
+    /// True when the model was too big to prefetch, so weights page in as they're used.
+    pub fn is_streaming(&self) -> bool {
+        self.prefetcher.is_some()
+    }
+
+    /// Private memory this engine keeps resident: KV-cache plus per-token scratch.
+    pub fn private_bytes_estimate(&self) -> u64 {
+        ((self.k_cache.len() + self.v_cache.len()) * 4 + self.cfg.vocab * 8 + 64 * 1024 * 1024) as u64
     }
 
     pub fn is_moe(&self) -> bool {
@@ -702,8 +759,18 @@ impl SmolLm2Engine {
             self.moe_stats.tokens += 1;
         }
 
+        let hint = self.prefetcher.as_ref();
         for l in 0..c.n_layers {
             let ly = self.layers[l];
+            // The next layer's attention (and router or dense FFN) loads during this one.
+            if let (Some(pf), Some(next)) = (hint, self.layers.get(l + 1)) {
+                let mut r = vec![span(&next.wq), span(&next.wk), span(&next.wv), span(&next.wo)];
+                match &next.ffn {
+                    FfnKind::Dense(f) => r.extend(f.spans()),
+                    FfnKind::Moe(m) => r.push(span(&m.router)),
+                }
+                pf.hint(r);
+            }
 
             // Attention: norm, Q/K/V (+ bias), optional per-head Q/K norm, RoPE.
             rmsnorm(&x, f32_at(base, ly.attn_norm, c.dim), &mut x_norm, c.rms_eps);
@@ -771,7 +838,7 @@ impl SmolLm2Engine {
             rmsnorm(&x, f32_at(base, ly.ffn_norm, c.dim), &mut x_norm, c.rms_eps);
             match &ly.ffn {
                 FfnKind::Dense(f) => ffn_forward(pool, base, f, &x_norm, &mut proj_out),
-                FfnKind::Moe(m) => moe_forward(pool, base, m, &x_norm, &mut proj_out, Some((&mut self.moe_stats, l))),
+                FfnKind::Moe(m) => moe_forward(pool, base, m, &x_norm, &mut proj_out, Some((&mut self.moe_stats, l)), hint),
             }
             for i in 0..c.dim {
                 x[i] += proj_out[i];
@@ -1194,7 +1261,7 @@ mod tests {
                 shared_gate: shared.then_some(sh_gate),
             };
             let mut got = vec![0.0f32; dim];
-            unsafe { moe_forward(None, base, &moe, &x, &mut got, None) };
+            unsafe { moe_forward(None, base, &moe, &x, &mut got, None, None) };
 
             // Reference.
             let logits: Vec<f32> = (0..n_exp).map(|e| (0..dim).map(|c| w(&router, 0, e, c) * x[c]).sum()).collect();
