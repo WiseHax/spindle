@@ -49,14 +49,25 @@ Weights stay quantized. A row is a sequence of blocks:
 
 | Type | Weights/block | Bytes | Contents |
 |---|---|---|---|
-| `Q8_0` | 32 | 34 | f16 scale, 32 int8 |
+| `Q4_0` | 32 | 18 | f16 scale, 32 x 4 bits |
+| `Q4_1` | 32 | 20 | f16 scale and min, 32 x 4 bits |
 | `Q5_0` | 32 | 22 | f16 scale, 32 high bits, 32 x 4 bits |
+| `Q5_1` | 32 | 24 | f16 scale and min, 32 high bits, 32 x 4 bits |
+| `Q8_0` | 32 | 34 | f16 scale, 32 int8 |
 | `Q4_K` | 256 | 144 | f16 d and dmin, 8 six-bit scales and mins, 256 x 4 bits |
+| `Q5_K` | 256 | 176 | like `Q4_K` plus 256 high bits |
 | `Q6_K` | 256 | 210 | 256 x (4+2) bits, 16 int8 scales, f16 d |
+
+`F32`, `F16` (via F16C) and `BF16` are also supported. All of this lives in `quant.rs`.
 
 Each `dot_*_row_avx2` unpacks a block into 8-wide float vectors and accumulates with FMA.
 Scales are applied once per block or sub-block. For `Q4_K` each 32-weight sub-block
-contributes `d*sc*sum(q*x) - dmin*mn*sum(x)`.
+contributes `d*sc*sum(q*x) - dmin*mn*sum(x)` (same for `Q5_K`, and `Q4_1`/`Q5_1` use
+`d*sum(q*x) + m*sum(x)`).
+
+`dequant_row` is a plain scalar version of every format written from the ggml definitions.
+The test in `quant.rs` runs each SIMD kernel on random blocks through the real matvec
+dispatch and compares against it. It also serves embedding lookups.
 
 ## Threads
 

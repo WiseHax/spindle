@@ -16,15 +16,15 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
 - GGUF v3 parsing (metadata, tensors, vocab, BPE merges)
 - Llama-style models: RMSNorm, RoPE, grouped-query attention, SwiGLU
 - Model sizes read from GGUF metadata, nothing hardcoded
-- AVX2/FMA kernels for `F32`, `Q8_0`, `Q5_0`, `Q4_K`, `Q6_K`
+- AVX2/FMA kernels for `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`,
+  `Q4_K`, `Q5_K`, `Q6_K`, each tested against a scalar reference
 - Matvecs split across the P-cores with a persistent thread pool
 - Weights memory-mapped, not copied
 - Multi-turn chat with a KV-cache that slides when it fills up
 - Temperature, top-k, top-p, min-p sampling with a seed
 - `--probe` to measure your RAM and SSD bandwidth
 
-Not yet: other quant types (`Q4_0`, `Q5_1`, `F16`, ...), MoE models, streaming from SSD,
-Linux/macOS, ARM.
+Not yet: `Q2_K`, `Q3_K` and the IQ formats, MoE models, streaming from SSD, Linux/macOS, ARM.
 
 ## Speed
 
@@ -40,7 +40,7 @@ laptop `--probe` measures about 31 GB/s, which puts 360M's ceiling around 80 tok
 
 ## Build
 
-You need Windows 10/11 on x86-64, a CPU with AVX2 and FMA (Haswell / Zen or newer), and
+You need Windows 10/11 on x86-64, a CPU with AVX2, FMA and F16C (Haswell / Zen or newer), and
 [Rust](https://rustup.rs).
 
 ```powershell
@@ -83,7 +83,8 @@ For honest SSD numbers, run `--probe` against a file of 1 GB or more.
 
 | | |
 |---|---|
-| `src/smollm_chat.rs` | the engine: kernels, forward pass, tokenizer, sampler, chat |
+| `src/smollm_chat.rs` | the engine: forward pass, tokenizer, sampler, chat |
+| `src/quant.rs` | quant formats, AVX2 kernels, scalar reference, kernel tests |
 | `src/gguf_loader.rs` | GGUF parser |
 | `src/worker_pool.rs` | thread pool used for matvecs |
 | `src/mmap_file.rs` | memory-mapped model files, RAM stats |

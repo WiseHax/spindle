@@ -29,25 +29,25 @@ need roughly a 25% cache hit rate.
 - Memory-mapped weights (private RAM for 135M: 373 MiB down to 63 MiB)
 - Bandwidth probe
 - Temperature / top-k / top-p / min-p sampling with a seed
+- `Q4_0`, `Q4_1`, `Q5_1`, `Q5_K`, `F16`, `BF16` kernels, all kernels tested against a scalar
+  dequantizer
 
 ## Next
 
-1. **Quant kernels.** `Q4_0`, `Q4_1`, `Q5_1`, `Q5_K`, `F16`, `BF16`, plus tests for every kernel
-   against a scalar version. Most real MoE GGUFs need some of these.
-2. **MoE support.** Router, top-k experts, shared experts (Qwen MoE style), first running fully
+1. **MoE support.** Router, top-k experts, shared experts (Qwen MoE style), first running fully
    from mmap to get correct output before worrying about speed.
-3. **Streaming file layout.** A one-time repack that puts each expert's tensors next to each
+2. **Streaming file layout.** A one-time repack that puts each expert's tensors next to each
    other, 4 KiB aligned, so one large read gets a whole expert. The original GGUF stays as is.
-4. **Expert cache with a memory governor.** Cache experts in RAM, shrink the cache when Windows
+3. **Expert cache with a memory governor.** Cache experts in RAM, shrink the cache when Windows
    reports low memory and grow it back when memory frees up. A `--ram-budget` hard limit on top.
    Test: open a pile of browser tabs mid-generation. It should slow down, not crash, and
    recover afterwards.
-5. **Prefetch on the E-cores.** P-cores do the math. E-cores predict which experts come next and
+4. **Prefetch on the E-cores.** P-cores do the math. E-cores predict which experts come next and
    issue the reads (IOCP, ~8 in flight) and manage the cache.
-6. **Draft-guided prefetch.** A small draft model runs a few tokens ahead. Running the big
+5. **Draft-guided prefetch.** A small draft model runs a few tokens ahead. Running the big
    model's router on the draft's path predicts experts several tokens early, and verifying k
    draft tokens at once loads the union of their experts in one go.
-7. **Energy numbers.** Joules per token in the stats, and a battery mode.
+6. **Energy numbers.** Joules per token in the stats, and a battery mode.
 
 Target: a ~30B MoE at 2+ tok/s on the dev laptop.
 
