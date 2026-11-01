@@ -334,7 +334,7 @@ pub(crate) unsafe fn matvec_rows_avx2(base_ptr: *const u8, m: &Mat, x: &[f32], o
     let n_cols = m.cols;
     debug_assert_eq!(x.len(), n_cols);
 
-    let tensor_ptr = base_ptr.add(m.offset);
+    let tensor_ptr = base_ptr.wrapping_add(m.offset);
     let xp = x.as_ptr();
 
     macro_rules! rows {
@@ -535,7 +535,7 @@ unsafe fn dot_q5_k_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
 /// Needs F16C on top of AVX2 (every AVX2 Intel/AMD CPU has it; `main` checks anyway).
 #[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
-unsafe fn dot_f16_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
+pub(crate) unsafe fn dot_f16_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let w = row_ptr as *const u16;
     let mut acc = _mm256_setzero_ps();
     let main = n_cols & !7;
@@ -567,6 +567,26 @@ unsafe fn dot_bf16_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
         tail += f32::from_bits((w.add(i).read_unaligned() as u32) << 16) * *x.add(i);
     }
     hsum_avx2(acc) + tail
+}
+
+/// f32 -> f16 for the KV-cache. `src.len()` must be a multiple of 8.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn f32_to_f16_slice(src: &[f32], dst: &mut [u16]) {
+    debug_assert!(src.len() % 8 == 0 && dst.len() == src.len());
+    for i in (0..src.len()).step_by(8) {
+        let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_loadu_ps(src.as_ptr().add(i)));
+        _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, h);
+    }
+}
+
+/// f16 -> f32. `src.len()` must be a multiple of 8.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(crate) unsafe fn f16_to_f32_slice(src: &[u16], dst: &mut [f32]) {
+    debug_assert!(src.len() % 8 == 0 && dst.len() == src.len());
+    for i in (0..src.len()).step_by(8) {
+        let f = _mm256_cvtph_ps(_mm_loadu_si128(src.as_ptr().add(i) as *const __m128i));
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), f);
+    }
 }
 
 // ---------------------------------------------------------------- reference path

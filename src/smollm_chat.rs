@@ -17,7 +17,7 @@ use std::{
 use crate::{
     gguf_loader::{GgmlType, GgufModelIndex, GgufValue},
     mmap_file::{MappedFile, Prefetcher},
-    quant::{dequant_row, dot_f32_avx2, matvec_rows_avx2, row_bytes, Mat},
+    quant::{dequant_row, dot_f16_row_avx2, f16_to_f32_slice, f32_to_f16_slice, matvec_rows_avx2, row_bytes, Mat},
     worker_pool::WorkerPool,
 };
 
@@ -258,8 +258,50 @@ unsafe fn matvec(pool: Option<&WorkerPool>, base: *const u8, m: &Mat, x: &[f32],
     });
 }
 
+/// `base` may be a streamed layer buffer shifted back by the layer's file offset, so the
+/// offset is applied with `wrapping_add` (the result is always inside the buffer).
 unsafe fn f32_at<'a>(base: *const u8, offset: usize, len: usize) -> &'a [f32] {
-    std::slice::from_raw_parts(base.add(offset) as *const f32, len)
+    std::slice::from_raw_parts(base.wrapping_add(offset) as *const f32, len)
+}
+
+unsafe fn add_bias(base: *const u8, dst: &mut [f32], off: Option<usize>) {
+    if let Some(off) = off {
+        let bias = f32_at(base, off, dst.len());
+        for (d, b) in dst.iter_mut().zip(bias) {
+            *d += b;
+        }
+    }
+}
+
+/// File span `(start, end)` of everything one layer reads, and the bytes actually used.
+fn layer_extent(ly: &Layer, c: &ModelConfig) -> (usize, usize, usize) {
+    let mut parts = vec![
+        (ly.attn_norm, c.dim * 4),
+        (ly.ffn_norm, c.dim * 4),
+        span(&ly.wq),
+        span(&ly.wk),
+        span(&ly.wv),
+        span(&ly.wo),
+    ];
+    for (off, len) in [(ly.q_bias, c.q_dim), (ly.k_bias, c.kv_dim), (ly.v_bias, c.kv_dim)] {
+        parts.extend(off.map(|o| (o, len * 4)));
+    }
+    for off in [ly.q_norm, ly.k_norm] {
+        parts.extend(off.map(|o| (o, c.head_dim * 4)));
+    }
+    match &ly.ffn {
+        FfnKind::Dense(f) => parts.extend(f.spans()),
+        FfnKind::Moe(m) => {
+            parts.push(span(&m.router));
+            // All experts: a whole MoE layer is far too big to stream as one block.
+            for e in 0..m.n_expert {
+                parts.extend(m.experts.expert(e).spans());
+            }
+        }
+    }
+    let start = parts.iter().map(|p| p.0).min().unwrap_or(0);
+    let end = parts.iter().map(|p| p.0 + p.1).max().unwrap_or(0);
+    (start, end, parts.iter().map(|p| p.1).sum())
 }
 
 fn rmsnorm(x: &[f32], w: &[f32], out: &mut [f32], eps: f32) {
@@ -470,6 +512,11 @@ pub struct SmolLm2Engine {
     /// Background prefetch hints, only when the model doesn't fit in RAM. Declared before
     /// `raw_bytes` so it is dropped (and its thread joined) before the file is unmapped.
     prefetcher: Option<Prefetcher>,
+    /// Reads layers `first..` into private buffers when they don't fit in RAM.
+    streamer: Option<crate::layer_stream::LayerStreamer>,
+    /// `(file offset, length)` per layer, if every layer is one contiguous dense block.
+    layer_spans: Option<Vec<(usize, usize)>>,
+    path: String,
     /// The GGUF file, memory-mapped read-only (weights are used in place, never copied).
     pub raw_bytes: MappedFile,
     layers: Vec<Layer>,
@@ -477,8 +524,10 @@ pub struct SmolLm2Engine {
     embed: Mat,
     lm_head: Mat,
     output_norm: usize,
-    pub k_cache: Vec<f32>, // [n_layers * max_seq * kv_dim]
-    pub v_cache: Vec<f32>,
+    /// K and V for every layer and position, stored as f16 (`[n_layers * max_seq * kv_dim]`).
+    /// Half the RAM of f32; when the model streams from disk, that RAM pins more layers.
+    pub k_cache: Vec<u16>,
+    pub v_cache: Vec<u16>,
     pub max_seq: usize,
     pub cur_pos: usize,
     /// Number of leading KV positions (the system prompt) that are never evicted by the
@@ -555,7 +604,7 @@ impl SmolLm2Engine {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1024)
             .clamp(64, c.ctx_len);
-        let per_pos = 2 * c.n_layers * c.kv_dim * 4;
+        let per_pos = 2 * c.n_layers * c.kv_dim * 2;
         let scratch = c.vocab * 8 + 64 * 1024 * 1024;
         let avail = crate::mmap_file::available_ram_bytes() as usize;
         let max_seq = wanted.min((avail / 4).saturating_sub(scratch) / per_pos);
@@ -573,10 +622,10 @@ impl SmolLm2Engine {
             println!("[model:preflight] only {} MiB free: KV-cache shrunk from {wanted} to {max_seq} tokens", avail >> 20);
         }
         let kv_mib = (max_seq * per_pos) as f64 / (1024.0 * 1024.0);
-        let alloc = |n: usize| -> std::io::Result<Vec<f32>> {
+        let alloc = |n: usize| -> std::io::Result<Vec<u16>> {
             let mut v = Vec::new();
             v.try_reserve_exact(n).map_err(|_| Error::new(ErrorKind::OutOfMemory, "KV-cache allocation failed"))?;
-            v.resize(n, 0.0);
+            v.resize(n, 0);
             Ok(v)
         };
         let k_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
@@ -607,8 +656,18 @@ impl SmolLm2Engine {
         let byte_dec = byte_enc.iter().enumerate().map(|(b, &ch)| (ch, b as u8)).collect();
         // SAFETY: field order guarantees the prefetcher is dropped before `raw_bytes`.
         let prefetcher = (!prefetched).then(|| unsafe { Prefetcher::new(&raw_bytes) });
+        // Streaming whole layers needs each layer's tensors stored back to back.
+        let layer_spans = {
+            let ext: Vec<_> = layers.iter().map(|ly| layer_extent(ly, &c)).collect();
+            let dense = layers.iter().all(|ly| matches!(ly.ffn, FfnKind::Dense(_)));
+            let tight = ext.iter().all(|&(s, e, used)| e - s <= used + used / 20 + 4096);
+            (dense && tight).then(|| ext.iter().map(|&(s, e, _)| (s, e - s)).collect())
+        };
         Ok(Self {
             prefetcher,
+            streamer: None,
+            layer_spans,
+            path: path.to_string(),
             rope: Rope::new(c.head_dim, c.rope_theta, c.rope_neox),
             cfg: c,
             idx,
@@ -657,6 +716,107 @@ impl SmolLm2Engine {
         self.n_keep = 0;
     }
 
+    /// Locks up to `budget` bytes of weights into RAM and returns how many were locked.
+    ///
+    /// Why: every token reads the layers in the same order, 0..n, then starts over. The
+    /// working set behaves roughly like an LRU cache, and LRU on a cyclic scan bigger than the
+    /// cache evicts exactly the page that is needed next, so nearly every access misses.
+    /// Pinning a fixed part of the model turns that part into guaranteed hits and leaves only
+    /// the rest cycling. Every pinned byte saves one page-in per token, so which bytes are
+    /// pinned matters less than how many; dense weights that every token reads come first,
+    /// MoE experts (each used by only some tokens) are never pinned.
+    pub fn pin_hot_weights(&self, budget: usize) -> usize {
+        let c = self.cfg;
+        let mut spans = vec![span(&self.lm_head), (self.output_norm, c.dim * 4)];
+        for ly in &self.layers {
+            spans.extend([(ly.attn_norm, c.dim * 4), (ly.ffn_norm, c.dim * 4)]);
+            spans.extend([span(&ly.wq), span(&ly.wk), span(&ly.wv), span(&ly.wo)]);
+            match &ly.ffn {
+                FfnKind::Dense(f) => spans.extend(f.spans()),
+                FfnKind::Moe(m) => {
+                    spans.push(span(&m.router));
+                    if let Some(sh) = &m.shared {
+                        spans.extend(sh.spans());
+                    }
+                }
+            }
+        }
+        let mut chosen = Vec::new();
+        let mut total = 0;
+        for s in spans {
+            if chosen.iter().any(|&(off, _)| off == s.0) {
+                continue; // tied embedding / LM head
+            }
+            if total + s.1 > budget {
+                continue; // too big for what's left; smaller tensors later may still fit
+            }
+            total += s.1;
+            chosen.push(s);
+        }
+        if total == 0 || !crate::memory_guard::allow_locking((total + 64 * 1024 * 1024) as u64) {
+            return 0;
+        }
+        self.raw_bytes.lock_ranges(&chosen)
+    }
+
+    /// Decides what lives in RAM for a model that doesn't fit, given `budget` bytes for
+    /// weights. The LM head (read in full every token) is pinned first, then whole layers
+    /// from layer 0 while they fit. The remaining layers are streamed with one read each
+    /// through two buffers (which come out of the budget). Models whose layers aren't
+    /// contiguous (MoE) fall back to `pin_hot_weights`. Returns `(pinned bytes, first
+    /// streamed layer)`.
+    ///
+    /// Streaming is opt-in (`stream_layers`): measured on Qwen3-0.6B it matched mmap paging
+    /// under a tight cap (both ~7-8 tok/s, both drive-limited) while cutting page faults
+    /// ~100x, but it is planned once at startup and can't grow into RAM that frees up later,
+    /// so by default (pin + mmap) wins whenever memory loosens.
+    pub fn plan_residency(&mut self, budget: usize, stream_layers: bool) -> (usize, Option<usize>) {
+        let spans = match (&self.layer_spans, stream_layers) {
+            (Some(s), true) => s.clone(),
+            _ => return (self.pin_hot_weights(budget), None),
+        };
+        let n = spans.len();
+        let max_span = spans.iter().map(|s| s.1).max().unwrap_or(0);
+        // Two stream buffers, unless everything ends up pinned anyway.
+        let mut left = budget.saturating_sub(2 * max_span);
+        let mut chosen = Vec::new();
+        let head = (span(&self.lm_head), (self.output_norm, self.cfg.dim * 4));
+        if head.0 .1 + head.1 .1 <= left {
+            left -= head.0 .1 + head.1 .1;
+            chosen.extend([head.0, head.1]);
+        }
+        let mut first = 0;
+        while first < n && spans[first].1 <= left {
+            left -= spans[first].1;
+            chosen.push(spans[first]);
+            first += 1;
+        }
+        let want = chosen.iter().map(|s| s.1).sum::<usize>();
+        let pinned = if want > 0 && crate::memory_guard::allow_locking((want + 64 * 1024 * 1024) as u64) {
+            self.raw_bytes.lock_ranges(&chosen)
+        } else {
+            0
+        };
+        if first == n {
+            return (pinned, None);
+        }
+        match crate::layer_stream::LayerStreamer::new(&self.path, spans, first) {
+            Ok(s) => {
+                self.streamer = Some(s);
+                (pinned, Some(first))
+            }
+            Err(e) => {
+                eprintln!("[warn] layer streaming unavailable ({e}); paging layers instead");
+                (pinned, None)
+            }
+        }
+    }
+
+    /// Bytes of model weights read from the file by the layer streamer so far.
+    pub fn streamed_bytes(&self) -> u64 {
+        self.streamer.as_ref().map_or(0, |s| s.bytes_read)
+    }
+
     /// True when the model was too big to prefetch, so weights page in as they're used.
     pub fn is_streaming(&self) -> bool {
         self.prefetcher.is_some()
@@ -664,7 +824,8 @@ impl SmolLm2Engine {
 
     /// Private memory this engine keeps resident: KV-cache plus per-token scratch.
     pub fn private_bytes_estimate(&self) -> u64 {
-        ((self.k_cache.len() + self.v_cache.len()) * 4 + self.cfg.vocab * 8 + 64 * 1024 * 1024) as u64
+        let buffers = self.streamer.as_ref().map_or(0, |s| 2 * s.max_buffer());
+        ((self.k_cache.len() + self.v_cache.len()) * 2 + self.cfg.vocab * 8 + 64 * 1024 * 1024 + buffers) as u64
     }
 
     pub fn is_moe(&self) -> bool {
@@ -708,9 +869,12 @@ impl SmolLm2Engine {
             for i in 0..n_move {
                 let src = (layer + self.n_keep + n_discard + i) * c.kv_dim;
                 let dst = (layer + self.n_keep + i) * c.kv_dim;
-                k_tmp.copy_from_slice(&self.k_cache[src..src + c.kv_dim]);
-                self.rope.rotate(&mut k_tmp, c.head_dim, -(n_discard as f32));
-                self.k_cache[dst..dst + c.kv_dim].copy_from_slice(&k_tmp);
+                // SAFETY: main checks for AVX2/F16C at startup; kv_dim is a multiple of 8.
+                unsafe {
+                    f16_to_f32_slice(&self.k_cache[src..src + c.kv_dim], &mut k_tmp);
+                    self.rope.rotate(&mut k_tmp, c.head_dim, -(n_discard as f32));
+                    f32_to_f16_slice(&k_tmp, &mut self.k_cache[dst..dst + c.kv_dim]);
+                }
                 self.v_cache.copy_within(src..src + c.kv_dim, dst);
             }
         }
@@ -731,7 +895,7 @@ impl SmolLm2Engine {
 
     /// Runs one token at position `pos` through every layer and returns the final-normed
     /// hidden state (`dim` floats).
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn forward_hidden(&mut self, token_id: usize, pos: usize) -> Vec<f32> {
         let c = self.cfg;
         let base = self.raw_bytes.as_ptr();
@@ -747,23 +911,27 @@ impl SmolLm2Engine {
         let mut v = vec![0.0f32; c.kv_dim];
         let mut attn_out = vec![0.0f32; c.q_dim];
         let mut proj_out = vec![0.0f32; c.dim];
-        let add = |dst: &mut [f32], off: Option<usize>| {
-            if let Some(off) = off {
-                let bias = f32_at(base, off, dst.len());
-                for (d, b) in dst.iter_mut().zip(bias) {
-                    *d += b;
-                }
-            }
-        };
         if self.is_moe() {
             self.moe_stats.tokens += 1;
         }
 
         let hint = self.prefetcher.as_ref();
+        let first_streamed = self.streamer.as_ref().map_or(usize::MAX, |s| s.first);
         for l in 0..c.n_layers {
             let ly = self.layers[l];
-            // The next layer's attention (and router or dense FFN) loads during this one.
-            if let (Some(pf), Some(next)) = (hint, self.layers.get(l + 1)) {
+            // Streamed layer: its bytes arrive in a private buffer; tensor offsets are file
+            // offsets, so shift the base back by where the layer starts in the file.
+            let streamed = match self.streamer.as_mut() {
+                Some(st) if l >= st.first => Some(st.take(l).expect("reading a layer from the model file failed")),
+                _ => None,
+            };
+            let lbase = match (&streamed, &self.layer_spans) {
+                (Some(buf), Some(spans)) => buf.as_ptr().wrapping_sub(spans[l].0),
+                _ => base,
+            };
+            // The next layer's attention (and router or dense FFN) loads during this one,
+            // unless the layer streamer is already reading it.
+            if let (Some(pf), Some(next)) = (hint.filter(|_| l + 1 < first_streamed), self.layers.get(l + 1)) {
                 let mut r = vec![span(&next.wq), span(&next.wk), span(&next.wv), span(&next.wo)];
                 match &next.ffn {
                     FfnKind::Dense(f) => r.extend(f.spans()),
@@ -773,25 +941,25 @@ impl SmolLm2Engine {
             }
 
             // Attention: norm, Q/K/V (+ bias), optional per-head Q/K norm, RoPE.
-            rmsnorm(&x, f32_at(base, ly.attn_norm, c.dim), &mut x_norm, c.rms_eps);
-            matvec(pool, base, &ly.wq, &x_norm, &mut q);
-            matvec(pool, base, &ly.wk, &x_norm, &mut k);
-            matvec(pool, base, &ly.wv, &x_norm, &mut v);
-            add(&mut q, ly.q_bias);
-            add(&mut k, ly.k_bias);
-            add(&mut v, ly.v_bias);
+            rmsnorm(&x, f32_at(lbase, ly.attn_norm, c.dim), &mut x_norm, c.rms_eps);
+            matvec(pool, lbase, &ly.wq, &x_norm, &mut q);
+            matvec(pool, lbase, &ly.wk, &x_norm, &mut k);
+            matvec(pool, lbase, &ly.wv, &x_norm, &mut v);
+            add_bias(lbase, &mut q, ly.q_bias);
+            add_bias(lbase, &mut k, ly.k_bias);
+            add_bias(lbase, &mut v, ly.v_bias);
             if let Some(off) = ly.q_norm {
-                rmsnorm_heads(&mut q, f32_at(base, off, c.head_dim), c.head_dim, c.rms_eps);
+                rmsnorm_heads(&mut q, f32_at(lbase, off, c.head_dim), c.head_dim, c.rms_eps);
             }
             if let Some(off) = ly.k_norm {
-                rmsnorm_heads(&mut k, f32_at(base, off, c.head_dim), c.head_dim, c.rms_eps);
+                rmsnorm_heads(&mut k, f32_at(lbase, off, c.head_dim), c.head_dim, c.rms_eps);
             }
             self.rope.rotate(&mut q, c.head_dim, pos as f32);
             self.rope.rotate(&mut k, c.head_dim, pos as f32);
 
             let kv_off = (l * self.max_seq + pos) * c.kv_dim;
-            self.k_cache[kv_off..kv_off + c.kv_dim].copy_from_slice(&k);
-            self.v_cache[kv_off..kv_off + c.kv_dim].copy_from_slice(&v);
+            f32_to_f16_slice(&k, &mut self.k_cache[kv_off..kv_off + c.kv_dim]);
+            f32_to_f16_slice(&v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
 
             // Grouped-query attention with an online softmax over positions 0..=pos.
             let scale = 1.0f32 / (c.head_dim as f32).sqrt();
@@ -808,7 +976,7 @@ impl SmolLm2Engine {
                     let k_head = &self.k_cache[t_off..t_off + c.head_dim];
                     let v_head = &self.v_cache[t_off..t_off + c.head_dim];
 
-                    let score = dot_f32_avx2(q_head.as_ptr(), k_head.as_ptr(), c.head_dim) * scale;
+                    let score = dot_f16_row_avx2(k_head.as_ptr() as *const u8, q_head.as_ptr(), c.head_dim) * scale;
                     let m_new = m_prev.max(score);
                     let alpha = (m_prev - m_new).exp();
                     let p = (score - m_new).exp();
@@ -820,7 +988,8 @@ impl SmolLm2Engine {
                     for d in (0..c.head_dim).step_by(8) {
                         let o = out_head.as_mut_ptr().add(d);
                         let ov = _mm256_mul_ps(_mm256_loadu_ps(o), va);
-                        _mm256_storeu_ps(o, _mm256_fmadd_ps(vp, _mm256_loadu_ps(v_head.as_ptr().add(d)), ov));
+                        let vv = _mm256_cvtph_ps(_mm_loadu_si128(v_head.as_ptr().add(d) as *const __m128i));
+                        _mm256_storeu_ps(o, _mm256_fmadd_ps(vp, vv, ov));
                     }
                 }
                 let inv_l = 1.0f32 / l_prev.max(1e-9);
@@ -829,19 +998,22 @@ impl SmolLm2Engine {
                 }
             }
 
-            matvec(pool, base, &ly.wo, &attn_out, &mut proj_out);
+            matvec(pool, lbase, &ly.wo, &attn_out, &mut proj_out);
             for i in 0..c.dim {
                 x[i] += proj_out[i];
             }
 
             // Feed-forward: dense SwiGLU or mixture of experts.
-            rmsnorm(&x, f32_at(base, ly.ffn_norm, c.dim), &mut x_norm, c.rms_eps);
+            rmsnorm(&x, f32_at(lbase, ly.ffn_norm, c.dim), &mut x_norm, c.rms_eps);
             match &ly.ffn {
-                FfnKind::Dense(f) => ffn_forward(pool, base, f, &x_norm, &mut proj_out),
-                FfnKind::Moe(m) => moe_forward(pool, base, m, &x_norm, &mut proj_out, Some((&mut self.moe_stats, l)), hint),
+                FfnKind::Dense(f) => ffn_forward(pool, lbase, f, &x_norm, &mut proj_out),
+                FfnKind::Moe(m) => moe_forward(pool, lbase, m, &x_norm, &mut proj_out, Some((&mut self.moe_stats, l)), hint),
             }
             for i in 0..c.dim {
                 x[i] += proj_out[i];
+            }
+            if let (Some(buf), Some(st)) = (streamed, self.streamer.as_mut()) {
+                st.give_back(buf);
             }
         }
 
