@@ -17,6 +17,7 @@ mod rio_mesh;
 mod smollm_chat;
 mod worker_pool;
 mod memory_guard;
+mod layer_stream;
 mod mmap_file;
 mod probe;
 mod quant;
@@ -709,6 +710,8 @@ struct CliConfig {
     prompt_given: bool,
     chat_mode: bool,
     probe: bool,
+    /// `--stream-layers`: read non-pinned layers with explicit I/O instead of paging.
+    stream_layers: bool,
     sampler: smollm_chat::SamplerConfig,
     /// `--ram-budget`: hard ceiling on spindle's resident memory, in MiB.
     ram_budget_mib: Option<u64>,
@@ -728,6 +731,7 @@ fn parse_cli() -> CliConfig {
         prompt_given: false,
         chat_mode: false,
         probe: false,
+        stream_layers: false,
         sampler: smollm_chat::SamplerConfig::default(),
         ram_budget_mib: None,
         reserve_mib: None,
@@ -788,6 +792,10 @@ fn parse_cli() -> CliConfig {
                     cfg.reserve_mib = Some(mib);
                 }
                 i += 2;
+            }
+            "--stream-layers" => {
+                cfg.stream_layers = true;
+                i += 1;
             }
             "--probe" => {
                 cfg.probe = true;
@@ -868,10 +876,37 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
+            let reserve = cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB);
+            let ceiling = cli.ram_budget_mib.map(|m| m * memory_guard::MIB);
+            let mut private = engine.private_bytes_estimate();
+            // When the model doesn't fit, lock as much of it as the budget allows (see
+            // `pin_hot_weights`), keeping 128 MiB of the budget for the pages that still stream.
+            let mut pinned = 0u64;
+            if engine.is_streaming() && std::env::var("SPINDLE_NO_PIN").map_or(true, |v| v != "1") {
+                let (ws, _, _) = memory_guard::process_counters();
+                let target = ceiling.unwrap_or((ws + mmap_file::available_ram_bytes()).saturating_sub(reserve));
+                let pin_budget = target.saturating_sub(private + 128 * memory_guard::MIB);
+                let (p, first_streamed) = engine.plan_residency(pin_budget as usize, cli.stream_layers);
+                pinned = p as u64;
+                match first_streamed {
+                    Some(f) => println!(
+                        "[memory] pinned {} MiB in RAM (LM head + layers 0..{f}); streaming layers {f}..{} from disk",
+                        pinned / memory_guard::MIB,
+                        engine.cfg.n_layers
+                    ),
+                    None => println!(
+                        "[memory] pinned {} MiB of hot weights in RAM; the rest pages in as needed",
+                        pinned / memory_guard::MIB
+                    ),
+                }
+            }
+            // Stream buffers were allocated by the planner; count them as private memory.
+            private = engine.private_bytes_estimate();
             let budget = memory_guard::Budget {
-                reserve: cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB),
-                floor: engine.private_bytes_estimate() + 128 * memory_guard::MIB,
-                ceiling: cli.ram_budget_mib.map(|m| m * memory_guard::MIB),
+                reserve,
+                floor: private + pinned + 128 * memory_guard::MIB,
+                ceiling,
+                min_ws: pinned + 32 * memory_guard::MIB,
             };
             // A model that fits in RAM needs no cap: its clean, file-backed pages are cheap for
             // Windows to reclaim. The cap matters when the model is bigger than free memory,
