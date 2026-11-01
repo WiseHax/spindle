@@ -543,6 +543,10 @@ pub struct SmolLm2Engine {
     im_end: usize,
     /// Tokens that end a reply (`<|im_end|>`, the GGUF EOS, `<|endoftext|>`).
     stop_ids: Vec<usize>,
+    /// `<think>` / `</think>` token ids for reasoning models (Qwen3).
+    think_ids: Option<(usize, usize)>,
+    /// Counts KV-cache shifts, so a reply knows whether its positions moved under it.
+    kv_shifts: u64,
     system_prompt: &'static str,
     pub moe_stats: MoeStats,
 }
@@ -580,6 +584,7 @@ impl SmolLm2Engine {
                 stop_ids.push(id);
             }
         }
+        let think_ids = token("<think>").zip(token("</think>"));
         let system_prompt = if idx.model_name.to_lowercase().contains("smollm") {
             SMOLLM_SYSTEM_PROMPT
         } else {
@@ -689,6 +694,8 @@ impl SmolLm2Engine {
             im_start,
             im_end,
             stop_ids,
+            think_ids,
+            kv_shifts: 0,
             system_prompt,
             moe_stats: MoeStats { touched: vec![false; c.n_layers * c.n_expert], ..Default::default() },
         })
@@ -879,6 +886,7 @@ impl SmolLm2Engine {
             }
         }
         self.cur_pos -= n_discard;
+        self.kv_shifts += 1;
         crate::vlog!("[kv:shift] evicted {n_discard} old tokens (kept {} system + {n_move} recent)", self.n_keep);
     }
 
@@ -1263,18 +1271,35 @@ impl SmolLm2Engine {
             turn_ids.drain(..turn_ids.len() - max_turn);
         }
         let mut last_hidden = self.feed(&turn_ids);
+        let reply_start = self.cur_pos;
+        let shifts_before = self.kv_shifts;
 
         let mut recent = Vec::with_capacity(max_new_tokens);
+        // Reasoning models: are we inside <think>, and where does the answer start in `recent`?
+        let mut in_think = false;
+        let mut answer_from: Option<usize> = None;
         let mut reply = String::new();
         // Bytes of a UTF-8 character that isn't complete yet.
         let mut pending: Vec<u8> = Vec::new();
         let mut generated = 0usize;
 
         for step in 0..max_new_tokens {
-            // Block stop tokens for the first 2 tokens so the reply is never empty.
-            let next_id = self.sample_next_token(&last_hidden, &recent, step < 2);
+            // Stop tokens are blocked for the first 2 tokens (no empty replies) and inside a
+            // <think> block: Qwen3 sometimes samples <|endoftext|> where </think> belongs, which
+            // ended the reply before any answer. Once the answer starts, the repetition
+            // penalty only looks at the answer, not at words the reasoning already used.
+            let penalty_window = &recent[answer_from.unwrap_or(0).min(recent.len())..];
+            let next_id = self.sample_next_token(&last_hidden, penalty_window, step < 2 || in_think);
             if self.stop_ids.contains(&next_id) {
                 break;
+            }
+            match self.think_ids {
+                Some((open, _)) if next_id == open => in_think = true,
+                Some((_, close)) if next_id == close => {
+                    in_think = false;
+                    answer_from = Some(recent.len() + 1);
+                }
+                _ => {}
             }
             pending.extend(self.token_bytes(next_id));
             let valid = match std::str::from_utf8(&pending) {
@@ -1296,6 +1321,21 @@ impl SmolLm2Engine {
             let piece = String::from_utf8_lossy(&pending).into_owned();
             on_text(&piece);
             reply.push_str(&piece);
+        }
+        // Qwen3's chat template keeps only the final answer of earlier turns, not their
+        // reasoning. Rewind the cache to the start of this reply and re-feed just the answer,
+        // which also saves context (the reasoning is usually the longer part). Skipped if the
+        // cache shifted during the reply, since `reply_start` no longer points at it.
+        if let Some(from) = answer_from {
+            if self.kv_shifts == shifts_before {
+                let answer: Vec<usize> = recent[from.min(recent.len())..]
+                    .iter()
+                    .copied()
+                    .skip_while(|&t| self.idx.vocab[t].chars().all(|c| c == '\u{010A}'))
+                    .collect();
+                self.cur_pos = reply_start;
+                self.feed(&answer);
+            }
         }
         // Close the assistant turn in the cache (`<|im_end|>\n`) so the next user turn
         // follows proper ChatML framing, whether we stopped on EOS or hit max_new_tokens.
