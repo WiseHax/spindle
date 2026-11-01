@@ -7,9 +7,8 @@ either crawl or take the whole machine down with them. spindle doesn't use llama
 or any ML framework. The GGUF parser, tokenizer, transformer, AVX2 kernels and thread pool
 are all in this repo.
 
-It's early. It runs SmolLM2 135M and 360M today, and has code paths for Qwen2/Qwen3 and
-mixture-of-experts models that pass unit tests but haven't been run on a real Qwen or MoE
-file yet. The goal is to run models bigger than RAM
+It's early. It runs SmolLM2 135M/360M and Qwen3-0.6B today. The mixture-of-experts code
+passes its unit tests but hasn't been run on a real MoE file yet. The goal is to run models bigger than RAM
 by streaming weights from the NVMe drive, mostly MoE models. That part isn't done yet; see
 [docs/roadmap.md](docs/roadmap.md).
 
@@ -18,7 +17,7 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
 - GGUF v3 parsing (metadata, tensors, vocab, BPE merges)
 - Llama-style models: RMSNorm, RoPE, grouped-query attention, SwiGLU
 - Qwen2/Qwen3 attention details: QKV bias, per-head Q/K norm, NEOX RoPE, `head_dim`
-  different from `dim / heads` (unit-tested, not yet run on a real Qwen file)
+  different from `dim / heads` (checked end to end on Qwen3-0.6B)
 - MoE layers: softmax router, top-k experts, optional shared expert, with per-turn stats on
   how many MiB of experts each token reads (unit-tested, not yet run on a real MoE file)
 - Byte-level BPE, so non-ASCII text (ñ, emoji, CJK) round-trips instead of being dropped
@@ -30,6 +29,7 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
 - Memory safety net for models bigger than RAM: the KV-cache is sized to free memory at
   startup, a governor caps spindle's working set so other apps keep their RAM, and weights
   that are about to be used are prefetched in large reads from a background thread
+- f16 KV-cache (half the RAM of f32, same output on the models tested)
 - Multi-turn chat with a KV-cache that slides when it fills up
 - Temperature, top-k, top-p, min-p sampling with a seed
 - `--probe` to measure your RAM and SSD bandwidth
@@ -85,8 +85,9 @@ quits.
 | `--repeat-penalty` | 1.1 | |
 | `--seed` | random | printed at startup, reuse it to get the same replies |
 | `--probe` | | measure RAM/SSD speed instead of chatting |
-| `--reserve` | 1024 | MiB of RAM to always leave free for other apps |
+| `--reserve` | 512 | MiB of RAM to always leave free for other apps |
 | `--ram-budget` | | hard cap on spindle's resident memory in MiB |
+| `--stream-layers` | off | read layers that don't fit with one large read each instead of paging them |
 | `$env:CHAT_THREADS` | 4 | |
 | `$env:CHAT_CTX` | 1024 | KV-cache length in tokens |
 
@@ -105,6 +106,7 @@ testing the low-memory path with a small model.
 | `src/worker_pool.rs` | thread pool used for matvecs |
 | `src/mmap_file.rs` | memory-mapped model files, background prefetcher |
 | `src/memory_guard.rs` | working-set governor |
+| `src/layer_stream.rs` | opt-in double-buffered layer reader |
 | `src/probe.rs` | bandwidth probe |
 | `src/main.rs` | CLI and CPU topology (P-core / E-core detection) |
 | `src/q4k_gemv.rs`, `transformer.rs`, `moe_engine.rs`, `rio_mesh.rs` | older experiments behind the synthetic benchmark, not used by chat |

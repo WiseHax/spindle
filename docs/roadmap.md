@@ -34,14 +34,15 @@ need roughly a 25% cache hit rate.
 - Memory safety net: KV-cache sized to free RAM, working-set governor (`--reserve`,
   `--ram-budget`) that shrinks under pressure and recovers, background prefetch of the next
   layer and chosen experts
+- f16 KV-cache, weight pinning against cyclic-scan thrash, 512 MiB default reserve, opt-in
+  double-buffered layer streaming (Qwen3-0.6B oversized run: 3.7 -> 24-29 tok/s)
 - MoE FFN (softmax router, top-k, shared expert), Qwen2/Qwen3 attention, NEOX RoPE,
   byte-level BPE, stop tokens from metadata, per-layer weights resolved at load time
 
 ## Next
 
-1. **Run a real MoE end to end.** The MoE layer, Qwen attention and NEOX RoPE are written and
-   unit-tested, but no Qwen or MoE GGUF has gone through them yet. Validate on a small dense
-   Qwen first, then a Qwen MoE, and compare output against llama.cpp.
+1. **Run a real MoE end to end.** Qwen attention and NEOX RoPE are confirmed on Qwen3-0.6B. The
+   MoE layer is unit-tested but no MoE GGUF has gone through it yet. Compare against llama.cpp.
 2. **Streaming file layout.** A one-time repack that puts each expert's tensors next to each
    other, 4 KiB aligned, so one large read gets a whole expert. The original GGUF stays as is.
 3. **Expert cache.** The governor now caps memory and recovers under pressure (see "Done"),

@@ -157,6 +157,26 @@ Tested on the dev laptop with SmolLM2-360M forced into streaming mode:
   and all four replies finished.
 - `CHAT_CTX=100000`: the KV-cache was shrunk from 8192 to 4365 tokens to fit.
 
+### Making the oversized case faster
+
+Measured with Qwen3-0.6B (610 MiB) on the dev laptop, greedy, same prompt:
+
+| Change | Result |
+|---|---|
+| Default reserve 1024 -> 512 MiB | the run that started at 3.7 tok/s now gets 24-29 tok/s when ~700 MiB is free. "Available" already includes the standby cache, so the larger reserve was squeezing a model that RAM could hold |
+| f16 KV-cache | private memory for SmolLM2-360M 98 -> 58 MiB; under a 450 MiB cap, 31 -> 111 MiB of weights pinned, 6.3 -> 7.8 tok/s |
+| Pinning (`VirtualLock`) a fixed part of the model | +10-20% under a cap, noisy. The working set acts like LRU, and LRU on a cyclic scan bigger than the cache misses on nearly every access; pinned bytes can't be evicted, so they always hit |
+| `--stream-layers` | page faults per reply 4M -> 41k, speed the same (~7-8 tok/s). That is the drive's speed: ~400 MiB read per token at ~2.5 GB/s. Splitting each read 4 ways didn't help either |
+
+Under a tight cap the soft faults themselves, not the SSD, were most of the time at first:
+21M faults in 35 s on the original run. Once the cap stops squeezing needlessly and more
+weights are pinned, what is left is the drive. Beyond that the only levers are reading fewer
+bytes per token: smaller quants, more RAM for pinning, and MoE models that read a fraction of
+their weights.
+
+`--stream-layers` stays opt-in because it plans residency once at startup and can't grow
+into memory that frees up later, while mmap paging can.
+
 ## The speed limit
 
 Generating a token reads every weight once and does little math per byte, so:
