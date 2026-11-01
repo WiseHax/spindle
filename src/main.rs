@@ -10,11 +10,13 @@
 
 #![allow(dead_code)]
 
+mod chat_cli;
 mod gguf_loader;
 mod moe_engine;
 mod q4k_gemv;
 mod rio_mesh;
 mod smollm_chat;
+mod ui;
 mod worker_pool;
 mod memory_guard;
 mod layer_stream;
@@ -229,7 +231,7 @@ unsafe fn lock_thread_to_core(target: LogicalCpu, role: &str) -> Result<()> {
 
     let running_on = GetCurrentProcessorNumber();
     let core_kind = if target.efficiency_class > 0 { "P-Core" } else { "E-Core" };
-    println!(
+    vlog!(
         "[pin:{role}] pinned to {core_kind} LP #{} (CpuSet {:#x}, PhysicalCore #{}, EffClass {}), active on LP #{}",
         target.logical_idx,
         target.cpu_set_id,
@@ -712,6 +714,8 @@ struct CliConfig {
     probe: bool,
     /// `--stream-layers`: read non-pinned layers with explicit I/O instead of paging.
     stream_layers: bool,
+    /// `--verbose`: print load and memory diagnostics.
+    verbose: bool,
     sampler: smollm_chat::SamplerConfig,
     /// `--ram-budget`: hard ceiling on spindle's resident memory, in MiB.
     ram_budget_mib: Option<u64>,
@@ -732,6 +736,7 @@ fn parse_cli() -> CliConfig {
         chat_mode: false,
         probe: false,
         stream_layers: false,
+        verbose: false,
         sampler: smollm_chat::SamplerConfig::default(),
         ram_budget_mib: None,
         reserve_mib: None,
@@ -793,6 +798,10 @@ fn parse_cli() -> CliConfig {
                 }
                 i += 2;
             }
+            "--verbose" | "-v" => {
+                cfg.verbose = true;
+                i += 1;
+            }
             "--stream-layers" => {
                 cfg.stream_layers = true;
                 i += 1;
@@ -825,6 +834,8 @@ fn main() -> Result<()> {
     }
     let cli = parse_cli();
     let path = cli.path.as_str();
+    // Chat is quiet unless asked; the synthetic benchmark keeps its full log.
+    ui::init(cli.verbose || !path.ends_with(".gguf"));
     if cli.probe {
         if let Err(e) = probe::run(path) {
             eprintln!("probe failed: {e}");
@@ -849,7 +860,7 @@ fn main() -> Result<()> {
 
     unsafe {
         let topo = detect_hybrid_topology()?;
-        println!(
+        vlog!(
             "[topo] {} logical CPUs: {} P-core threads ({} physical P-cores, EffClass {}) + {} E-Cores (EffClass 0)",
             topo.total_logical,
             topo.p_logical_count,
@@ -864,15 +875,11 @@ fn main() -> Result<()> {
         if gguf_idx.tensor_by_name.contains_key("token_embd.weight")
             && gguf_idx.tensor_by_name.contains_key("blk.0.attn_q.weight")
         {
-            println!(
-                "\n=== LIVE REAL-WEIGHT CONVERSATIONAL ENGINE ({}) ===",
-                gguf_idx.model_name
-            );
             lock_thread_to_core(topo.worker_pcores[0], "chat-pcore")?;
             let mut engine = match smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("[error] could not load model: {e}");
+                    eprintln!("{}", ui::warn(&format!("could not load {path}: {e}")));
                     std::process::exit(1);
                 }
             };
@@ -889,12 +896,12 @@ fn main() -> Result<()> {
                 let (p, first_streamed) = engine.plan_residency(pin_budget as usize, cli.stream_layers);
                 pinned = p as u64;
                 match first_streamed {
-                    Some(f) => println!(
+                    Some(f) => vlog!(
                         "[memory] pinned {} MiB in RAM (LM head + layers 0..{f}); streaming layers {f}..{} from disk",
                         pinned / memory_guard::MIB,
                         engine.cfg.n_layers
                     ),
-                    None => println!(
+                    None => vlog!(
                         "[memory] pinned {} MiB of hot weights in RAM; the rest pages in as needed",
                         pinned / memory_guard::MIB
                     ),
@@ -914,22 +921,21 @@ fn main() -> Result<()> {
             let governor = if engine.is_streaming() || budget.ceiling.is_some() {
                 memory_guard::Governor::start(budget)
             } else {
-                println!("[memory] model fits in RAM, no working-set cap needed (use --ram-budget to force one)");
+                vlog!("[memory] model fits in RAM, no working-set cap needed (use --ram-budget to force one)");
                 None
             };
             match &governor {
-                Some(g) => println!(
+                Some(g) => vlog!(
                     "[memory] governor on: keeping {} MiB free for other apps, current cap {} MiB{}",
                     budget.reserve / memory_guard::MIB,
                     g.status.cap.load(std::sync::atomic::Ordering::Relaxed) / memory_guard::MIB,
                     budget.ceiling.map_or(String::new(), |c| format!(", hard ceiling {} MiB", c / memory_guard::MIB))
                 ),
                 None if engine.is_streaming() || budget.ceiling.is_some() => {
-                    eprintln!("[warn] Windows refused the working-set limit; running without the memory governor")
+                    ui::note("Windows refused the working-set limit; running without the memory governor")
                 }
                 None => {}
             }
-            let mut last_faults = memory_guard::process_counters().2;
             // One thread per physical P-core: main on worker_pcores[0], helpers on the rest.
             // Override with `$env:CHAT_THREADS = "1"` to benchmark single-threaded.
             let chat_cores = [
@@ -946,81 +952,20 @@ fn main() -> Result<()> {
             engine.enable_threads(n_threads, move |i| {
                 let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
             });
-            println!("[chat] {n_threads} matvec thread(s) on P-Cores");
             engine.set_sampler(cli.sampler);
             let sc = cli.sampler;
-            println!(
-                "[chat] sampling: temp={} top_k={} top_p={} min_p={} repeat_penalty={} seed={}",
+            vlog!(
+                "[chat] {n_threads} threads, temp={} top_k={} top_p={} min_p={} repeat_penalty={} seed={}",
                 sc.temperature, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty, sc.seed
             );
-            // `--chat` alone goes straight to the `You > ` prompt.
-            if cli.prompt_given || !cli.chat_mode {
-                let (_reply, secs, total_toks) = engine.generate_reply(&cli.prompt, 256);
-                println!(
-                    "[chat:stats] {} total tokens (prompt + reply) in {:.2} s => {:.1} tok/s on P-Core LP #{}",
-                    total_toks,
-                    secs,
-                    (total_toks as f64) / secs,
-                    topo.worker_pcores[0].logical_idx
-                );
-            } else {
-                println!("[chat] type a message (/clear to reset, exit to quit)");
-            }
-
-            if cli.chat_mode {
-                use std::io::{BufRead, Write};
-                let stdin = std::io::stdin();
-                loop {
-                    print!("\nYou > ");
-                    let _ = std::io::stdout().flush();
-                    let mut line = String::new();
-                    match stdin.lock().read_line(&mut line) {
-                        Ok(0) | Err(_) => break, // EOF / closed stdin
-                        Ok(_) => {}
-                    }
-                    // PowerShell pipes may prepend a UTF-8 BOM to the first line.
-                    let trimmed = line.trim_start_matches('\u{feff}').trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit") {
-                        break;
-                    }
-                    if trimmed.eq_ignore_ascii_case("/clear") || trimmed.eq_ignore_ascii_case("/reset") {
-                        engine.reset_kv();
-                        println!("[chat] conversation history cleared.");
-                        continue;
-                    }
-                    let (_r, s, toks) = engine.generate_reply(trimmed, 512);
-                    let (ws, private, faults) = memory_guard::process_counters();
-                    let mib = |b: u64| b / memory_guard::MIB;
-                    let guard = governor.as_ref().map_or(String::new(), |g| {
-                        let st = &g.status;
-                        let ord = std::sync::atomic::Ordering::Relaxed;
-                        format!(
-                            " | cap {} MiB, {} MiB free{}",
-                            mib(st.cap.load(ord)),
-                            mib(st.available.load(ord)),
-                            match st.squeezes.load(ord) {
-                                0 => String::new(),
-                                n => format!(", squeezed {n}x"),
-                            }
-                        )
-                    });
-                    println!(
-                        "[chat:stats] {:.1} tok/s ({:.2} s) | RAM: {} MiB working set ({} MiB private){guard} | {} page faults",
-                        (toks as f64) / s,
-                        s,
-                        mib(ws),
-                        mib(private),
-                        faults - last_faults
-                    );
-                    last_faults = faults;
-                    if let Some((mib, touched, total)) = engine.take_moe_stats() {
-                        println!("[moe] {mib:.1} MiB of expert weights read per token, {touched}/{total} experts used this turn");
-                    }
-                }
-            }
+            let opts = chat_cli::ChatOptions {
+                // `--chat` alone goes straight to the prompt; without `--chat`, answer once.
+                first_prompt: (cli.prompt_given || !cli.chat_mode).then(|| cli.prompt.clone()),
+                interactive: cli.chat_mode,
+                threads: n_threads,
+            };
+            chat_cli::print_header(&engine, &opts);
+            chat_cli::run(&mut engine, governor.as_ref(), opts);
             return Ok(());
         }
 
