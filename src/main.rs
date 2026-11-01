@@ -16,6 +16,7 @@ mod q4k_gemv;
 mod rio_mesh;
 mod smollm_chat;
 mod worker_pool;
+mod memory_guard;
 mod mmap_file;
 mod probe;
 mod quant;
@@ -709,6 +710,10 @@ struct CliConfig {
     chat_mode: bool,
     probe: bool,
     sampler: smollm_chat::SamplerConfig,
+    /// `--ram-budget`: hard ceiling on spindle's resident memory, in MiB.
+    ram_budget_mib: Option<u64>,
+    /// `--reserve`: RAM to always leave free for other programs, in MiB.
+    reserve_mib: Option<u64>,
 }
 
 fn parse_cli() -> CliConfig {
@@ -724,6 +729,8 @@ fn parse_cli() -> CliConfig {
         chat_mode: false,
         probe: false,
         sampler: smollm_chat::SamplerConfig::default(),
+        ram_budget_mib: None,
+        reserve_mib: None,
     };
 
     let mut pos = Vec::new();
@@ -767,6 +774,18 @@ fn parse_cli() -> CliConfig {
                     "--min-p" => cfg.sampler.min_p = f(),
                     "--repeat-penalty" => cfg.sampler.repeat_penalty = f(),
                     _ => cfg.sampler.seed = v.parse().unwrap_or_else(|_| bad()),
+                }
+                i += 2;
+            }
+            "--ram-budget" | "--reserve" if i + 1 < args.len() => {
+                let mib: u64 = args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("{} takes a size in MiB, got {}", args[i], args[i + 1]);
+                    std::process::exit(2)
+                });
+                if args[i] == "--ram-budget" {
+                    cfg.ram_budget_mib = Some(mib);
+                } else {
+                    cfg.reserve_mib = Some(mib);
                 }
                 i += 2;
             }
@@ -842,8 +861,40 @@ fn main() -> Result<()> {
                 gguf_idx.model_name
             );
             lock_thread_to_core(topo.worker_pcores[0], "chat-pcore")?;
-            let mut engine =
-                smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx).expect("failed to load model");
+            let mut engine = match smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("[error] could not load model: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let budget = memory_guard::Budget {
+                reserve: cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB),
+                floor: engine.private_bytes_estimate() + 128 * memory_guard::MIB,
+                ceiling: cli.ram_budget_mib.map(|m| m * memory_guard::MIB),
+            };
+            // A model that fits in RAM needs no cap: its clean, file-backed pages are cheap for
+            // Windows to reclaim. The cap matters when the model is bigger than free memory,
+            // or when the user asked for a hard budget.
+            let governor = if engine.is_streaming() || budget.ceiling.is_some() {
+                memory_guard::Governor::start(budget)
+            } else {
+                println!("[memory] model fits in RAM, no working-set cap needed (use --ram-budget to force one)");
+                None
+            };
+            match &governor {
+                Some(g) => println!(
+                    "[memory] governor on: keeping {} MiB free for other apps, current cap {} MiB{}",
+                    budget.reserve / memory_guard::MIB,
+                    g.status.cap.load(std::sync::atomic::Ordering::Relaxed) / memory_guard::MIB,
+                    budget.ceiling.map_or(String::new(), |c| format!(", hard ceiling {} MiB", c / memory_guard::MIB))
+                ),
+                None if engine.is_streaming() || budget.ceiling.is_some() => {
+                    eprintln!("[warn] Windows refused the working-set limit; running without the memory governor")
+                }
+                None => {}
+            }
+            let mut last_faults = memory_guard::process_counters().2;
             // One thread per physical P-core: main on worker_pcores[0], helpers on the rest.
             // Override with `$env:CHAT_THREADS = "1"` to benchmark single-threaded.
             let chat_cores = [
@@ -906,12 +957,30 @@ fn main() -> Result<()> {
                         continue;
                     }
                     let (_r, s, toks) = engine.generate_reply(trimmed, 512);
-                    let (ws, private) = mmap_file::process_memory_mib();
+                    let (ws, private, faults) = memory_guard::process_counters();
+                    let mib = |b: u64| b / memory_guard::MIB;
+                    let guard = governor.as_ref().map_or(String::new(), |g| {
+                        let st = &g.status;
+                        let ord = std::sync::atomic::Ordering::Relaxed;
+                        format!(
+                            " | cap {} MiB, {} MiB free{}",
+                            mib(st.cap.load(ord)),
+                            mib(st.available.load(ord)),
+                            match st.squeezes.load(ord) {
+                                0 => String::new(),
+                                n => format!(", squeezed {n}x"),
+                            }
+                        )
+                    });
                     println!(
-                        "[chat:stats] {:.1} tok/s ({:.2} s) | RAM: {ws:.0} MiB working set ({private:.0} MiB private)",
+                        "[chat:stats] {:.1} tok/s ({:.2} s) | RAM: {} MiB working set ({} MiB private){guard} | {} page faults",
                         (toks as f64) / s,
-                        s
+                        s,
+                        mib(ws),
+                        mib(private),
+                        faults - last_faults
                     );
+                    last_faults = faults;
                     if let Some((mib, touched, total)) = engine.take_moe_stats() {
                         println!("[moe] {mib:.1} MiB of expert weights read per token, {touched}/{total} experts used this turn");
                     }
