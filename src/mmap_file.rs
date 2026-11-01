@@ -18,7 +18,7 @@ use windows::{
         },
         System::{
             Memory::{
-                CreateFileMappingW, MapViewOfFile, PrefetchVirtualMemory, UnmapViewOfFile,
+                CreateFileMappingW, MapViewOfFile, PrefetchVirtualMemory, UnmapViewOfFile, VirtualLock,
                 FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READONLY, WIN32_MEMORY_RANGE_ENTRY,
             },
             ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
@@ -94,6 +94,21 @@ impl MappedFile {
     /// our working set, so this never pushes other apps out. A hint only: errors are ignored.
     pub fn prefetch_ranges(&self, ranges: &[(usize, usize)]) {
         prefetch_raw(self.ptr as usize, self.len, ranges);
+    }
+
+    /// Locks `(offset, len)` ranges into our working set (reading them in first). Locked pages
+    /// are never trimmed, so they can't be the victims of the scan-order thrash described in
+    /// `SmolLm2Engine::pin_hot_weights`. Returns how many bytes were locked. The lock lasts
+    /// until the view is unmapped.
+    pub fn lock_ranges(&self, ranges: &[(usize, usize)]) -> usize {
+        // Read ahead in big I/Os first; VirtualLock would otherwise fault page by page.
+        self.prefetch_ranges(ranges);
+        ranges
+            .iter()
+            .filter(|&&(off, len)| len > 0 && off + len <= self.len)
+            .filter(|&&(off, len)| unsafe { VirtualLock(self.ptr.add(off) as *const c_void, len).is_ok() })
+            .map(|&(_, len)| len)
+            .sum()
     }
 }
 
