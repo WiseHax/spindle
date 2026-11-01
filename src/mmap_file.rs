@@ -88,6 +88,71 @@ impl MappedFile {
         };
         unsafe { PrefetchVirtualMemory(GetCurrentProcess(), &[range], 0).is_ok() }
     }
+
+    /// Asks Windows to start reading these `(offset, len)` ranges in the background with
+    /// large I/Os, instead of 4 KiB page faults later. Pages go to the standby cache, not
+    /// our working set, so this never pushes other apps out. A hint only: errors are ignored.
+    pub fn prefetch_ranges(&self, ranges: &[(usize, usize)]) {
+        prefetch_raw(self.ptr as usize, self.len, ranges);
+    }
+}
+
+fn prefetch_raw(base: usize, file_len: usize, ranges: &[(usize, usize)]) {
+    let entries: Vec<WIN32_MEMORY_RANGE_ENTRY> = ranges
+        .iter()
+        .filter(|&&(off, len)| len > 0 && off + len <= file_len)
+        .map(|&(off, len)| WIN32_MEMORY_RANGE_ENTRY { VirtualAddress: (base + off) as *mut c_void, NumberOfBytes: len })
+        .collect();
+    if !entries.is_empty() {
+        unsafe {
+            let _ = PrefetchVirtualMemory(GetCurrentProcess(), &entries, 0);
+        }
+    }
+}
+
+/// Issues prefetch hints from a background thread. `PrefetchVirtualMemory` walks every page
+/// in the range before returning, which costs real time even when the pages are already
+/// resident; doing it here keeps that off the compute thread. Requests that pile up while
+/// the thread is busy are merged into one call.
+pub struct Prefetcher {
+    tx: Option<std::sync::mpsc::Sender<Vec<(usize, usize)>>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Prefetcher {
+    /// # Safety
+    /// `file` must stay mapped until this `Prefetcher` is dropped.
+    pub unsafe fn new(file: &MappedFile) -> Self {
+        let (base, len) = (file.ptr as usize, file.len);
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(usize, usize)>>();
+        let handle = std::thread::Builder::new()
+            .name("prefetch".into())
+            .spawn(move || {
+                while let Ok(mut ranges) = rx.recv() {
+                    while let Ok(more) = rx.try_recv() {
+                        ranges.extend(more);
+                    }
+                    prefetch_raw(base, len, &ranges);
+                }
+            })
+            .ok();
+        Self { tx: handle.as_ref().map(|_| tx), handle }
+    }
+
+    pub fn hint(&self, ranges: Vec<(usize, usize)>) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(ranges);
+        }
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl Deref for MappedFile {
