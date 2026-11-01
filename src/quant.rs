@@ -301,20 +301,40 @@ unsafe fn hsum_avx2(v: __m256) -> f32 {
     _mm_cvtss_f32(x)
 }
 
-/// Computes rows `r0..r1` of `W * x` into `out` (`out.len() == r1 - r0`)
-/// for any GGUF tensor quantization type (`Q8_0`, `Q5_0`, `Q4_K`, `Q6_K`, `F32`).
+/// A 2D weight matrix inside the mapped file: `rows` rows of `cols` weights of `dtype`,
+/// starting `offset` bytes into the file. For a 3D expert tensor (`[cols, rows, n_expert]`)
+/// `expert(e)` gives the view of one expert's slab.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Mat {
+    pub dtype: GgmlType,
+    pub offset: usize,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl Mat {
+    pub fn of(info: &GgufTensorInfo) -> Self {
+        Self {
+            dtype: info.dtype,
+            offset: info.abs_file_offset as usize,
+            cols: info.dims[0] as usize,
+            rows: info.dims.get(1).copied().unwrap_or(1) as usize,
+        }
+    }
+
+    pub fn expert(self, e: usize) -> Self {
+        let rb = row_bytes(self.dtype, self.cols).expect("unsupported expert tensor type");
+        Self { offset: self.offset + e * self.rows * rb, ..self }
+    }
+}
+
+/// Computes rows `r0..r0 + out.len()` of `W * x` into `out`.
 #[target_feature(enable = "avx2,fma")]
-pub(crate) unsafe fn matvec_rows_avx2(
-    base_ptr: *const u8,
-    info: &GgufTensorInfo,
-    x: &[f32],
-    out: &mut [f32],
-    r0: usize,
-) {
-    let n_cols = info.dims[0] as usize;
+pub(crate) unsafe fn matvec_rows_avx2(base_ptr: *const u8, m: &Mat, x: &[f32], out: &mut [f32], r0: usize) {
+    let n_cols = m.cols;
     debug_assert_eq!(x.len(), n_cols);
 
-    let tensor_ptr = base_ptr.add(info.abs_file_offset as usize);
+    let tensor_ptr = base_ptr.add(m.offset);
     let xp = x.as_ptr();
 
     macro_rules! rows {
@@ -324,7 +344,7 @@ pub(crate) unsafe fn matvec_rows_avx2(
             }
         };
     }
-    match info.dtype {
+    match m.dtype {
         GgmlType::Q8_0 => rows!((n_cols / 32) * 34, dot_q8_0_row_avx2),
         GgmlType::Q4_0 => rows!((n_cols / 32) * 18, dot_q4_0_row_avx2),
         GgmlType::Q4_1 => rows!((n_cols / 32) * 20, dot_q4_1_row_avx2),
@@ -773,16 +793,10 @@ mod tests {
                     mat.extend(random_row(dtype, n, &mut rng));
                 }
                 let x: Vec<f32> = (0..n).map(|_| rng.f(-1.0, 1.0)).collect();
-                let info = GgufTensorInfo {
-                    name: "test".into(),
-                    dims: vec![n as u64, rows as u64],
-                    dtype,
-                    rel_offset: 0,
-                    abs_file_offset: 0,
-                };
+                let m = Mat { dtype, offset: 0, cols: n, rows };
                 // Rows 1..5 through the r0 offset path.
                 let mut out = vec![0.0f32; rows - 1];
-                unsafe { matvec_rows_avx2(mat.as_ptr(), &info, &x, &mut out, 1) };
+                unsafe { matvec_rows_avx2(mat.as_ptr(), &m, &x, &mut out, 1) };
 
                 let rb = row_bytes(dtype, n).unwrap();
                 for (i, &got) in out.iter().enumerate() {
