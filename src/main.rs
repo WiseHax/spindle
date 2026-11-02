@@ -11,6 +11,8 @@
 #![allow(dead_code)]
 
 mod chat_cli;
+mod expert_cache;
+mod expert_pack;
 mod gguf_loader;
 mod moe_engine;
 mod q4k_gemv;
@@ -27,6 +29,7 @@ mod transformer;
 
 use std::{
     ffi::c_void,
+    io::Write,
     mem::size_of,
     net::{Ipv4Addr, SocketAddrV4},
     ptr,
@@ -725,6 +728,11 @@ struct CliConfig {
     ram_budget_mib: Option<u64>,
     /// `--reserve`: RAM to always leave free for other programs, in MiB.
     reserve_mib: Option<u64>,
+    /// `--pack-experts`: repacks an MoE model's expert weights into `<model>.spindle.pack`.
+    pack_experts: bool,
+    /// `--expert-cache-mib`: turn on the MoE expert cache with this RAM budget (needs a pack
+    /// from `--pack-experts`).
+    expert_cache_mib: Option<usize>,
 }
 
 fn parse_cli() -> CliConfig {
@@ -746,6 +754,8 @@ fn parse_cli() -> CliConfig {
         sampler: smollm_chat::SamplerConfig::default(),
         ram_budget_mib: None,
         reserve_mib: None,
+        pack_experts: false,
+        expert_cache_mib: None,
     };
 
     let mut pos = Vec::new();
@@ -827,6 +837,14 @@ fn parse_cli() -> CliConfig {
                 cfg.probe = true;
                 i += 1;
             }
+            "--pack-experts" => {
+                cfg.pack_experts = true;
+                i += 1;
+            }
+            "--expert-cache-mib" if i + 1 < args.len() => {
+                cfg.expert_cache_mib = args[i + 1].parse().ok();
+                i += 2;
+            }
             other => {
                 pos.push(other.to_string());
                 i += 1;
@@ -900,6 +918,68 @@ fn main() -> Result<()> {
                     std::process::exit(1);
                 }
             };
+
+            if cli.pack_experts {
+                if !engine.is_moe() {
+                    eprintln!("{}", ui::warn(&format!("{path} is not an MoE model")));
+                    std::process::exit(1);
+                }
+                let pack_path = expert_pack::pack_path_for_model(path);
+                println!(
+                    "Repacking {} MoE experts ({} layers x {} experts) into {}...",
+                    engine.cfg.n_layers * engine.cfg.n_expert,
+                    engine.cfg.n_layers,
+                    engine.cfg.n_expert,
+                    pack_path
+                );
+                let t0 = Instant::now();
+                match engine.repack_moe_experts(|l, nl, written, total| {
+                    print!(
+                        "\r[repack] layer {l}/{nl} ({:.1}%) · {:.1} MiB / {:.1} MiB",
+                        (written as f64 / total as f64) * 100.0,
+                        written as f64 / (1024.0 * 1024.0),
+                        total as f64 / (1024.0 * 1024.0)
+                    );
+                    let _ = std::io::stdout().flush();
+                }) {
+                    Ok(idx) => {
+                        println!();
+                        println!(
+                            "Done in {:.2} s: {} total experts, slot size {:.2} MiB, total pack file {:.1} MiB",
+                            t0.elapsed().as_secs_f64(),
+                            idx.hdr.n_layers * idx.hdr.n_expert,
+                            idx.hdr.expert_slot_bytes as f64 / (1024.0 * 1024.0),
+                            ((idx.hdr.n_layers * idx.hdr.n_expert) as f64 * idx.hdr.expert_slot_bytes as f64) / (1024.0 * 1024.0)
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        eprintln!("\n{}", ui::warn(&format!("repack failed: {e}")));
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            // The expert cache is opt-in (--expert-cache-mib): measured on Granite 1B-A400M it is
+            // 2-3x slower than reading experts through the mmap, because every miss goes to the
+            // SSD while mapped pages are often still in Windows' standby cache.
+            if engine.is_moe() && cli.expert_cache_mib.is_some_and(|m| m > 0) {
+                let pack_path = expert_pack::pack_path_for_model(path);
+                if !expert_pack::is_pack_valid(path, &pack_path) {
+                    ui::note(&format!("no expert pack for {path}; run with --pack-experts first"));
+                } else {
+                    // Free RAM minus the reserve and 128 MiB of engine headroom, unless
+                    // --expert-cache-mib says otherwise. ExpertCache::open refuses budgets
+                    // below one layer of experts, and the engine then reads from the mmap.
+                    let reserve = cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB) as usize;
+                    let budget = cli.expert_cache_mib.map(|m| m << 20).unwrap_or_else(|| {
+                        (mmap_file::available_ram_bytes() as usize).saturating_sub(reserve + (128 << 20))
+                    });
+                    if let Err(e) = engine.enable_expert_cache(budget) {
+                        ui::note(&format!("expert cache off ({e}); reading experts from the mapped file"));
+                    }
+                }
+            }
             let reserve = cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB);
             let ceiling = cli.ram_budget_mib.map(|m| m * memory_guard::MIB);
             let mut private = engine.private_bytes_estimate();

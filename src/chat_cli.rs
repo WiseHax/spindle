@@ -103,6 +103,17 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
             parts.push(format!("{mib:.0} MiB experts/token, {touched}/{total} experts used"));
         }
     }
+    if let Some(c) = engine.expert_cache.as_ref() {
+        if detailed {
+            parts.push(format!(
+                "cache: {:.1}% hit ({}/{}), {:.1} MiB from disk",
+                c.hit_rate(),
+                c.hits,
+                c.hits + c.misses,
+                c.bytes_read as f64 / (1024.0 * 1024.0)
+            ));
+        }
+    }
     parts.join(" · ")
 }
 

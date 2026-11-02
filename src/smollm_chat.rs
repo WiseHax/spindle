@@ -372,6 +372,7 @@ unsafe fn moe_forward(
     out: &mut [f32],
     stats: Option<(&mut MoeStats, usize)>,
     prefetch: Option<&Prefetcher>,
+    mut cache: Option<&mut crate::expert_cache::ExpertCache>,
 ) {
     let mut probs = vec![0.0f32; m.n_expert];
     matvec(pool, base, &m.router, x, &mut probs);
@@ -386,8 +387,14 @@ unsafe fn moe_forward(
     let wsum: f32 = chosen.iter().map(|&e| probs[e]).sum();
 
     // Start reading every chosen expert now, so experts 2..k load while expert 1 computes.
-    if let Some(pf) = prefetch {
+    // Not needed when the expert cache serves them: that would read each expert twice.
+    if let (Some(pf), None) = (prefetch, cache.as_ref()) {
         pf.hint(chosen.iter().flat_map(|&e| m.experts.expert(e).spans()).collect());
+    }
+
+    let layer = stats.as_ref().map(|s| s.1).unwrap_or(0);
+    if let Some(c) = cache.as_mut() {
+        let _ = c.ensure_experts(layer, &chosen);
     }
 
     out.fill(0.0);
@@ -396,13 +403,26 @@ unsafe fn moe_forward(
     for &e in &chosen {
         let w = if m.norm { probs[e] / wsum } else { probs[e] };
         let f = m.experts.expert(e);
-        ffn_forward(pool, base, &f, x, &mut tmp);
+        let [g_span, u_span, _d_span] = f.spans();
+        let cached_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+
+        if let Some(c_ptr) = cached_ptr {
+            let packed_f = Ffn {
+                gate: Mat { offset: 0, ..f.gate },
+                up: Mat { offset: g_span.1, ..f.up },
+                down: Mat { offset: g_span.1 + u_span.1, ..f.down },
+            };
+            ffn_forward(pool, c_ptr, &packed_f, x, &mut tmp);
+        } else {
+            ffn_forward(pool, base, &f, x, &mut tmp);
+        }
+
         for i in 0..out.len() {
             out[i] += w * tmp[i];
         }
-        if let Some((s, layer)) = stats.as_mut() {
+        if let Some((s, _)) = stats.as_mut() {
             s.expert_bytes += f.bytes();
-            s.touched[*layer * m.n_expert + e] = true;
+            s.touched[layer * m.n_expert + e] = true;
         }
     }
     if let Some(sh) = &m.shared {
@@ -529,6 +549,8 @@ pub struct SmolLm2Engine {
     prefetcher: Option<Prefetcher>,
     /// Reads layers `first..` into private buffers when they don't fit in RAM.
     streamer: Option<crate::layer_stream::LayerStreamer>,
+    /// Explicit in-RAM expert cache for streaming MoE weights from disk.
+    pub expert_cache: Option<crate::expert_cache::ExpertCache>,
     /// `(file offset, length)` per layer, if every layer is one contiguous dense block.
     layer_spans: Option<Vec<(usize, usize)>>,
     path: String,
@@ -725,6 +747,7 @@ impl SmolLm2Engine {
         let mut engine = Self {
             prefetcher,
             streamer: None,
+            expert_cache: None,
             layer_spans,
             path: path.to_string(),
             rope: Rope::new(c.head_dim, c.rope_theta, c.rope_neox),
@@ -950,7 +973,8 @@ impl SmolLm2Engine {
 
     /// Private memory this engine keeps resident: KV-cache plus per-token scratch.
     pub fn private_bytes_estimate(&self) -> u64 {
-        let buffers = self.streamer.as_ref().map_or(0, |s| 2 * s.max_buffer());
+        let buffers = self.streamer.as_ref().map_or(0, |s| 2 * s.max_buffer())
+            + self.expert_cache.as_ref().map_or(0, |c| c.bytes());
         ((self.k_cache.len() + self.v_cache.len()) * 2 + self.cfg.vocab * 8 + 64 * 1024 * 1024 + buffers) as u64
     }
 
@@ -972,6 +996,67 @@ impl SmolLm2Engine {
         s.expert_bytes = 0;
         s.touched.fill(false);
         Some((per_tok, touched, total))
+    }
+
+    /// Repacks all MoE expert weights into a single contiguous 4096-aligned sidecar file
+    /// `<model>.spindle.pack`. Returns the written `PackIndex`.
+    pub fn repack_moe_experts<P: FnMut(usize, usize, u64, u64)>(&self, progress: P) -> std::io::Result<crate::expert_pack::PackIndex> {
+        if !self.is_moe() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "model has no MoE layers"));
+        }
+        let pack_path = crate::expert_pack::pack_path_for_model(&self.path);
+        let expert_spans = |l: usize, e: usize| -> [(usize, usize); 3] {
+            match &self.layers[l].ffn {
+                FfnKind::Moe(m) => m.experts.expert(e).spans(),
+                _ => panic!("layer {l} is not an MoE layer"),
+            }
+        };
+        crate::expert_pack::repack_experts(
+            &self.raw_bytes,
+            self.raw_bytes.len() as u64,
+            &pack_path,
+            self.cfg.n_layers,
+            self.cfg.n_expert,
+            &expert_spans,
+            progress,
+        )
+    }
+
+    /// Opens an in-RAM expert cache for `<model>.spindle.pack` with the specified budget.
+    pub fn enable_expert_cache(&mut self, budget_bytes: usize) -> std::io::Result<()> {
+        if !self.is_moe() {
+            return Ok(());
+        }
+        let pack_path = crate::expert_pack::pack_path_for_model(&self.path);
+        if !crate::expert_pack::is_pack_valid(&self.path, &pack_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("no valid pack file found at {pack_path}"),
+            ));
+        }
+        let cache = crate::expert_cache::ExpertCache::open(&pack_path, budget_bytes)?;
+        let h = &cache.pack_idx.hdr;
+        let first_moe = self.layers.iter().find_map(|l| match &l.ffn {
+            FfnKind::Moe(m) => Some(m.experts.expert(0).spans()),
+            _ => None,
+        });
+        let shape_ok = h.n_layers as usize == self.cfg.n_layers
+            && h.n_expert as usize == self.cfg.n_expert
+            && first_moe.is_some_and(|s| (s[0].1 as u64, s[1].1 as u64, s[2].1 as u64) == (h.gate_bytes, h.up_bytes, h.down_bytes));
+        if !shape_ok {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{pack_path} doesn't match this model's experts; delete it and run --pack-experts again"),
+            ));
+        }
+        crate::vlog!(
+            "[expert:cache] enabled in-RAM cache: {} expert slots ({:.1} MiB budget), slot size {:.2} MiB",
+            cache.capacity(),
+            (cache.capacity() * cache.slot_bytes) as f64 / (1024.0 * 1024.0),
+            cache.slot_bytes as f64 / (1024.0 * 1024.0)
+        );
+        self.expert_cache = Some(cache);
+        Ok(())
     }
 
     /// Makes room for `needed` more positions by evicting the oldest non-system tokens.
@@ -1139,7 +1224,16 @@ impl SmolLm2Engine {
             rmsnorm(&x, f32_at(lbase, ly.ffn_norm, c.dim), &mut x_norm, c.rms_eps);
             match &ly.ffn {
                 FfnKind::Dense(f) => ffn_forward(pool, lbase, f, &x_norm, &mut proj_out),
-                FfnKind::Moe(m) => moe_forward(pool, lbase, m, &x_norm, &mut proj_out, Some((&mut self.moe_stats, l)), hint),
+                FfnKind::Moe(m) => moe_forward(
+                    pool,
+                    lbase,
+                    m,
+                    &x_norm,
+                    &mut proj_out,
+                    Some((&mut self.moe_stats, l)),
+                    hint,
+                    self.expert_cache.as_mut(),
+                ),
             }
             for i in 0..c.dim {
                 x[i] += c.residual_scale * proj_out[i];
@@ -1641,7 +1735,7 @@ mod tests {
                 shared_gate: shared.then_some(sh_gate),
             };
             let mut got = vec![0.0f32; dim];
-            unsafe { moe_forward(None, base, &moe, &x, &mut got, None, None) };
+            unsafe { moe_forward(None, base, &moe, &x, &mut got, None, None, None) };
 
             // Reference.
             let logits: Vec<f32> = (0..n_exp).map(|e| (0..dim).map(|c| w(&router, 0, e, c) * x[c]).sum()).collect();
