@@ -2,20 +2,21 @@
 //!
 //! Replaces mmap-demand paging for MoE expert layers with an explicit, bounded RAM cache.
 //! Sized to a target memory budget (e.g. 256 MiB–1 GiB), it holds `N` 4096-byte-aligned
-//! expert slots. Unbuffered direct reads (`FILE_FLAG_NO_BUFFERING`) fetch missing experts
-//! directly into the slots from the repacked `.spindle.pack` file at full NVMe bandwidth.
+//! expert slots. Buffered sequential reads (`FILE_FLAG_SEQUENTIAL_SCAN`) fetch missing experts
+//! from the repacked `.spindle.pack` file, allowing misses to be served from the OS file cache.
+//! Unbuffered direct I/O remains opt-in via `SPINDLE_DIRECT_IO=1`.
 
 use std::{
     alloc::{alloc, dealloc, Layout},
     collections::HashMap,
     fs::File,
-    os::windows::{
-        fs::{FileExt, OpenOptionsExt},
-    },
+    os::windows::fs::{FileExt, OpenOptionsExt},
+    sync::{Arc, Condvar, Mutex},
+    thread::{self, JoinHandle},
 };
 
 use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
+    FILE_FLAG_NO_BUFFERING, FILE_FLAG_RANDOM_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN,
 };
 
 use crate::expert_pack::{PackIndex, PACK_ALIGN};
@@ -63,13 +64,147 @@ struct CacheSlot {
     buf: AlignedSlotBuf,
 }
 
+struct ReadTask {
+    expert: usize,
+    slot_idx: usize,
+    offset: u64,
+    dst_ptr: usize,
+    len: usize,
+}
+
+struct WorkerJob {
+    expert: usize,
+    slot_idx: usize,
+    offset: u64,
+    dst_ptr: usize,
+    len: usize,
+}
+
+struct ReaderWorkerState {
+    jobs: Vec<WorkerJob>,
+    remaining: usize,
+    failed: Vec<(usize, std::io::Error)>,
+    shutdown: bool,
+}
+
+struct ReaderPool {
+    state: Arc<(Mutex<ReaderWorkerState>, Condvar)>,
+    done_cvar: Arc<Condvar>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl ReaderPool {
+    pub fn new(pack_path: &str, flags: u32, n_workers: usize) -> std::io::Result<Self> {
+        let state = Arc::new((
+            Mutex::new(ReaderWorkerState {
+                jobs: Vec::new(),
+                remaining: 0,
+                failed: Vec::new(),
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ));
+        let done_cvar = Arc::new(Condvar::new());
+        let mut handles = Vec::with_capacity(n_workers);
+
+        for i in 0..n_workers {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags)
+                .open(pack_path)?;
+            let state = Arc::clone(&state);
+            let done_cvar = Arc::clone(&done_cvar);
+
+            let handle = thread::Builder::new()
+                .name(format!("expert-reader-{i}"))
+                .spawn(move || {
+                    let (lock, cvar) = &*state;
+                    loop {
+                        let job = {
+                            let mut s = lock.lock().unwrap();
+                            loop {
+                                if s.shutdown {
+                                    return;
+                                }
+                                if let Some(j) = s.jobs.pop() {
+                                    break j;
+                                }
+                                s = cvar.wait(s).unwrap();
+                            }
+                        };
+
+                        let slice = unsafe { std::slice::from_raw_parts_mut(job.dst_ptr as *mut u8, job.len) };
+                        let res = read_exact_at(&file, slice, job.offset);
+
+                        let mut s = lock.lock().unwrap();
+                        if let Err(e) = res {
+                            s.failed.push((job.expert, e));
+                        }
+                        s.remaining -= 1;
+                        if s.remaining == 0 {
+                            done_cvar.notify_one();
+                        }
+                    }
+                })?;
+            handles.push(handle);
+        }
+
+        Ok(Self { state, done_cvar, handles })
+    }
+
+    pub fn read_batch(&self, tasks: &[ReadTask]) -> Vec<(usize, std::io::Error)> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+
+        let (lock, cvar) = &*self.state;
+        {
+            let mut s = lock.lock().unwrap();
+            s.jobs = tasks
+                .iter()
+                .map(|t| WorkerJob {
+                    expert: t.expert,
+                    slot_idx: t.slot_idx,
+                    offset: t.offset,
+                    dst_ptr: t.dst_ptr,
+                    len: t.len,
+                })
+                .collect();
+            s.remaining = tasks.len();
+            s.failed.clear();
+            cvar.notify_all();
+        }
+
+        let mut s = lock.lock().unwrap();
+        while s.remaining > 0 {
+            s = self.done_cvar.wait(s).unwrap();
+        }
+
+        std::mem::take(&mut s.failed)
+    }
+}
+
+impl Drop for ReaderPool {
+    fn drop(&mut self) {
+        {
+            let (lock, cvar) = &*self.state;
+            let mut s = lock.lock().unwrap();
+            s.shutdown = true;
+            cvar.notify_all();
+        }
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
 pub struct ExpertCache {
     slots: Vec<CacheSlot>,
     /// `(layer, expert)` -> index in `slots`
     map: HashMap<(usize, usize), usize>,
     tick: u64,
     pub pack_idx: PackIndex,
-    pack_file: File,
+    reader_pool: ReaderPool,
     pub slot_bytes: usize,
     pub hits: u64,
     pub misses: u64,
@@ -110,30 +245,22 @@ impl ExpertCache {
             return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "not enough RAM for expert cache slots"));
         }
 
-        // Attempt direct unbuffered unthrottled NVMe I/O first
-        let direct_flags = (FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN).0;
-        let pack_file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(direct_flags)
-            .open(pack_path)
-        {
-            Ok(f) => f,
-            Err(_) => {
-                // Fallback to buffered sequential I/O if the filesystem does not permit direct I/O
-                let fallback_flags = FILE_FLAG_SEQUENTIAL_SCAN.0;
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(fallback_flags)
-                    .open(pack_path)?
-            }
+        // Buffered random-access I/O by default so misses can hit the OS file cache.
+        // Unbuffered direct I/O remains opt-in via SPINDLE_DIRECT_IO=1.
+        let direct = std::env::var("SPINDLE_DIRECT_IO").map_or(false, |v| v == "1");
+        let flags = if direct {
+            (FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN).0
+        } else {
+            FILE_FLAG_RANDOM_ACCESS.0
         };
+        let reader_pool = ReaderPool::new(pack_path, flags, 8)?;
 
         Ok(Self {
             slots,
             map: HashMap::with_capacity(wanted_slots),
             tick: 0,
             pack_idx,
-            pack_file,
+            reader_pool,
             slot_bytes,
             hits: 0,
             misses: 0,
@@ -209,16 +336,36 @@ impl ExpertCache {
             }
         }
 
-        let mut disk_us = 0u64;
-        // Read missing experts directly into their designated slots
+        let mut tasks = Vec::with_capacity(to_fetch.len());
+        for &(e, slot_idx) in &to_fetch {
+            let off = self.pack_idx.offset(layer, e);
+            let ptr = self.slots[slot_idx].buf.as_mut_slice().as_mut_ptr() as usize;
+            tasks.push(ReadTask {
+                expert: e,
+                slot_idx,
+                offset: off,
+                dst_ptr: ptr,
+                len: self.slot_bytes,
+            });
+        }
+
+        let t_read = std::time::Instant::now();
+        let failed = self.reader_pool.read_batch(&tasks);
+        let disk_us = t_read.elapsed().as_micros() as u64;
+
+        let failed_map: HashMap<usize, std::io::Error> = failed.into_iter().collect();
+
         for &(e, slot_idx) in &to_fetch {
             self.misses += 1;
-            let off = self.pack_idx.offset(layer, e);
-            let t_read = std::time::Instant::now();
-            read_exact_at(&self.pack_file, self.slots[slot_idx].buf.as_mut_slice(), off)?;
-            disk_us += t_read.elapsed().as_micros() as u64;
-            self.bytes_read += self.slot_bytes as u64;
+            if let Some(err) = failed_map.get(&e) {
+                crate::vlog!("[expert:cache] read failed for layer {layer} expert {e}: {err}; falling back to mmap");
+                let slot = &mut self.slots[slot_idx];
+                slot.layer = usize::MAX;
+                slot.expert = usize::MAX;
+                continue;
+            }
 
+            self.bytes_read += self.slot_bytes as u64;
             let slot = &mut self.slots[slot_idx];
             slot.layer = layer;
             slot.expert = e;
@@ -236,7 +383,8 @@ impl ExpertCache {
     /// Fetches the base pointer of packed expert `(layer, expert)`.
     pub fn get_or_fetch(&mut self, layer: usize, expert: usize) -> std::io::Result<*const u8> {
         self.ensure_experts(layer, &[expert])?;
-        Ok(self.get_expert_ptr(layer, expert).expect("expert must be resident after ensure_experts"))
+        self.get_expert_ptr(layer, expert)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "expert read failed"))
     }
 
     /// Chooses an empty slot first, or evicts using fair-share layer balancing and frequency aging.
@@ -297,7 +445,7 @@ impl ExpertCache {
             }
         }
 
-        best_idx.expect("expert cache: failed to find an evictable slot")
+        best_idx.unwrap_or(0)
     }
 
     /// Prefetches missing experts for `layer` in a batch.
@@ -386,6 +534,83 @@ mod tests {
         let _ = cache.get_or_fetch(1, 0).unwrap();
         assert_eq!(cache.misses, 5);
         assert!(cache.hit_rate() > 0.0);
+
+        drop(cache);
+        let _ = std::fs::remove_file(temp_pack);
+    }
+
+    #[test]
+    fn test_parallel_reads_from_synthetic_pack() {
+        let n_layers = 2;
+        let n_expert = 8;
+        let gate_len = 128;
+        let up_len = 128;
+        let down_len = 256;
+        let expert_len = gate_len + up_len + down_len;
+
+        let total_size = n_layers * n_expert * 1024;
+        let mut model_bytes = vec![0u8; total_size];
+        for l in 0..n_layers {
+            for e in 0..n_expert {
+                let base = (l * n_expert + e) * 1024;
+                for i in 0..expert_len {
+                    model_bytes[base + i] = ((l * 43 + e * 19 + i * 7) % 251) as u8;
+                }
+            }
+        }
+
+        let expert_spans = move |l: usize, e: usize| -> [(usize, usize); 3] {
+            let base = (l * n_expert + e) * 1024;
+            [
+                (base, gate_len),
+                (base + gate_len, up_len),
+                (base + gate_len + up_len, down_len),
+            ]
+        };
+
+        let temp_pack = std::env::temp_dir().join("test_parallel_cache.spindle.pack");
+        let pack_path_str = temp_pack.to_str().unwrap();
+
+        repack_experts(
+            &model_bytes,
+            model_bytes.len() as u64,
+            pack_path_str,
+            n_layers,
+            n_expert,
+            &expert_spans,
+            |_l, _nl, _cur, _tot| {},
+        )
+        .unwrap();
+
+        // Open cache with budget for 8 slots (each 4096-aligned)
+        let mut cache = ExpertCache::open(pack_path_str, 8 * 4096).unwrap();
+        assert_eq!(cache.capacity(), 8);
+
+        // Read all 8 experts for layer 0 simultaneously in parallel across the reader pool
+        let all_experts: Vec<usize> = (0..8).collect();
+        let _ = cache.ensure_experts(0, &all_experts).unwrap();
+        assert_eq!(cache.misses, 8);
+        assert_eq!(cache.hits, 0);
+
+        // Check EVERY BYTE of every expert in parallel slots
+        for e in 0..8 {
+            let ptr = cache.get_expert_ptr(0, e).expect("expert must be resident in cache");
+            let cached_bytes = unsafe { std::slice::from_raw_parts(ptr, expert_len) };
+            let base = e * 1024;
+            let expected_bytes = &model_bytes[base..base + expert_len];
+            assert_eq!(cached_bytes, expected_bytes, "byte mismatch in layer 0 expert {e}");
+        }
+
+        // Test layer 1 experts in parallel
+        let _ = cache.ensure_experts(1, &all_experts).unwrap();
+        assert_eq!(cache.misses, 16);
+        for e in 0..8 {
+            let ptr = cache.get_expert_ptr(1, e).expect("expert must be resident in cache");
+            let cached_bytes = unsafe { std::slice::from_raw_parts(ptr, expert_len) };
+            let base = (1 * n_expert + e) * 1024;
+            let expected_bytes = &model_bytes[base..base + expert_len];
+            assert_eq!(cached_bytes, expected_bytes, "byte mismatch in layer 1 expert {e}");
+        }
 
         drop(cache);
         let _ = std::fs::remove_file(temp_pack);
