@@ -2021,9 +2021,9 @@ impl SmolLm2Engine {
         &mut self,
         user_prompt: &str,
         max_new_tokens: usize,
+        allow_think: bool,
         on_text: &mut dyn FnMut(&str),
     ) -> (String, f64, usize) {
-        let allow_think = true;
         let t0 = Instant::now();
         self.spec_stats = (0, 0, 0);
         let mut draft_engine = self.draft_engine.take();
@@ -2318,7 +2318,7 @@ mod tests {
             let pieces: Vec<String> = ids.iter().map(|&id| format!("{id}:{:?}", eng.idx.vocab[id])).collect();
             println!("\nPrompt: {prompt:?}\nTokens: {}", pieces.join(", "));
             unsafe {
-                let (reply, secs, toks) = eng.generate_reply(prompt, 48, &mut |_| {});
+                let (reply, secs, toks) = eng.generate_reply(prompt, 48, false, &mut |_| {});
                 println!("[test:stats] {toks} toks in {secs:.2}s");
                 assert!(!reply.trim().is_empty(), "Expected non-empty reply for prompt {prompt:?}");
             }

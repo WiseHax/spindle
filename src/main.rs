@@ -735,6 +735,8 @@ struct CliConfig {
     expert_cache_mib: Option<usize>,
     /// `--draft <path>`: small in-RAM draft model for speculative decoding.
     draft_path: Option<String>,
+    /// `--think`: enable reasoning model thinking mode (default: false for fast direct reply).
+    think: bool,
 }
 
 fn parse_cli() -> CliConfig {
@@ -759,6 +761,7 @@ fn parse_cli() -> CliConfig {
         pack_experts: false,
         expert_cache_mib: None,
         draft_path: None,
+        think: false,
     };
 
     let mut pos = Vec::new();
@@ -851,6 +854,10 @@ fn parse_cli() -> CliConfig {
             "--draft" if i + 1 < args.len() => {
                 cfg.draft_path = Some(args[i + 1].clone());
                 i += 2;
+            }
+            "--think" => {
+                cfg.think = true;
+                i += 1;
             }
             other => {
                 pos.push(other.to_string());
@@ -1090,6 +1097,8 @@ fn main() -> Result<()> {
                 first_prompt: (cli.prompt_given || !cli.chat_mode).then(|| cli.prompt.clone()),
                 interactive: cli.chat_mode,
                 threads: n_threads,
+                max_tokens: if cli.max_tokens == 32 { 2048 } else { cli.max_tokens },
+                allow_think: cli.think,
             };
             chat_cli::print_header(&engine, &opts);
             chat_cli::run(&mut engine, governor.as_ref(), opts);

@@ -9,11 +9,12 @@ use crate::{
 };
 
 const HELP: &str = "\
-/clear    start a new conversation
-/think    show or hide the model's reasoning (Qwen3 <think> blocks)
-/stats    show or hide memory details after each reply
-/help     this list
-/exit     quit (also: exit, quit, Ctrl+Z then Enter)";
+/clear       start a new conversation
+/think       toggle reasoning mode on/off (/think on, /think off)
+/stats       show or hide memory details after each reply
+/max <n>     set maximum generation tokens (default: 2048)
+/help        this list
+/exit        quit (also: exit, quit, Ctrl+Z then Enter)";
 
 /// Prints model output as it streams. Reasoning between `<think>` and `</think>` is shown
 /// dimmed, or collapsed into a single "thinking..." line that is erased once the answer starts.
@@ -69,6 +70,8 @@ pub struct ChatOptions {
     pub first_prompt: Option<String>,
     pub interactive: bool,
     pub threads: usize,
+    pub max_tokens: usize,
+    pub allow_think: bool,
 }
 
 pub fn print_header(engine: &SmolLm2Engine, opts: &ChatOptions) {
@@ -144,12 +147,14 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
 
 /// Runs `opts.first_prompt` (if any), then the interactive loop.
 pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOptions) {
-    let mut show_think = false;
+    let mut allow_think = opts.allow_think;
+    let mut show_think = opts.allow_think;
     let mut detailed = crate::ui::verbose();
+    let mut max_tokens = if opts.max_tokens > 0 { opts.max_tokens } else { 2048 };
 
-    let reply = |engine: &mut SmolLm2Engine, text: &str, show_think: bool, detailed: bool, max: usize| {
+    let reply = |engine: &mut SmolLm2Engine, text: &str, allow_think: bool, show_think: bool, detailed: bool, max: usize| {
         let mut r = Render::new(show_think);
-        let (_, secs, tokens) = unsafe { engine.generate_reply(text, max, &mut |p| r.push(p)) };
+        let (_, secs, tokens) = unsafe { engine.generate_reply(text, max, allow_think, &mut |p| r.push(p)) };
         if r.wrote {
             println!();
         } else {
@@ -163,7 +168,7 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
         if opts.interactive {
             println!("\n{} {p}", bold(&accent(">")));
         }
-        reply(engine, p, show_think, detailed, 256);
+        reply(engine, p, allow_think, show_think, detailed, max_tokens);
     }
     if !opts.interactive {
         return;
@@ -188,16 +193,43 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
                 engine.reset_kv();
                 println!("{}", dim("new conversation"));
             }
-            "/think" => {
-                show_think = !show_think;
-                println!("{}", dim(if show_think { "reasoning: shown" } else { "reasoning: hidden" }));
+            "/think" | "/think toggle" => {
+                allow_think = !allow_think;
+                show_think = allow_think;
+                println!("{}", dim(if allow_think { "thinking mode: ON (reasoning enabled)" } else { "thinking mode: OFF (direct fast answer)" }));
+            }
+            "/think on" => {
+                allow_think = true;
+                show_think = true;
+                println!("{}", dim("thinking mode: ON (reasoning enabled)"));
+            }
+            "/think off" => {
+                allow_think = false;
+                show_think = false;
+                println!("{}", dim("thinking mode: OFF (direct fast answer)"));
+            }
+            "/think show" => {
+                show_think = true;
+                println!("{}", dim("reasoning visibility: shown"));
+            }
+            "/think hide" => {
+                show_think = false;
+                println!("{}", dim("reasoning visibility: hidden"));
             }
             "/stats" => {
                 detailed = !detailed;
                 println!("{}", dim(if detailed { "memory details: on" } else { "memory details: off" }));
             }
+            cmd if cmd.starts_with("/max ") => {
+                if let Ok(n) = cmd[5..].trim().parse::<usize>() {
+                    max_tokens = n;
+                    println!("{}", dim(&format!("max tokens set to {n}")));
+                } else {
+                    println!("{}", dim("usage: /max <number of tokens>"));
+                }
+            }
             cmd if cmd.starts_with('/') => println!("{}", dim(&format!("unknown command {cmd}, try /help"))),
-            _ => reply(engine, input, show_think, detailed, 512),
+            _ => reply(engine, input, allow_think, show_think, detailed, max_tokens),
         }
     }
 }
