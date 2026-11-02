@@ -39,8 +39,14 @@ struct BlockQ6K {
 }
 
 
+#[inline]
+#[target_feature(enable = "f16c")]
+unsafe fn f16_to_f32_fast(h: u16) -> f32 {
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
+}
+
 /// AVX2 dot product of one `Q8_0` row (`n_cols` weights, multiple of 32) against `x[0..n_cols]`.
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q8_0_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let n_blocks = n_cols / 32;
@@ -57,7 +63,7 @@ unsafe fn dot_q8_0_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
             let qi = _mm256_cvtepi8_epi32(_mm_loadl_epi64(qp.add(sub) as *const __m128i));
             s = _mm256_fmadd_ps(_mm256_cvtepi32_ps(qi), _mm256_loadu_ps(xp.add(sub)), s);
         }
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.d)), s, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.d)), s, acc);
     }
 
     hsum_avx2(acc)
@@ -76,7 +82,7 @@ unsafe fn fma_i8x16(v: __m128i, x: *const f32, acc: __m256) -> __m256 {
 /// In `ggml` `block_q5_0`:
 /// - Low 4 bits of `qs[j]` (`j = 0..16`) + bit `j` of `qh` -> weight `j` (`0..16`) minus 16
 /// - High 4 bits of `qs[j]` (`j = 0..16`) + bit `j+16` of `qh` -> weight `j+16` (`16..32`) minus 16
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q5_0_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let n_blocks = n_cols / 32;
@@ -111,7 +117,7 @@ unsafe fn dot_q5_0_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
 
         let mut s = fma_i8x16(_mm256_castsi256_si128(q), xp, _mm256_setzero_ps());
         s = fma_i8x16(_mm256_extracti128_si256::<1>(q), xp.add(16), s);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.d)), s, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.d)), s, acc);
     }
 
     hsum_avx2(acc)
@@ -145,11 +151,11 @@ unsafe fn fma_u8x16(v: __m128i, x: *const f32, sqx: &mut __m256, sx: &mut __m256
 
 /// Exact `Q4_K` block dot product using un-clamped IEEE-754 fp16 scales.
 /// Each 32-weight sub-block contributes `d*sc * sum(q*x) - dmin*mn * sum(x)`.
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn q4k_block_dot_avx2_exact(blk: &BlockQ4K, act: *const f32) -> f32 {
-    let d = f16_to_f32_exact(blk.d);
-    let dmin = f16_to_f32_exact(blk.dmin);
+    let d = f16_to_f32_fast(blk.d);
+    let dmin = f16_to_f32_fast(blk.dmin);
     let (sc, mn) = crate::q4k_gemv::unpack_q4k_scales(&blk.scales);
     let m4 = _mm_set1_epi8(0x0F);
 
@@ -180,7 +186,7 @@ unsafe fn q4k_block_dot_avx2_exact(blk: &BlockQ4K, act: *const f32) -> f32 {
 
 /// Dot product of one `Q6_K` row (`n_cols` weights, multiple of 256) against `x[0..n_cols]`.
 /// Decodes 8 weights at a time in 32-bit lanes (same bit layout as ggml's reference loop).
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q6_k_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let n_blocks = n_cols / 256;
@@ -245,7 +251,7 @@ unsafe fn dot_q6_k_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
             qh = qh.add(32);
             sc = sc.add(8);
         }
-        total = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.d)), acc, total);
+        total = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.d)), acc, total);
     }
 
     hsum_avx2(total)
@@ -449,7 +455,7 @@ unsafe fn fma_u8x32(q: __m256i, x: *const f32, sqx: &mut __m256, sx: &mut __m256
     fma_u8x16(_mm256_extracti128_si256::<1>(q), x.add(16), sqx, sx);
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q4_0_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let mut acc = _mm256_setzero_ps();
@@ -458,13 +464,13 @@ unsafe fn dot_q4_0_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
         let blk = &*(row_ptr.add(b * 18) as *const BlockQ4_0);
         let q = _mm256_sub_epi8(nibbles32(blk.qs.as_ptr()), eight);
         let s = fma_i8x32(q, x.add(b * 32), _mm256_setzero_ps());
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.d)), s, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.d)), s, acc);
     }
     hsum_avx2(acc)
 }
 
 /// `sum((q*d + m) * x) = d*sum(q*x) + m*sum(x)`.
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q4_1_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let mut acc = _mm256_setzero_ps();
@@ -472,13 +478,13 @@ unsafe fn dot_q4_1_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
         let blk = &*(row_ptr.add(b * 20) as *const BlockQ4_1);
         let (mut sqx, mut sx) = (_mm256_setzero_ps(), _mm256_setzero_ps());
         fma_u8x32(nibbles32(blk.qs.as_ptr()), x.add(b * 32), &mut sqx, &mut sx);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.d)), sqx, acc);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.m)), sx, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.d)), sqx, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.m)), sx, acc);
     }
     hsum_avx2(acc)
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q5_1_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let mut acc = _mm256_setzero_ps();
@@ -489,14 +495,14 @@ unsafe fn dot_q5_1_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
         let q = _mm256_or_si256(nibbles32(blk.qs.as_ptr()), high);
         let (mut sqx, mut sx) = (_mm256_setzero_ps(), _mm256_setzero_ps());
         fma_u8x32(q, x.add(b * 32), &mut sqx, &mut sx);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.d)), sqx, acc);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_exact(blk.m)), sx, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.d)), sqx, acc);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk.m)), sx, acc);
     }
     hsum_avx2(acc)
 }
 
 /// Like `Q4_K` (`d*sc*sum(q*x) - dmin*mn*sum(x)` per 32-weight sub-block) with 5-bit `q`.
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
 unsafe fn dot_q5_k_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) -> f32 {
     let mut acc = _mm256_setzero_ps();
@@ -505,8 +511,8 @@ unsafe fn dot_q5_k_row_avx2(row_ptr: *const u8, x: *const f32, n_cols: usize) ->
     let hi_bit = _mm256_set1_epi8(0x10);
     for b in 0..n_cols / 256 {
         let blk = &*(row_ptr.add(b * 176) as *const BlockQ5K);
-        let d = f16_to_f32_exact(blk.d);
-        let dmin = f16_to_f32_exact(blk.dmin);
+        let d = f16_to_f32_fast(blk.d);
+        let dmin = f16_to_f32_fast(blk.dmin);
         let (sc, mn) = crate::q4k_gemv::unpack_q4k_scales(&blk.scales);
         let qh = _mm256_loadu_si256(blk.qh.as_ptr() as *const __m256i);
         let xb = x.add(b * 256);
@@ -545,7 +551,7 @@ pub(crate) unsafe fn dot_f16_row_avx2(row_ptr: *const u8, x: *const f32, n_cols:
     }
     let mut tail = 0.0;
     for i in main..n_cols {
-        tail += f16_to_f32_exact(w.add(i).read_unaligned()) * *x.add(i);
+        tail += f16_to_f32_fast(w.add(i).read_unaligned()) * *x.add(i);
     }
     hsum_avx2(acc) + tail
 }
