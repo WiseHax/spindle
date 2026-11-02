@@ -716,6 +716,10 @@ struct CliConfig {
     stream_layers: bool,
     /// `--verbose`: print load and memory diagnostics.
     verbose: bool,
+    /// `--raw "text"`: plain completion with no chat framing (for golden tests).
+    raw: Option<String>,
+    /// `-n`: tokens to generate in `--raw` mode.
+    max_tokens: usize,
     sampler: smollm_chat::SamplerConfig,
     /// `--ram-budget`: hard ceiling on spindle's resident memory, in MiB.
     ram_budget_mib: Option<u64>,
@@ -737,6 +741,8 @@ fn parse_cli() -> CliConfig {
         probe: false,
         stream_layers: false,
         verbose: false,
+        raw: None,
+        max_tokens: 32,
         sampler: smollm_chat::SamplerConfig::default(),
         ram_budget_mib: None,
         reserve_mib: None,
@@ -796,6 +802,17 @@ fn parse_cli() -> CliConfig {
                 } else {
                     cfg.reserve_mib = Some(mib);
                 }
+                i += 2;
+            }
+            "--raw" if i + 1 < args.len() => {
+                cfg.raw = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-n" if i + 1 < args.len() => {
+                cfg.max_tokens = args[i + 1].parse().unwrap_or_else(|_| {
+                    eprintln!("-n takes a number of tokens, got {}", args[i + 1]);
+                    std::process::exit(2)
+                });
                 i += 2;
             }
             "--verbose" | "-v" => {
@@ -958,6 +975,15 @@ fn main() -> Result<()> {
                 "[chat] {n_threads} threads, temp={} top_k={} top_p={} min_p={} repeat_penalty={} seed={}",
                 sc.temperature, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty, sc.seed
             );
+            if let Some(text) = &cli.raw {
+                use std::io::Write;
+                engine.complete_raw(text, cli.max_tokens, &mut |p| {
+                    print!("{p}");
+                    let _ = std::io::stdout().flush();
+                });
+                println!();
+                return Ok(());
+            }
             let opts = chat_cli::ChatOptions {
                 // `--chat` alone goes straight to the prompt; without `--chat`, answer once.
                 first_prompt: (cli.prompt_given || !cli.chat_mode).then(|| cli.prompt.clone()),
