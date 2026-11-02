@@ -148,12 +148,21 @@ pub fn repack_experts<P: FnMut(usize, usize, u64, u64)>(
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "zero layers or experts"));
     }
 
-    // Determine sizes from layer 0, expert 0
+    // Header records expert (0, 0)'s sizes. Quant mixes like Q4_K_M store some layers'
+    // tensors in a different type (e.g. ffn_down as Q6_K), so expert sizes can vary per
+    // layer. Every slot is sized for the largest expert; the forward pass takes the real
+    // per-layer offsets inside a slot from the GGUF tensor shapes, not from this header.
     let [gate_span, up_span, down_span] = expert_spans_fn(0, 0);
     let gate_bytes = gate_span.1 as u64;
     let up_bytes = up_span.1 as u64;
     let down_bytes = down_span.1 as u64;
-    let payload_bytes = gate_bytes + up_bytes + down_bytes;
+    let mut payload_bytes = 0u64;
+    for l in 0..n_layers {
+        for e in 0..n_expert {
+            let s = expert_spans_fn(l, e);
+            payload_bytes = payload_bytes.max((s[0].1 + s[1].1 + s[2].1) as u64);
+        }
+    }
     let slot_bytes = ((payload_bytes as usize + PACK_ALIGN - 1) & !(PACK_ALIGN - 1)) as u64;
 
     let total_experts = n_layers * n_expert;
@@ -206,20 +215,13 @@ pub fn repack_experts<P: FnMut(usize, usize, u64, u64)>(
 
     // 3. Write each expert slab: [gate, up, down] + padding to slot_bytes
     let total_pack_bytes = data_start + (total_experts as u64) * slot_bytes;
-    let pad_slot = (slot_bytes - payload_bytes) as usize;
-    let pad_zeros = vec![0u8; pad_slot];
+    let pad_zeros = vec![0u8; slot_bytes as usize];
 
     let mut written_bytes = data_start;
     for l in 0..n_layers {
         for e in 0..n_expert {
             let [g_span, u_span, d_span] = expert_spans_fn(l, e);
-            if (g_span.1 as u64, u_span.1 as u64, d_span.1 as u64) != (gate_bytes, up_bytes, down_bytes) {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("expert ({l}, {e}) differs in size from expert (0, 0); this model can't be packed"),
-                ));
-            }
+            let pad_slot = slot_bytes as usize - (g_span.1 + u_span.1 + d_span.1);
             if g_span.0 + g_span.1 > model_bytes.len()
                 || u_span.0 + u_span.1 > model_bytes.len()
                 || d_span.0 + d_span.1 > model_bytes.len()
@@ -234,7 +236,7 @@ pub fn repack_experts<P: FnMut(usize, usize, u64, u64)>(
             writer.write_all(&model_bytes[u_span.0..u_span.0 + u_span.1])?;
             writer.write_all(&model_bytes[d_span.0..d_span.0 + d_span.1])?;
             if pad_slot > 0 {
-                writer.write_all(&pad_zeros)?;
+                writer.write_all(&pad_zeros[..pad_slot])?;
             }
             written_bytes += slot_bytes;
         }
@@ -341,6 +343,39 @@ mod tests {
             &model_bytes[spans[2].0..spans[2].0 + down_len]
         );
 
+        drop(f);
+        let _ = std::fs::remove_file(temp_pack);
+    }
+
+    /// Q4_K_M-style mix: layer 1's down tensor is larger than layer 0's. Packing must
+    /// succeed, size every slot for the largest expert, and keep each expert's bytes intact.
+    #[test]
+    fn repack_mixed_expert_sizes_per_layer() {
+        let (n_layers, n_expert) = (2, 3);
+        let model_bytes: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let down_len = |l: usize| if l == 0 { 256 } else { 5000 };
+        let spans = move |l: usize, e: usize| -> [(usize, usize); 3] {
+            let base = (l * n_expert + e) * 8192;
+            [(base, 128), (base + 128, 128), (base + 256, down_len(l))]
+        };
+        let temp_pack = std::env::temp_dir().join("test_repack_mixed.spindle.pack");
+        let p = temp_pack.to_str().unwrap();
+        let idx = repack_experts(&model_bytes, model_bytes.len() as u64, p, n_layers, n_expert, &spans, |_, _, _, _| {}).unwrap();
+        assert_eq!(idx.hdr.expert_payload_bytes, 256 + 5000);
+        assert_eq!(idx.hdr.expert_slot_bytes, 8192);
+        assert_eq!(std::fs::metadata(p).unwrap().len(), idx.offsets[0] + 6 * 8192);
+
+        let mut f = File::open(p).unwrap();
+        for l in 0..n_layers {
+            for e in 0..n_expert {
+                let s = spans(l, e);
+                let len = s[0].1 + s[1].1 + s[2].1;
+                let mut buf = vec![0u8; len];
+                f.seek(SeekFrom::Start(idx.offset(l, e))).unwrap();
+                f.read_exact(&mut buf).unwrap();
+                assert_eq!(&buf[..], &model_bytes[s[0].0..s[0].0 + len], "expert ({l}, {e})");
+            }
+        }
         drop(f);
         let _ = std::fs::remove_file(temp_pack);
     }

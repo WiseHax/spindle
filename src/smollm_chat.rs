@@ -1065,8 +1065,20 @@ impl SmolLm2Engine {
             FfnKind::Moe(m) => Some(m.experts.expert(0).spans()),
             _ => None,
         });
+        // Expert sizes can differ per layer (mixed quants such as Q4_K_M); every expert
+        // must fit in one slot or the cached slab would be truncated.
+        let max_payload = self
+            .layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                FfnKind::Moe(m) => Some((0..m.n_expert).map(|e| m.experts.expert(e).spans().iter().map(|s| s.1).sum::<usize>()).max().unwrap_or(0)),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0) as u64;
         let shape_ok = h.n_layers as usize == self.cfg.n_layers
             && h.n_expert as usize == self.cfg.n_expert
+            && max_payload <= h.expert_slot_bytes
             && first_moe.is_some_and(|s| (s[0].1 as u64, s[1].1 as u64, s[2].1 as u64) == (h.gate_bytes, h.up_bytes, h.down_bytes));
         if !shape_ok {
             return Err(std::io::Error::new(
