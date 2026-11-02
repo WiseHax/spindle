@@ -17,6 +17,17 @@ param(
     [string[]] $LlamaArgs = @("--no-display-prompt")
 )
 
+foreach ($exe in @($Llama, $Spindle)) {
+    if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) {
+        Write-Host "not found: $exe"
+        exit 2
+    }
+}
+if (-not (Test-Path $Model)) {
+    Write-Host "model not found: $Model"
+    exit 2
+}
+
 $prompts = @(
     "The capital of France is",
     "def fibonacci(n):",
