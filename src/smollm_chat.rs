@@ -46,6 +46,13 @@ pub struct ModelConfig {
     pub n_expert_used: usize,
     /// Renormalize the selected experts' router weights to sum to 1.
     pub expert_norm: bool,
+    /// Granite multipliers (1.0 elsewhere): input embeddings are scaled by `embedding_scale`,
+    /// attention and FFN outputs by `residual_scale` before the residual add, and logits are
+    /// divided by `logit_scale`. `attn_scale` replaces `1/sqrt(head_dim)` when set.
+    pub embedding_scale: f32,
+    pub residual_scale: f32,
+    pub logit_scale: f32,
+    pub attn_scale: Option<f32>,
 }
 
 impl ModelConfig {
@@ -56,8 +63,8 @@ impl ModelConfig {
         let req = |key: &str| num(key).ok_or_else(|| invalid(format!("GGUF metadata missing `{arch}.{key}`")));
 
         let rope_neox = match arch {
-            "llama" => false,
-            "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" => true,
+            "llama" | "granite" | "granitemoe" => false,
+            "qwen2" | "qwen2moe" | "qwen3" | "qwen3moe" | "olmoe" => true,
             other => return Err(invalid(format!("unsupported architecture `{other}`"))),
         };
         if num("expert_gating_func").is_some_and(|f| f != 1) {
@@ -84,11 +91,15 @@ impl ModelConfig {
             rope_neox,
             n_expert,
             n_expert_used: num("expert_used_count").unwrap_or(0).min(n_expert),
-            // Qwen2-MoE doesn't renormalize; Qwen3-MoE and Mixtral do.
+            // Qwen2-MoE and OLMoE don't renormalize; Qwen3-MoE, Mixtral and Granite do.
             expert_norm: match get("expert_weights_norm") {
                 Some(GgufValue::Bool(b)) => *b,
-                _ => arch != "qwen2moe",
+                _ => !matches!(arch, "qwen2moe" | "olmoe"),
             },
+            embedding_scale: get("embedding_scale").and_then(|v| v.as_f32()).unwrap_or(1.0),
+            residual_scale: get("residual_scale").and_then(|v| v.as_f32()).unwrap_or(1.0),
+            logit_scale: get("logit_scale").and_then(|v| v.as_f32()).unwrap_or(1.0),
+            attn_scale: get("attention.scale").and_then(|v| v.as_f32()),
         };
         // The AVX2 attention loops step 8 floats at a time.
         if head_dim % 8 != 0 || n_heads % n_kv_heads != 0 {
@@ -161,6 +172,8 @@ struct Layer {
     v_bias: Option<usize>,
     q_norm: Option<usize>,
     k_norm: Option<usize>,
+    /// Q/K norm weights cover the whole projection (OLMoE) instead of one head (Qwen3).
+    qk_norm_full: bool,
     ffn_norm: usize,
     ffn: FfnKind,
 }
@@ -227,6 +240,7 @@ fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig) -> std::io::Result<Vec<
                 v_bias: vec_f32(&n("attn_v.bias"))?,
                 q_norm: vec_f32(&n("attn_q_norm.weight"))?,
                 k_norm: vec_f32(&n("attn_k_norm.weight"))?,
+                qk_norm_full: find(&n("attn_q_norm.weight")).is_some_and(|t| t.dims[0] as usize == c.q_dim && c.q_dim != c.head_dim),
                 ffn_norm: need(&n("ffn_norm.weight"))?,
                 ffn,
             })
@@ -286,8 +300,9 @@ fn layer_extent(ly: &Layer, c: &ModelConfig) -> (usize, usize, usize) {
     for (off, len) in [(ly.q_bias, c.q_dim), (ly.k_bias, c.kv_dim), (ly.v_bias, c.kv_dim)] {
         parts.extend(off.map(|o| (o, len * 4)));
     }
-    for off in [ly.q_norm, ly.k_norm] {
-        parts.extend(off.map(|o| (o, c.head_dim * 4)));
+    let (qn, kn) = if ly.qk_norm_full { (c.q_dim, c.kv_dim) } else { (c.head_dim, c.head_dim) };
+    for (off, len) in [(ly.q_norm, qn), (ly.k_norm, kn)] {
+        parts.extend(off.map(|o| (o, len * 4)));
     }
     match &ly.ffn {
         FfnKind::Dense(f) => parts.extend(f.spans()),
@@ -539,8 +554,9 @@ pub struct SmolLm2Engine {
     rng: SplitMix64,
     byte_enc: [char; 256],
     byte_dec: HashMap<char, u8>,
-    im_start: usize,
-    im_end: usize,
+    format: ChatFormat,
+    /// Whether raw prompts start with BOS (`tokenizer.ggml.add_bos_token`).
+    bos: Option<usize>,
     /// Tokens that end a reply (`<|im_end|>`, the GGUF EOS, `<|endoftext|>`).
     stop_ids: Vec<usize>,
     /// `<think>` / `</think>` token ids for reasoning models (Qwen3).
@@ -551,10 +567,24 @@ pub struct SmolLm2Engine {
     pub moe_stats: MoeStats,
 }
 
+/// How a conversation is framed in tokens. Built once at load from the model's special
+/// tokens, so ChatML (SmolLM2, Qwen), Granite and Tulu-style (OLMoE) models share one code path.
+#[derive(Clone, Debug, Default)]
+struct ChatFormat {
+    system_open: Vec<usize>,
+    system_close: Vec<usize>,
+    user_open: Vec<usize>,
+    user_close: Vec<usize>,
+    assistant_open: Vec<usize>,
+    /// Appended after a reply; its first token is also what the model emits to end a turn.
+    assistant_close: Vec<usize>,
+}
+
 /// SmolLM2's own system prompt. Giving the assistant a name stops the tiny model from
 /// adopting the user's name ("Hi, I'm Wise" -> "My name is Wise").
 const SMOLLM_SYSTEM_PROMPT: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const GRANITE_SYSTEM_PROMPT: &str = "You are Granite, developed by IBM. You are a helpful AI assistant.";
 
 impl SmolLm2Engine {
     pub fn load(path: &str) -> std::io::Result<Self> {
@@ -573,20 +603,24 @@ impl SmolLm2Engine {
             .abs_file_offset as usize;
 
         let token = |s: &str| idx.token_to_id.get(s).copied();
-        let (im_start, im_end) = match (token("<|im_start|>"), token("<|im_end|>")) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Err(invalid("model has no ChatML tokens (<|im_start|>/<|im_end|>)".into())),
+        let meta_id = |k: &str| idx.metadata.get(k).and_then(|v| v.as_usize());
+        let eos = meta_id("tokenizer.ggml.eos_token_id");
+        let bos = match idx.metadata.get("tokenizer.ggml.add_bos_token") {
+            Some(GgufValue::Bool(true)) => meta_id("tokenizer.ggml.bos_token_id"),
+            _ => None,
         };
-        let mut stop_ids = vec![im_end];
-        let eos = idx.metadata.get("tokenizer.ggml.eos_token_id").and_then(|v| v.as_usize());
-        for id in [eos, token("<|endoftext|>")].into_iter().flatten() {
+        let mut stop_ids = Vec::new();
+        for id in [eos, token("<|endoftext|>"), token("<|im_end|>"), token("<|end_of_text|>")].into_iter().flatten() {
             if !stop_ids.contains(&id) {
                 stop_ids.push(id);
             }
         }
         let think_ids = token("<think>").zip(token("</think>"));
-        let system_prompt = if idx.model_name.to_lowercase().contains("smollm") {
+        let name = idx.model_name.to_lowercase();
+        let system_prompt = if name.contains("smollm") {
             SMOLLM_SYSTEM_PROMPT
+        } else if name.contains("granite") {
+            GRANITE_SYSTEM_PROMPT
         } else {
             DEFAULT_SYSTEM_PROMPT
         };
@@ -668,7 +702,7 @@ impl SmolLm2Engine {
             let tight = ext.iter().all(|&(s, e, used)| e - s <= used + used / 20 + 4096);
             (dense && tight).then(|| ext.iter().map(|&(s, e, _)| (s, e - s)).collect())
         };
-        Ok(Self {
+        let mut engine = Self {
             prefetcher,
             streamer: None,
             layer_spans,
@@ -691,14 +725,79 @@ impl SmolLm2Engine {
             rng: SplitMix64(SamplerConfig::default().seed),
             byte_enc,
             byte_dec,
-            im_start,
-            im_end,
+            format: ChatFormat::default(),
+            bos,
             stop_ids,
             think_ids,
             kv_shifts: 0,
             system_prompt,
             moe_stats: MoeStats { touched: vec![false; c.n_layers * c.n_expert], ..Default::default() },
-        })
+        };
+        engine.format = engine.detect_format()?;
+        // The token that closes an assistant turn always ends a reply.
+        let end = engine.format.assistant_close[0];
+        if !engine.stop_ids.contains(&end) {
+            engine.stop_ids.insert(0, end);
+        }
+        Ok(engine)
+    }
+
+    /// Picks the chat framing from the special tokens the model has.
+    fn detect_format(&self) -> std::io::Result<ChatFormat> {
+        let token = |s: &str| self.idx.token_to_id.get(s).copied();
+        let nl = self.encode_bpe_segment("\n");
+        let text = |s: &str| self.encode_bpe_segment(s);
+        let cat = |parts: &[&[usize]]| parts.concat();
+        if let (Some(start), Some(end)) = (token("<|im_start|>"), token("<|im_end|>")) {
+            // <|im_start|>role\n ... <|im_end|>\n
+            let open = |role: &str| cat(&[&[start], &text(&format!("{role}\n"))]);
+            let close = cat(&[&[end], &nl]);
+            return Ok(ChatFormat {
+                system_open: open("system"),
+                system_close: close.clone(),
+                user_open: open("user"),
+                user_close: close.clone(),
+                assistant_open: open("assistant"),
+                assistant_close: close,
+            });
+        }
+        if let (Some(start), Some(role_end), Some(end)) =
+            (token("<|start_of_role|>"), token("<|end_of_role|>"), token("<|end_of_text|>"))
+        {
+            // <|start_of_role|>role<|end_of_role|> ... <|end_of_text|>\n
+            let open = |role: &str| cat(&[&[start], &text(role), &[role_end]]);
+            let close = cat(&[&[end], &nl]);
+            return Ok(ChatFormat {
+                system_open: open("system"),
+                system_close: close.clone(),
+                user_open: open("user"),
+                user_close: close.clone(),
+                assistant_open: open("assistant"),
+                assistant_close: close,
+            });
+        }
+        let template = match self.idx.metadata.get("tokenizer.chat_template") {
+            Some(GgufValue::String(t)) => t.as_str(),
+            _ => "",
+        };
+        if let (true, Some(eos)) = (template.contains("<|user|>"), self.stop_ids.first().copied()) {
+            // Tulu: <|role|>\n ... \n, assistant turns end with EOS.
+            let tag = |role: &str| {
+                let t = format!("<|{role}|>");
+                let mut ids = token(&t).map_or_else(|| text(&t), |id| vec![id]);
+                ids.extend(&nl);
+                ids
+            };
+            return Ok(ChatFormat {
+                system_open: tag("system"),
+                system_close: nl.clone(),
+                user_open: tag("user"),
+                user_close: nl.clone(),
+                assistant_open: tag("assistant"),
+                assistant_close: cat(&[&[eos], &nl]),
+            });
+        }
+        Err(invalid("unknown chat format: no ChatML, Granite or Tulu markers in this model".into()))
     }
 
     /// Splits matvecs across `n_threads` (the caller is thread 0). `pin(i)` runs on each
@@ -912,6 +1011,9 @@ impl SmolLm2Engine {
         let rb = row_bytes(self.embed.dtype, c.dim).expect("unsupported embedding type");
         let row = std::slice::from_raw_parts(base.add(self.embed.offset + token_id * rb), rb);
         let mut x = dequant_row(self.embed.dtype, row, c.dim);
+        if c.embedding_scale != 1.0 {
+            x.iter_mut().for_each(|v| *v *= c.embedding_scale);
+        }
 
         let mut x_norm = vec![0.0f32; c.dim];
         let mut q = vec![0.0f32; c.q_dim];
@@ -957,10 +1059,12 @@ impl SmolLm2Engine {
             add_bias(lbase, &mut k, ly.k_bias);
             add_bias(lbase, &mut v, ly.v_bias);
             if let Some(off) = ly.q_norm {
-                rmsnorm_heads(&mut q, f32_at(lbase, off, c.head_dim), c.head_dim, c.rms_eps);
+                let n = if ly.qk_norm_full { c.q_dim } else { c.head_dim };
+                rmsnorm_heads(&mut q, f32_at(lbase, off, n), n, c.rms_eps);
             }
             if let Some(off) = ly.k_norm {
-                rmsnorm_heads(&mut k, f32_at(lbase, off, c.head_dim), c.head_dim, c.rms_eps);
+                let n = if ly.qk_norm_full { c.kv_dim } else { c.head_dim };
+                rmsnorm_heads(&mut k, f32_at(lbase, off, n), n, c.rms_eps);
             }
             self.rope.rotate(&mut q, c.head_dim, pos as f32);
             self.rope.rotate(&mut k, c.head_dim, pos as f32);
@@ -970,7 +1074,7 @@ impl SmolLm2Engine {
             f32_to_f16_slice(&v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
 
             // Grouped-query attention with an online softmax over positions 0..=pos.
-            let scale = 1.0f32 / (c.head_dim as f32).sqrt();
+            let scale = c.attn_scale.unwrap_or(1.0 / (c.head_dim as f32).sqrt());
             attn_out.fill(0.0);
             for h in 0..c.n_heads {
                 let kvh = h / (c.n_heads / c.n_kv_heads);
@@ -1008,7 +1112,7 @@ impl SmolLm2Engine {
 
             matvec(pool, lbase, &ly.wo, &attn_out, &mut proj_out);
             for i in 0..c.dim {
-                x[i] += proj_out[i];
+                x[i] += c.residual_scale * proj_out[i];
             }
 
             // Feed-forward: dense SwiGLU or mixture of experts.
@@ -1018,7 +1122,7 @@ impl SmolLm2Engine {
                 FfnKind::Moe(m) => moe_forward(pool, lbase, m, &x_norm, &mut proj_out, Some((&mut self.moe_stats, l)), hint),
             }
             for i in 0..c.dim {
-                x[i] += proj_out[i];
+                x[i] += c.residual_scale * proj_out[i];
             }
             if let (Some(buf), Some(st)) = (streamed, self.streamer.as_mut()) {
                 st.give_back(buf);
@@ -1038,6 +1142,9 @@ impl SmolLm2Engine {
         let c = self.cfg;
         let mut logits = vec![0.0f32; c.vocab];
         matvec(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, hidden, &mut logits);
+        if c.logit_scale != 1.0 {
+            logits.iter_mut().for_each(|l| *l /= c.logit_scale);
+        }
 
         // O(1) membership instead of `recent.contains()` per vocab entry.
         let mut penalized = vec![false; c.vocab];
@@ -1110,27 +1217,19 @@ impl SmolLm2Engine {
         cand[keep - 1]
     }
 
-    /// `<|im_start|>system\n{prompt}<|im_end|>\n`
+    /// The system message, framed for this model.
     fn encode_system(&self) -> Vec<usize> {
-        let mut ids = vec![self.im_start];
-        ids.extend(self.encode_bpe_segment(&format!("system\n{}", self.system_prompt)));
-        ids.push(self.im_end);
-        ids.extend(self.encode_bpe_segment("\n"));
-        ids
+        let f = &self.format;
+        [&f.system_open[..], &self.encode_bpe_segment(self.system_prompt), &f.system_close].concat()
     }
 
-    /// `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`
+    /// A user message followed by the opening of the assistant's reply.
     fn encode_user_turn(&self, user_prompt: &str) -> Vec<usize> {
-        let mut ids = vec![self.im_start];
-        ids.extend(self.encode_bpe_segment(&format!("user\n{}", user_prompt.trim())));
-        ids.push(self.im_end);
-        ids.extend(self.encode_bpe_segment("\n"));
-        ids.push(self.im_start);
-        ids.extend(self.encode_bpe_segment("assistant\n"));
-        ids
+        let f = &self.format;
+        [&f.user_open[..], &self.encode_bpe_segment(user_prompt.trim()), &f.user_close, &f.assistant_open].concat()
     }
 
-    /// Full ChatML prompt for a single message (system + user + assistant header).
+    /// Full prompt for a single message (system + user + assistant header).
     pub fn encode_chatml(&self, user_prompt: &str) -> Vec<usize> {
         let mut ids = self.encode_system();
         ids.extend(self.encode_user_turn(user_prompt));
@@ -1248,6 +1347,35 @@ impl SmolLm2Engine {
         out
     }
 
+    /// Plain text completion with no chat framing, for comparing against llama.cpp: encodes
+    /// `prompt` (with BOS if the model wants one), then generates up to `n` tokens.
+    pub unsafe fn complete_raw(&mut self, prompt: &str, n: usize, on_text: &mut dyn FnMut(&str)) -> usize {
+        self.reset_kv();
+        let mut ids: Vec<usize> = self.bos.into_iter().collect();
+        ids.extend(self.encode_bpe_segment(prompt));
+        let mut hidden = self.feed(&ids);
+        let mut recent = Vec::new();
+        let mut pending: Vec<u8> = Vec::new();
+        for _ in 0..n {
+            let next = self.sample_next_token(&hidden, &recent, false);
+            if self.stop_ids.contains(&next) {
+                break;
+            }
+            pending.extend(self.token_bytes(next));
+            let valid = match std::str::from_utf8(&pending) {
+                Ok(s) => s.len(),
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => pending.len(),
+            };
+            on_text(&String::from_utf8_lossy(&pending[..valid]));
+            pending.drain(..valid);
+            recent.push(next);
+            hidden = self.feed(&[next]);
+        }
+        on_text(&String::from_utf8_lossy(&pending));
+        recent.len()
+    }
+
     /// Generates a conversational reply to `user_prompt`, passing text to `on_text` as it is
     /// produced (whole UTF-8 characters only). The KV-cache persists across calls, so earlier
     /// turns stay in context; only the new user turn is prefilled. Call `reset_kv()` to start
@@ -1337,10 +1465,9 @@ impl SmolLm2Engine {
                 self.feed(&answer);
             }
         }
-        // Close the assistant turn in the cache (`<|im_end|>\n`) so the next user turn
-        // follows proper ChatML framing, whether we stopped on EOS or hit max_new_tokens.
-        let mut closing = vec![self.im_end];
-        closing.extend(self.encode_bpe_segment("\n"));
+        // Close the assistant turn in the cache (e.g. `<|im_end|>\n`) so the next user turn
+        // follows the model's framing, whether we stopped on EOS or hit max_new_tokens.
+        let closing = self.format.assistant_close.clone();
         self.feed(&closing);
         let secs = t0.elapsed().as_secs_f64();
         (reply, secs, turn_ids.len() + generated)
