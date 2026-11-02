@@ -3,18 +3,22 @@
 #   .\tools\golden.ps1 -Model qwen3-0.6b-q8_0.gguf -Llama C:\llama\llama-completion.exe
 #
 # Both engines get the same raw prompts (no chat template), temperature 0 and no repetition
-# penalty, so their output should match. The script prints where the first difference is.
-# Small differences late in a long output can come from float rounding; a mismatch in the
-# first few tokens means a real bug.
+# penalty. The script prints where the first difference is.
+#
+# Exact matches aren't guaranteed: llama.cpp quantizes activations to 8 bits before its dot
+# products, spindle keeps them in f32, so when two tokens are nearly tied the engines can pick
+# differently and the texts drift apart from there. To check a difference, rerun spindle with
+# -v: it prints the top two candidates and their logit gap at every step. If llama.cpp's token
+# is spindle's second choice with a gap well under 1, it's rounding; anything else is a bug.
 
 param(
     [Parameter(Mandatory)] [string] $Model,
     [Parameter(Mandatory)] [string] $Llama,
     [int] $Tokens = 32,
     [string] $Spindle = ".\target\release\spindle.exe",
-    # Extra flags for llama.cpp. Newer builds call the raw-completion tool llama-completion;
-    # older llama-cli needs -no-cnv to skip conversation mode.
-    [string[]] $LlamaArgs = @("--no-display-prompt")
+    # Extra flags for llama.cpp. -no-cnv stops it from applying the chat template, which it
+    # otherwise does by default.
+    [string[]] $LlamaArgs = @("--no-display-prompt", "-no-cnv")
 )
 
 foreach ($exe in @($Llama, $Spindle)) {

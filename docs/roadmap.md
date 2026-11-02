@@ -63,7 +63,11 @@ produce correct text from a real file.
 Done when: a MoE model matches llama.cpp token for token on a fixed prompt.
 
 Status: Granite 3.1 1B-A400M (Q8_0) chats coherently, the first real MoE through the
-engine. 18 tok/s with `--reserve 256` and ~500 MB free; the llama.cpp comparison is next.
+engine (18 tok/s with `--reserve 256` and ~500 MB free). Against llama.cpp b12032 with
+`tools/golden.ps1`, prompt tokens match exactly for every model, SmolLM2-360M matches on all
+4 prompts and Qwen3-0.6B on 3. Every other divergence happens at a near-tie: llama.cpp's
+token is spindle's second choice with a logit gap of 0.01-0.25 (llama.cpp rounds activations
+to 8 bits, spindle doesn't). No divergence pointed at a logic bug. Left: push and tag v0.1.
 
 ### Phase 2: experts from disk (months 1-2)
 

@@ -1373,10 +1373,30 @@ impl SmolLm2Engine {
         self.reset_kv();
         let mut ids: Vec<usize> = self.bos.into_iter().collect();
         ids.extend(self.encode_bpe_segment(prompt));
+        crate::vlog!("[raw] prompt tokens: {ids:?}");
         let mut hidden = self.feed(&ids);
         let mut recent = Vec::new();
         let mut pending: Vec<u8> = Vec::new();
         for _ in 0..n {
+            if crate::ui::verbose() {
+                // The two best candidates and their logit gap: a tiny gap means another engine
+                // can legitimately pick the other one because of rounding.
+                let mut logits = vec![0.0f32; self.cfg.vocab];
+                matvec(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, &hidden, &mut logits);
+                let mut idx: Vec<usize> = (0..logits.len()).collect();
+                idx.select_nth_unstable_by(1, |&a, &b| logits[b].total_cmp(&logits[a]));
+                let (a, b) = if logits[idx[0]] >= logits[idx[1]] { (idx[0], idx[1]) } else { (idx[1], idx[0]) };
+                let s = |t: usize| String::from_utf8_lossy(&self.token_bytes(t)).into_owned();
+                crate::vlog!(
+                    "[raw] step {}: {:?} {:.3} vs {:?} {:.3} (gap {:.3})",
+                    recent.len(),
+                    s(a),
+                    logits[a] / self.cfg.logit_scale,
+                    s(b),
+                    logits[b] / self.cfg.logit_scale,
+                    (logits[a] - logits[b]) / self.cfg.logit_scale
+                );
+            }
             let next = self.sample_next_token(&hidden, &recent, false);
             if self.stop_ids.contains(&next) {
                 break;
