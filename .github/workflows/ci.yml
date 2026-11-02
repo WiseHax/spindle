@@ -1,0 +1,19 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      # Tests that need a model file skip themselves when it isn't present, so CI covers the
+      # kernels, MoE layer, RoPE, tokenizer tables, governor math and layer streamer.
+      - name: Test
+        run: cargo test --release
