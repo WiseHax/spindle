@@ -733,6 +733,8 @@ struct CliConfig {
     /// `--expert-cache-mib`: turn on the MoE expert cache with this RAM budget (needs a pack
     /// from `--pack-experts`).
     expert_cache_mib: Option<usize>,
+    /// `--draft <path>`: small in-RAM draft model for speculative decoding.
+    draft_path: Option<String>,
 }
 
 fn parse_cli() -> CliConfig {
@@ -756,6 +758,7 @@ fn parse_cli() -> CliConfig {
         reserve_mib: None,
         pack_experts: false,
         expert_cache_mib: None,
+        draft_path: None,
     };
 
     let mut pos = Vec::new();
@@ -843,6 +846,10 @@ fn parse_cli() -> CliConfig {
             }
             "--expert-cache-mib" if i + 1 < args.len() => {
                 cfg.expert_cache_mib = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--draft" if i + 1 < args.len() => {
+                cfg.draft_path = Some(args[i + 1].clone());
                 i += 2;
             }
             other => {
@@ -964,10 +971,9 @@ fn main() -> Result<()> {
             // 2-3x slower than reading experts through the mmap, because every miss goes to the
             // SSD while mapped pages are often still in Windows' standby cache.
             if engine.is_moe() && cli.expert_cache_mib.is_some_and(|m| m > 0) {
-                let pack_path = expert_pack::pack_path_for_model(path);
-                if !expert_pack::is_pack_valid(path, &pack_path) {
-                    ui::note(&format!("no expert pack for {path}; run with --pack-experts first"));
-                } else {
+                // Uses <model>.spindle.pack if present, otherwise reads experts straight
+                // from the GGUF (no extra disk space needed).
+                {
                     // Free RAM minus the reserve and 128 MiB of engine headroom, unless
                     // --expert-cache-mib says otherwise. ExpertCache::open refuses budgets
                     // below one layer of experts, and the engine then reads from the mmap.
@@ -977,6 +983,21 @@ fn main() -> Result<()> {
                     });
                     if let Err(e) = engine.enable_expert_cache(budget) {
                         ui::note(&format!("expert cache off ({e}); reading experts from the mapped file"));
+                    }
+                }
+            }
+
+            if let Some(draft_path) = &cli.draft_path {
+                match smollm_chat::SmolLm2Engine::load(draft_path) {
+                    Ok(mut draft) => {
+                        let mib = draft.raw_bytes.len() >> 20;
+                        vlog!("[draft] loaded draft model '{draft_path}' ({mib} MiB) for speculative decoding");
+                        draft.set_sampler(cli.sampler);
+                        engine.enable_draft(draft);
+                    }
+                    Err(e) => {
+                        eprintln!("{}", ui::warn(&format!("could not load draft model {draft_path}: {e}")));
+                        std::process::exit(1);
                     }
                 }
             }

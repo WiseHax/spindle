@@ -129,6 +129,16 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
             ));
         }
     }
+    let (acc, tot, b) = engine.spec_stats;
+    if tot > 0 {
+        parts.push(format!(
+            "spec: {}/{} ({:.1}%) accepted, {} batches",
+            acc,
+            tot,
+            (acc as f64 / tot as f64) * 100.0,
+            b
+        ));
+    }
     parts.join(" · ")
 }
 

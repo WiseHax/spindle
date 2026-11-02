@@ -372,6 +372,192 @@ pub struct MoeStats {
     pub timing: MoeTiming,
 }
 
+/// Multi-token Mixture-of-Experts FFN: runs the router for every token in `xs`, takes the
+/// deduplicated union of chosen experts across the batch so shared experts are fetched from
+/// NVMe / `ExpertCache` only once per layer, and overlaps P-core hit matvecs with E-core reads.
+unsafe fn moe_forward_batch(
+    pool: Option<&WorkerPool>,
+    base: *const u8,
+    m: &Moe,
+    xs: &[Vec<f32>],
+    outs: &mut [Vec<f32>],
+    mut stats: Option<(&mut MoeStats, usize)>,
+    prefetch: Option<&Prefetcher>,
+    mut cache: Option<&mut crate::expert_cache::ExpertCache>,
+) {
+    let bsz = xs.len();
+    if bsz == 0 {
+        return;
+    }
+    if bsz == 1 {
+        moe_forward(pool, base, m, &xs[0], &mut outs[0], stats, prefetch, cache);
+        return;
+    }
+
+    let t_router = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+    let mut probs_batch = vec![vec![0.0f32; m.n_expert]; bsz];
+    let mut chosen_batch = Vec::with_capacity(bsz);
+    let mut wsum_batch = vec![0.0f32; bsz];
+    let mut unique_experts = Vec::new();
+
+    for b in 0..bsz {
+        let probs = &mut probs_batch[b];
+        matvec(pool, base, &m.router, &xs[b], probs);
+        let max = probs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        probs.iter_mut().for_each(|p| *p = (*p - max).exp());
+        let sum: f32 = probs.iter().sum();
+        probs.iter_mut().for_each(|p| *p /= sum);
+
+        let mut chosen: Vec<usize> = (0..m.n_expert).collect();
+        chosen.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
+        chosen.truncate(m.n_used);
+        wsum_batch[b] = chosen.iter().map(|&e| probs[e]).sum();
+        for &e in &chosen {
+            if !unique_experts.contains(&e) {
+                unique_experts.push(e);
+            }
+        }
+        chosen_batch.push(chosen);
+    }
+    let router_us = t_router.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+    if let (Some(pf), None) = (prefetch, cache.as_ref()) {
+        pf.hint(unique_experts.iter().flat_map(|&e| m.experts.expert(e).spans()).collect());
+    }
+
+    let layer = stats.as_ref().map(|s| s.1).unwrap_or(0);
+    let (lookup_us, pending_misses) = if let Some(c) = cache.as_mut() {
+        c.begin_layer(layer, &unique_experts)
+    } else {
+        (0, Vec::new())
+    };
+
+    if let (Some(pf), Some(c)) = (prefetch, cache.as_ref()) {
+        let bypassed: Vec<(usize, usize)> = unique_experts
+            .iter()
+            .copied()
+            .filter(|&e| c.get_expert_ptr(layer, e).is_none() && !pending_misses.iter().any(|&(me, _)| me == e))
+            .flat_map(|e| m.experts.expert(e).spans())
+            .collect();
+        if !bypassed.is_empty() {
+            pf.hint(bypassed);
+        }
+    }
+
+    for out in outs.iter_mut() {
+        out.fill(0.0);
+    }
+    let dim = outs[0].len();
+    let run_expert_for_token = |e: usize, c_ptr: Option<*const u8>, x: &[f32], dst: &mut [f32]| unsafe {
+        let f = m.experts.expert(e);
+        let [g_span, u_span, _d_span] = f.spans();
+        if let Some(c_ptr) = c_ptr {
+            let packed_f = Ffn {
+                gate: Mat { offset: 0, ..f.gate },
+                up: Mat { offset: g_span.1, ..f.up },
+                down: Mat { offset: g_span.1 + u_span.1, ..f.down },
+            };
+            ffn_forward(pool, c_ptr, &packed_f, x, dst);
+        } else {
+            ffn_forward(pool, base, &f, x, dst);
+        }
+    };
+
+    let mut expert_outs = vec![vec![vec![0.0f32; dim]; m.n_used]; bsz];
+    let mut computed = vec![vec![false; m.n_used]; bsz];
+
+    let (disk_us, matvec_us) = if !pending_misses.is_empty() {
+        let t_hit = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        for b in 0..bsz {
+            for (idx, &e) in chosen_batch[b].iter().enumerate() {
+                if let Some(c_ptr) = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e)) {
+                    computed[b][idx] = true;
+                    run_expert_for_token(e, Some(c_ptr), &xs[b], &mut expert_outs[b][idx]);
+                }
+            }
+        }
+        let hit_us = t_hit.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+        let mut disk_us = 0u64;
+        let mut miss_us = 0u64;
+        for (miss_idx, &(e, _)) in pending_misses.iter().enumerate() {
+            disk_us += cache.as_mut().map_or(0, |c| c.wait_one_miss(layer, &pending_misses, miss_idx));
+            let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+            let t_m = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+            for b in 0..bsz {
+                if let Some(idx) = chosen_batch[b].iter().position(|&ce| ce == e) {
+                    if !computed[b][idx] {
+                        computed[b][idx] = true;
+                        run_expert_for_token(e, c_ptr, &xs[b], &mut expert_outs[b][idx]);
+                    }
+                }
+            }
+            miss_us += t_m.map_or(0, |t| t.elapsed().as_micros() as u64);
+        }
+        let t_rem = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        for b in 0..bsz {
+            for (idx, &e) in chosen_batch[b].iter().enumerate() {
+                if !computed[b][idx] {
+                    let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+                    run_expert_for_token(e, c_ptr, &xs[b], &mut expert_outs[b][idx]);
+                }
+            }
+        }
+        miss_us += t_rem.map_or(0, |t| t.elapsed().as_micros() as u64);
+        (disk_us, hit_us + miss_us)
+    } else {
+        let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        for b in 0..bsz {
+            for (idx, &e) in chosen_batch[b].iter().enumerate() {
+                let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+                run_expert_for_token(e, c_ptr, &xs[b], &mut expert_outs[b][idx]);
+            }
+        }
+        (0, t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64))
+    };
+
+    let t_acc = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+    for b in 0..bsz {
+        for (idx, &e) in chosen_batch[b].iter().enumerate() {
+            let w = if m.norm { probs_batch[b][e] / wsum_batch[b] } else { probs_batch[b][e] };
+            let tmp = &expert_outs[b][idx];
+            for i in 0..dim {
+                outs[b][i] += w * tmp[i];
+            }
+            if let Some((s, _)) = stats.as_mut() {
+                s.expert_bytes += m.experts.expert(e).bytes();
+                s.touched[layer * m.n_expert + e] = true;
+            }
+        }
+    }
+
+    if let Some(sh) = &m.shared {
+        let mut tmp = vec![0.0f32; dim];
+        for b in 0..bsz {
+            ffn_forward(pool, base, sh, &xs[b], &mut tmp);
+            let g = match m.shared_gate {
+                Some(off) => {
+                    let w = f32_at(base, off, xs[b].len());
+                    let z: f32 = w.iter().zip(&xs[b]).map(|(a, x)| a * x).sum();
+                    1.0 / (1.0 + (-z).exp())
+                }
+                None => 1.0,
+            };
+            for i in 0..dim {
+                outs[b][i] += g * tmp[i];
+            }
+        }
+    }
+    let sh_us = t_acc.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+    if let Some((s, _)) = stats {
+        s.timing.router_us += router_us;
+        s.timing.cache_lookup_us += lookup_us;
+        s.timing.disk_read_us += disk_us;
+        s.timing.expert_matvec_us += matvec_us + sh_us;
+    }
+}
+
 /// Mixture-of-experts FFN: softmax router, top-`n_used` experts weighted by their router
 /// probability (renormalized if `norm`), plus the optional shared expert.
 unsafe fn moe_forward(
@@ -405,42 +591,110 @@ unsafe fn moe_forward(
     }
 
     let layer = stats.as_ref().map(|s| s.1).unwrap_or(0);
-    let (lookup_us, disk_us) = if let Some(c) = cache.as_mut() {
-        c.ensure_experts(layer, &chosen).unwrap_or((0, 0))
+    let (lookup_us, pending_misses) = if let Some(c) = cache.as_mut() {
+        c.begin_layer(layer, &chosen)
     } else {
-        (0, 0)
+        (0, Vec::new())
     };
 
-    let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+    // If W-TinyLFU bypassed any cold outliers (not in cache, not being read into a slot),
+    // prefetch their mapped spans while the P-cores compute the cached hits.
+    if let (Some(pf), Some(c)) = (prefetch, cache.as_ref()) {
+        let bypassed: Vec<(usize, usize)> = chosen
+            .iter()
+            .copied()
+            .filter(|&e| c.get_expert_ptr(layer, e).is_none() && !pending_misses.iter().any(|&(me, _)| me == e))
+            .flat_map(|e| m.experts.expert(e).spans())
+            .collect();
+        if !bypassed.is_empty() {
+            pf.hint(bypassed);
+        }
+    }
+
     out.fill(0.0);
-    let mut tmp = vec![0.0f32; out.len()];
     let mut stats = stats;
-    for &e in &chosen {
-        let w = if m.norm { probs[e] / wsum } else { probs[e] };
+    let run_expert = |e: usize, c_ptr: Option<*const u8>, dst: &mut [f32]| unsafe {
         let f = m.experts.expert(e);
         let [g_span, u_span, _d_span] = f.spans();
-        let cached_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
-
-        if let Some(c_ptr) = cached_ptr {
+        if let Some(c_ptr) = c_ptr {
             let packed_f = Ffn {
                 gate: Mat { offset: 0, ..f.gate },
                 up: Mat { offset: g_span.1, ..f.up },
                 down: Mat { offset: g_span.1 + u_span.1, ..f.down },
             };
-            ffn_forward(pool, c_ptr, &packed_f, x, &mut tmp);
+            ffn_forward(pool, c_ptr, &packed_f, x, dst);
         } else {
-            ffn_forward(pool, base, &f, x, &mut tmp);
+            ffn_forward(pool, base, &f, x, dst);
         }
+    };
 
-        for i in 0..out.len() {
-            out[i] += w * tmp[i];
+    let (disk_us, matvec_us) = if !pending_misses.is_empty() {
+        // Overlap P-core matvecs of already-cached (hit) experts with E-core disk reads of
+        // missed experts, and pipeline each missed expert as soon as its segments finish.
+        let mut expert_outs = vec![vec![0.0f32; out.len()]; chosen.len()];
+        let mut computed = vec![false; chosen.len()];
+        let t_hit = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        for (idx, &e) in chosen.iter().enumerate() {
+            if let Some(c_ptr) = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e)) {
+                computed[idx] = true;
+                run_expert(e, Some(c_ptr), &mut expert_outs[idx]);
+            }
         }
-        if let Some((s, _)) = stats.as_mut() {
-            s.expert_bytes += f.bytes();
-            s.touched[layer * m.n_expert + e] = true;
+        let hit_us = t_hit.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+        let mut disk_us = 0u64;
+        let mut miss_us = 0u64;
+        for (miss_idx, &(e, _)) in pending_misses.iter().enumerate() {
+            disk_us += cache.as_mut().map_or(0, |c| c.wait_one_miss(layer, &pending_misses, miss_idx));
+            if let Some(idx) = chosen.iter().position(|&ce| ce == e) {
+                let t_m = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+                let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+                computed[idx] = true;
+                run_expert(e, c_ptr, &mut expert_outs[idx]);
+                miss_us += t_m.map_or(0, |t| t.elapsed().as_micros() as u64);
+            }
         }
-    }
+        let t_rem = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        for (idx, &e) in chosen.iter().enumerate() {
+            if !computed[idx] {
+                let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+                run_expert(e, c_ptr, &mut expert_outs[idx]);
+            }
+        }
+        for (idx, &e) in chosen.iter().enumerate() {
+            let w = if m.norm { probs[e] / wsum } else { probs[e] };
+            let tmp = &expert_outs[idx];
+            for i in 0..out.len() {
+                out[i] += w * tmp[i];
+            }
+            if let Some((s, _)) = stats.as_mut() {
+                s.expert_bytes += m.experts.expert(e).bytes();
+                s.touched[layer * m.n_expert + e] = true;
+            }
+        }
+        miss_us += t_rem.map_or(0, |t| t.elapsed().as_micros() as u64);
+        (disk_us, hit_us + miss_us)
+    } else {
+        let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        let mut tmp = vec![0.0f32; out.len()];
+        for &e in &chosen {
+            let w = if m.norm { probs[e] / wsum } else { probs[e] };
+            let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+            run_expert(e, c_ptr, &mut tmp);
+            for i in 0..out.len() {
+                out[i] += w * tmp[i];
+            }
+            if let Some((s, _)) = stats.as_mut() {
+                s.expert_bytes += m.experts.expert(e).bytes();
+                s.touched[layer * m.n_expert + e] = true;
+            }
+        }
+        (0, t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64))
+    };
+
+    let t_sh = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
     if let Some(sh) = &m.shared {
+        let mut tmp = vec![0.0f32; out.len()];
         ffn_forward(pool, base, sh, x, &mut tmp);
         let g = match m.shared_gate {
             Some(off) => {
@@ -454,7 +708,7 @@ unsafe fn moe_forward(
             out[i] += g * tmp[i];
         }
     }
-    let matvec_us = t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64);
+    let matvec_us = matvec_us + t_sh.map_or(0, |t| t.elapsed().as_micros() as u64);
 
     if let Some((s, _)) = stats.as_mut() {
         s.timing.router_us += router_us;
@@ -610,6 +864,10 @@ pub struct SmolLm2Engine {
     kv_shifts: u64,
     system_prompt: &'static str,
     pub moe_stats: MoeStats,
+    /// Optional small draft engine for speculative decoding (`--draft <path>`).
+    pub draft_engine: Option<Box<SmolLm2Engine>>,
+    /// Speculative decoding stats `(accepted_draft_tokens, total_drafted_tokens, verify_batches)` for the turn.
+    pub spec_stats: (usize, usize, usize),
 }
 
 /// How a conversation is framed in tokens. Built once at load from the model's special
@@ -702,11 +960,11 @@ impl SmolLm2Engine {
 
         // Preflight: the KV-cache is the one big private allocation. Size it to what's free
         // (a quarter of available RAM at most) instead of letting a failed allocation abort
-        // the process. 1024 positions is the default.
+        // the process. 2048 positions is the default.
         let wanted = std::env::var("CHAT_CTX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(1024)
+            .unwrap_or(2048)
             .clamp(64, c.ctx_len);
         let per_pos = 2 * c.n_layers * c.kv_dim * 2;
         let scratch = c.vocab * 8 + 64 * 1024 * 1024;
@@ -798,6 +1056,8 @@ impl SmolLm2Engine {
             kv_shifts: 0,
             system_prompt,
             moe_stats: MoeStats { touched: vec![false; c.n_layers * c.n_expert], ..Default::default() },
+            draft_engine: None,
+            spec_stats: (0, 0, 0),
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -886,6 +1146,17 @@ impl SmolLm2Engine {
     pub fn reset_kv(&mut self) {
         self.cur_pos = 0;
         self.n_keep = 0;
+        if let Some(draft) = self.draft_engine.as_mut() {
+            draft.cur_pos = 0;
+            draft.n_keep = 0;
+        }
+    }
+
+    /// Attaches a small draft engine for speculative decoding (`--draft <path>`).
+    pub fn enable_draft(&mut self, mut draft: SmolLm2Engine) {
+        draft.max_seq = self.max_seq;
+        draft.system_prompt = self.system_prompt;
+        self.draft_engine = Some(Box::new(draft));
     }
 
     /// Locks up to `budget` bytes of weights into RAM and returns how many were locked.
@@ -1047,47 +1318,51 @@ impl SmolLm2Engine {
         )
     }
 
-    /// Opens an in-RAM expert cache for `<model>.spindle.pack` with the specified budget.
+    /// Opens an in-RAM expert cache with the specified budget. Uses `<model>.spindle.pack`
+    /// when a valid one exists, otherwise reads experts straight from the GGUF, which needs
+    /// no extra disk space (a pack duplicates every expert).
     pub fn enable_expert_cache(&mut self, budget_bytes: usize) -> std::io::Result<()> {
         if !self.is_moe() {
             return Ok(());
         }
-        let pack_path = crate::expert_pack::pack_path_for_model(&self.path);
-        if !crate::expert_pack::is_pack_valid(&self.path, &pack_path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no valid pack file found at {pack_path}"),
-            ));
-        }
-        let cache = crate::expert_cache::ExpertCache::open(&pack_path, budget_bytes)?;
-        let h = &cache.pack_idx.hdr;
-        let first_moe = self.layers.iter().find_map(|l| match &l.ffn {
-            FfnKind::Moe(m) => Some(m.experts.expert(0).spans()),
-            _ => None,
-        });
-        // Expert sizes can differ per layer (mixed quants such as Q4_K_M); every expert
-        // must fit in one slot or the cached slab would be truncated.
-        let max_payload = self
+        let n_expert = self.cfg.n_expert;
+        // Expert sizes can differ per layer (mixed quants such as Q4_K_M), so each expert
+        // carries its own spans. Non-MoE layers get empty entries and are never requested.
+        let segments: Vec<crate::expert_cache::ExpertSegments> = self
             .layers
             .iter()
-            .filter_map(|l| match &l.ffn {
-                FfnKind::Moe(m) => Some((0..m.n_expert).map(|e| m.experts.expert(e).spans().iter().map(|s| s.1).sum::<usize>()).max().unwrap_or(0)),
-                _ => None,
+            .flat_map(|l| {
+                (0..n_expert).map(move |e| match &l.ffn {
+                    FfnKind::Moe(m) => m.experts.expert(e).spans().map(|(off, len)| (off as u64, len)),
+                    _ => [(0, 0); 3],
+                })
             })
-            .max()
-            .unwrap_or(0) as u64;
-        let shape_ok = h.n_layers as usize == self.cfg.n_layers
-            && h.n_expert as usize == self.cfg.n_expert
-            && max_payload <= h.expert_slot_bytes
-            && first_moe.is_some_and(|s| (s[0].1 as u64, s[1].1 as u64, s[2].1 as u64) == (h.gate_bytes, h.up_bytes, h.down_bytes));
-        if !shape_ok {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{pack_path} doesn't match this model's experts; delete it and run --pack-experts again"),
-            ));
-        }
+            .collect();
+        let max_payload = segments.iter().map(|s| s.iter().map(|x| x.1).sum::<usize>()).max().unwrap_or(0) as u64;
+
+        let pack_path = crate::expert_pack::pack_path_for_model(&self.path);
+        let (cache, source) = if crate::expert_pack::is_pack_valid(&self.path, &pack_path) {
+            let h = std::fs::File::open(&pack_path)
+                .and_then(|mut f| crate::expert_pack::PackIndex::read_from_file(&mut f))?
+                .hdr;
+            let first = segments.iter().find(|s| s[0].1 > 0);
+            let shape_ok = h.n_layers as usize == self.cfg.n_layers
+                && h.n_expert as usize == n_expert
+                && max_payload <= h.expert_slot_bytes
+                && first.is_some_and(|s| (s[0].1 as u64, s[1].1 as u64, s[2].1 as u64) == (h.gate_bytes, h.up_bytes, h.down_bytes));
+            if !shape_ok {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{pack_path} doesn't match this model's experts; delete it and run --pack-experts again"),
+                ));
+            }
+            (crate::expert_cache::ExpertCache::open(&pack_path, budget_bytes)?, "pack")
+        } else {
+            let c = crate::expert_cache::ExpertCache::open_gguf(&self.path, segments, self.cfg.n_layers, n_expert, budget_bytes)?;
+            (c, "gguf")
+        };
         crate::vlog!(
-            "[expert:cache] enabled in-RAM cache: {} expert slots ({:.1} MiB budget), slot size {:.2} MiB",
+            "[expert:cache] enabled in-RAM cache from {source}: {} expert slots ({:.1} MiB budget), slot size {:.2} MiB",
             cache.capacity(),
             (cache.capacity() * cache.slot_bytes) as f64 / (1024.0 * 1024.0),
             cache.slot_bytes as f64 / (1024.0 * 1024.0)
@@ -1132,14 +1407,183 @@ impl SmolLm2Engine {
     }
 
     /// Feeds `ids` into the KV-cache starting at `cur_pos` and returns the last hidden state.
+    /// Processes up to 32 tokens per layer-synchronous batch so a multi-token prompt scans
+    /// the model's layers once per chunk instead of once per token.
     unsafe fn feed(&mut self, ids: &[usize]) -> Vec<f32> {
         let mut last_hidden = vec![0.0f32; self.cfg.dim];
-        for &tid in ids {
-            self.ensure_kv_room(1);
-            last_hidden = self.forward_hidden(tid, self.cur_pos);
-            self.cur_pos += 1;
+        for chunk in ids.chunks(32) {
+            self.ensure_kv_room(chunk.len());
+            if chunk.len() == 1 {
+                last_hidden = self.forward_hidden(chunk[0], self.cur_pos);
+                self.cur_pos += 1;
+            } else {
+                let mut hiddens = self.forward_batch(chunk, self.cur_pos);
+                self.cur_pos += chunk.len();
+                if let Some(h) = hiddens.pop() {
+                    last_hidden = h;
+                }
+            }
         }
         last_hidden
+    }
+
+    /// Runs a batch of tokens `token_ids` starting at `start_pos` synchronously layer-by-layer
+    /// (`l in 0..n_layers` on the outer loop, `b in 0..token_ids.len()` on the inner loop) and
+    /// returns the final-normed hidden state for each token in `token_ids`.
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn forward_batch(&mut self, token_ids: &[usize], start_pos: usize) -> Vec<Vec<f32>> {
+        let bsz = token_ids.len();
+        if bsz == 0 {
+            return Vec::new();
+        }
+        if bsz == 1 {
+            return vec![self.forward_hidden(token_ids[0], start_pos)];
+        }
+        let c = self.cfg;
+        let base = self.raw_bytes.as_ptr();
+        let pool = self.pool.as_ref();
+
+        let rb = row_bytes(self.embed.dtype, c.dim).expect("unsupported embedding type");
+        let mut xs: Vec<Vec<f32>> = token_ids
+            .iter()
+            .map(|&tid| {
+                let row = std::slice::from_raw_parts(base.add(self.embed.offset + tid * rb), rb);
+                let mut x = dequant_row(self.embed.dtype, row, c.dim);
+                if c.embedding_scale != 1.0 {
+                    x.iter_mut().for_each(|v| *v *= c.embedding_scale);
+                }
+                x
+            })
+            .collect();
+
+        let mut x_norms = vec![vec![0.0f32; c.dim]; bsz];
+        let mut proj_outs = vec![vec![0.0f32; c.dim]; bsz];
+        let mut q = vec![0.0f32; c.q_dim];
+        let mut k = vec![0.0f32; c.kv_dim];
+        let mut v = vec![0.0f32; c.kv_dim];
+        let mut attn_out = vec![0.0f32; c.q_dim];
+        if self.is_moe() {
+            self.moe_stats.tokens += bsz;
+        }
+
+        let hint = self.prefetcher.as_ref();
+        let first_streamed = self.streamer.as_ref().map_or(usize::MAX, |s| s.first);
+        for l in 0..c.n_layers {
+            let ly = self.layers[l];
+            let streamed = match self.streamer.as_mut() {
+                Some(st) if l >= st.first => Some(st.take(l).expect("reading a layer from the model file failed")),
+                _ => None,
+            };
+            let lbase = match (&streamed, &self.layer_spans) {
+                (Some(buf), Some(spans)) => buf.as_ptr().wrapping_sub(spans[l].0),
+                _ => base,
+            };
+            if let (Some(pf), Some(next)) = (hint.filter(|_| l + 1 < first_streamed), self.layers.get(l + 1)) {
+                let mut r = vec![span(&next.wq), span(&next.wk), span(&next.wv), span(&next.wo)];
+                match &next.ffn {
+                    FfnKind::Dense(f) => r.extend(f.spans()),
+                    FfnKind::Moe(m) => r.push(span(&m.router)),
+                }
+                pf.hint(r);
+            }
+
+            let scale = c.attn_scale.unwrap_or(1.0 / (c.head_dim as f32).sqrt());
+            for b in 0..bsz {
+                let pos = start_pos + b;
+                rmsnorm(&xs[b], f32_at(lbase, ly.attn_norm, c.dim), &mut x_norms[b], c.rms_eps);
+                matvec(pool, lbase, &ly.wq, &x_norms[b], &mut q);
+                matvec(pool, lbase, &ly.wk, &x_norms[b], &mut k);
+                matvec(pool, lbase, &ly.wv, &x_norms[b], &mut v);
+                add_bias(lbase, &mut q, ly.q_bias);
+                add_bias(lbase, &mut k, ly.k_bias);
+                add_bias(lbase, &mut v, ly.v_bias);
+                if let Some(off) = ly.q_norm {
+                    let n = if ly.qk_norm_full { c.q_dim } else { c.head_dim };
+                    rmsnorm_heads(&mut q, f32_at(lbase, off, n), n, c.rms_eps);
+                }
+                if let Some(off) = ly.k_norm {
+                    let n = if ly.qk_norm_full { c.kv_dim } else { c.head_dim };
+                    rmsnorm_heads(&mut k, f32_at(lbase, off, n), n, c.rms_eps);
+                }
+                self.rope.rotate(&mut q, c.head_dim, pos as f32);
+                self.rope.rotate(&mut k, c.head_dim, pos as f32);
+
+                let kv_off = (l * self.max_seq + pos) * c.kv_dim;
+                f32_to_f16_slice(&k, &mut self.k_cache[kv_off..kv_off + c.kv_dim]);
+                f32_to_f16_slice(&v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
+
+                attn_out.fill(0.0);
+                for h in 0..c.n_heads {
+                    let kvh = h / (c.n_heads / c.n_kv_heads);
+                    let q_head = &q[h * c.head_dim..(h + 1) * c.head_dim];
+                    let out_head = &mut attn_out[h * c.head_dim..(h + 1) * c.head_dim];
+
+                    let mut m_prev = f32::NEG_INFINITY;
+                    let mut l_prev = 0.0f32;
+                    for t in 0..=pos {
+                        let t_off = (l * self.max_seq + t) * c.kv_dim + kvh * c.head_dim;
+                        let k_head = &self.k_cache[t_off..t_off + c.head_dim];
+                        let v_head = &self.v_cache[t_off..t_off + c.head_dim];
+
+                        let score = dot_f16_row_avx2(k_head.as_ptr() as *const u8, q_head.as_ptr(), c.head_dim) * scale;
+                        let m_new = m_prev.max(score);
+                        let alpha = (m_prev - m_new).exp();
+                        let p = (score - m_new).exp();
+                        l_prev = l_prev * alpha + p;
+                        m_prev = m_new;
+
+                        let (va, vp) = (_mm256_set1_ps(alpha), _mm256_set1_ps(p));
+                        for d in (0..c.head_dim).step_by(8) {
+                            let o = out_head.as_mut_ptr().add(d);
+                            let ov = _mm256_mul_ps(_mm256_loadu_ps(o), va);
+                            let vv = _mm256_cvtph_ps(_mm_loadu_si128(v_head.as_ptr().add(d) as *const __m128i));
+                            _mm256_storeu_ps(o, _mm256_fmadd_ps(vp, vv, ov));
+                        }
+                    }
+                    let inv_l = 1.0f32 / l_prev.max(1e-9);
+                    for d in 0..c.head_dim {
+                        out_head[d] *= inv_l;
+                    }
+                }
+
+                matvec(pool, lbase, &ly.wo, &attn_out, &mut proj_outs[b]);
+                for i in 0..c.dim {
+                    xs[b][i] += c.residual_scale * proj_outs[b][i];
+                }
+                rmsnorm(&xs[b], f32_at(lbase, ly.ffn_norm, c.dim), &mut x_norms[b], c.rms_eps);
+            }
+
+            match &ly.ffn {
+                FfnKind::Dense(f) => {
+                    for b in 0..bsz {
+                        ffn_forward(pool, lbase, f, &x_norms[b], &mut proj_outs[b]);
+                    }
+                }
+                FfnKind::Moe(m) => moe_forward_batch(
+                    pool,
+                    lbase,
+                    m,
+                    &x_norms,
+                    &mut proj_outs,
+                    Some((&mut self.moe_stats, l)),
+                    hint,
+                    self.expert_cache.as_mut(),
+                ),
+            }
+            for b in 0..bsz {
+                for i in 0..c.dim {
+                    xs[b][i] += c.residual_scale * proj_outs[b][i];
+                }
+            }
+            if let (Some(buf), Some(st)) = (streamed, self.streamer.as_mut()) {
+                st.give_back(buf);
+            }
+        }
+
+        for b in 0..bsz {
+            rmsnorm(&xs[b], f32_at(base, self.output_norm, c.dim), &mut x_norms[b], c.rms_eps);
+        }
+        x_norms
     }
 
     /// Runs one token at position `pos` through every layer and returns the final-normed
@@ -1287,9 +1731,15 @@ impl SmolLm2Engine {
     /// Computes LM-head logits for `hidden` and picks the next token using `self.sampler`:
     /// repetition penalty, temperature, top-k, min-p, top-p, then a seeded random draw
     /// (or plain argmax when `temperature <= 0`). If `forbid_stop` is set, stop tokens are
-    /// masked so the reply can't be empty.
+    /// masked so the reply can't be empty. If `forbid_think` is set, opening `<think>` is masked.
     #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn sample_next_token(&mut self, hidden: &[f32], recent: &[usize], forbid_stop: bool) -> usize {
+    pub unsafe fn sample_next_token(
+        &mut self,
+        hidden: &[f32],
+        recent: &[usize],
+        forbid_stop: bool,
+        forbid_think: bool,
+    ) -> usize {
         let c = self.cfg;
         let mut logits = vec![0.0f32; c.vocab];
         matvec(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, hidden, &mut logits);
@@ -1311,6 +1761,11 @@ impl SmolLm2Engine {
         if forbid_stop {
             for &id in &self.stop_ids {
                 logits[id] = f32::NEG_INFINITY;
+            }
+        }
+        if forbid_think {
+            if let Some((open, _)) = self.think_ids {
+                logits[open] = f32::NEG_INFINITY;
             }
         }
 
@@ -1375,15 +1830,26 @@ impl SmolLm2Engine {
     }
 
     /// A user message followed by the opening of the assistant's reply.
-    fn encode_user_turn(&self, user_prompt: &str) -> Vec<usize> {
+    fn encode_user_turn(&self, user_prompt: &str, allow_think: bool) -> Vec<usize> {
         let f = &self.format;
-        [&f.user_open[..], &self.encode_bpe_segment(user_prompt.trim()), &f.user_close, &f.assistant_open].concat()
+        let mut ids = [&f.user_open[..], &self.encode_bpe_segment(user_prompt.trim()), &f.user_close, &f.assistant_open].concat();
+        if !allow_think {
+            if let Some((open, close)) = self.think_ids {
+                // Official Qwen/R1 fast mode: inject a closed think block (<think>\n\n</think>\n\n)
+                // so the model recognizes reasoning is already done and immediately begins the direct answer.
+                ids.push(open);
+                ids.extend(self.encode_bpe_segment("\n\n"));
+                ids.push(close);
+                ids.extend(self.encode_bpe_segment("\n\n"));
+            }
+        }
+        ids
     }
 
     /// Full prompt for a single message (system + user + assistant header).
     pub fn encode_chatml(&self, user_prompt: &str) -> Vec<usize> {
         let mut ids = self.encode_system();
-        ids.extend(self.encode_user_turn(user_prompt));
+        ids.extend(self.encode_user_turn(user_prompt, false));
         ids
     }
 
@@ -1528,7 +1994,7 @@ impl SmolLm2Engine {
                     (logits[a] - logits[b]) / self.cfg.logit_scale
                 );
             }
-            let next = self.sample_next_token(&hidden, &recent, false);
+            let next = self.sample_next_token(&hidden, &recent, false, false);
             if self.stop_ids.contains(&next) {
                 break;
             }
@@ -1557,19 +2023,29 @@ impl SmolLm2Engine {
         max_new_tokens: usize,
         on_text: &mut dyn FnMut(&str),
     ) -> (String, f64, usize) {
+        let allow_think = true;
         let t0 = Instant::now();
+        self.spec_stats = (0, 0, 0);
+        let mut draft_engine = self.draft_engine.take();
         if self.n_keep == 0 {
             let sys = self.encode_system();
             self.feed(&sys);
+            if let Some(draft) = draft_engine.as_mut() {
+                draft.feed(&sys);
+                draft.n_keep = self.n_keep;
+            }
             self.n_keep = self.cur_pos;
         }
-        let mut turn_ids = self.encode_user_turn(user_prompt);
+        let mut turn_ids = self.encode_user_turn(user_prompt, allow_think);
         // A single turn can never be larger than the non-system window (leave room to reply).
         let max_turn = (self.max_seq - self.n_keep) / 2;
         if turn_ids.len() > max_turn {
             turn_ids.drain(..turn_ids.len() - max_turn);
         }
         let mut last_hidden = self.feed(&turn_ids);
+        if let Some(draft) = draft_engine.as_mut() {
+            draft.feed(&turn_ids);
+        }
         let reply_start = self.cur_pos;
         let shifts_before = self.kv_shifts;
 
@@ -1581,14 +2057,19 @@ impl SmolLm2Engine {
         // Bytes of a UTF-8 character that isn't complete yet.
         let mut pending: Vec<u8> = Vec::new();
         let mut generated = 0usize;
+        let forbid_think = !allow_think;
 
-        for step in 0..max_new_tokens {
-            // Stop tokens are blocked for the first 2 tokens (no empty replies) and inside a
-            // <think> block: Qwen3 sometimes samples <|endoftext|> where </think> belongs, which
-            // ended the reply before any answer. Once the answer starts, the repetition
-            // penalty only looks at the answer, not at words the reasoning already used.
+        let should_stop = |gen: usize, recent_len: usize, ans_from: Option<usize>, _thinking: bool| -> bool {
+            if let Some(from) = ans_from {
+                recent_len.saturating_sub(from) >= max_new_tokens
+            } else {
+                gen >= max_new_tokens
+            }
+        };
+
+        while !should_stop(generated, recent.len(), answer_from, in_think) {
             let penalty_window = &recent[answer_from.unwrap_or(0).min(recent.len())..];
-            let next_id = self.sample_next_token(&last_hidden, penalty_window, step < 2 || in_think);
+            let next_id = self.sample_next_token(&last_hidden, penalty_window, generated < 2 || in_think, forbid_think);
             if self.stop_ids.contains(&next_id) {
                 break;
             }
@@ -1603,7 +2084,6 @@ impl SmolLm2Engine {
             pending.extend(self.token_bytes(next_id));
             let valid = match std::str::from_utf8(&pending) {
                 Ok(s) => s.len(),
-                // Incomplete trailing char: wait for more bytes. Invalid bytes: flush lossily.
                 Err(e) if e.error_len().is_none() => e.valid_up_to(),
                 Err(_) => pending.len(),
             };
@@ -1613,8 +2093,177 @@ impl SmolLm2Engine {
             reply.push_str(&piece);
             recent.push(next_id);
             generated += 1;
+            if should_stop(generated, recent.len(), answer_from, in_think) {
+                break;
+            }
 
-            last_hidden = self.feed(&[next_id]);
+            if let Some(draft) = draft_engine.as_mut() {
+                // 1. Advance draft with the verified token
+                draft.ensure_kv_room(1);
+                let mut draft_hidden = draft.forward_hidden(next_id, draft.cur_pos);
+                draft.cur_pos += 1;
+
+                // 2. Draft up to K tokens using the small fast model
+                let max_draft = 4.min(max_new_tokens.saturating_sub(recent.len().saturating_sub(answer_from.unwrap_or(0))));
+                let mut draft_tokens = Vec::with_capacity(max_draft);
+                for _ in 0..max_draft {
+                    draft.ensure_kv_room(1);
+                    let d = draft.sample_next_token(&draft_hidden, &[], false, forbid_think);
+                    if draft.stop_ids.contains(&d) {
+                        break;
+                    }
+                    draft_tokens.push(d);
+                    draft_hidden = draft.forward_hidden(d, draft.cur_pos);
+                    draft.cur_pos += 1;
+                }
+
+                if draft_tokens.is_empty() {
+                    self.ensure_kv_room(1);
+                    last_hidden = self.forward_hidden(next_id, self.cur_pos);
+                    self.cur_pos += 1;
+                    continue;
+                }
+
+                // 3. Batch verify on target in ONE layer-synchronous scan!
+                // Target evaluates: [next_id, draft_tokens[0], ..., draft_tokens[M-1]]
+                let m = draft_tokens.len();
+                let mut verify_batch = Vec::with_capacity(m + 1);
+                verify_batch.push(next_id);
+                verify_batch.extend_from_slice(&draft_tokens);
+
+                self.ensure_kv_room(verify_batch.len());
+                let target_start_pos = self.cur_pos;
+                let hiddens = self.forward_batch(&verify_batch, target_start_pos);
+                self.cur_pos += verify_batch.len();
+
+                // 4. Verify draft tokens sequentially against target logits
+                let mut all_accepted = true;
+                let mut stopped = false;
+                for (i, &d_tok) in draft_tokens.iter().enumerate() {
+                    self.spec_stats.1 += 1;
+                    let target_tok = self.sample_next_token(&hiddens[i], &recent[answer_from.unwrap_or(0).min(recent.len())..], in_think, forbid_think);
+                    if target_tok == d_tok {
+                        self.spec_stats.0 += 1;
+                        if self.stop_ids.contains(&d_tok) {
+                            let keep_pos = target_start_pos + 1 + i;
+                            self.cur_pos = keep_pos;
+                            draft.cur_pos = keep_pos;
+                            stopped = true;
+                            break;
+                        }
+                        match self.think_ids {
+                            Some((open, _)) if d_tok == open => in_think = true,
+                            Some((_, close)) if d_tok == close => {
+                                in_think = false;
+                                answer_from = Some(recent.len() + 1);
+                            }
+                            _ => {}
+                        }
+                        pending.extend(self.token_bytes(d_tok));
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(s) => s.len(),
+                            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                            Err(_) => pending.len(),
+                        };
+                        let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        pending.drain(..valid);
+                        on_text(&piece);
+                        reply.push_str(&piece);
+                        recent.push(d_tok);
+                        generated += 1;
+                        if should_stop(generated, recent.len(), answer_from, in_think) {
+                            let keep_pos = target_start_pos + 1 + i;
+                            self.cur_pos = keep_pos;
+                            draft.cur_pos = keep_pos;
+                            stopped = true;
+                            break;
+                        }
+                    } else {
+                        all_accepted = false;
+                        if self.stop_ids.contains(&target_tok) {
+                            let keep_pos = target_start_pos + 1 + i;
+                            self.cur_pos = keep_pos;
+                            draft.cur_pos = keep_pos;
+                            stopped = true;
+                            break;
+                        }
+                        match self.think_ids {
+                            Some((open, _)) if target_tok == open => in_think = true,
+                            Some((_, close)) if target_tok == close => {
+                                in_think = false;
+                                answer_from = Some(recent.len() + 1);
+                            }
+                            _ => {}
+                        }
+                        pending.extend(self.token_bytes(target_tok));
+                        let valid = match std::str::from_utf8(&pending) {
+                            Ok(s) => s.len(),
+                            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                            Err(_) => pending.len(),
+                        };
+                        let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        pending.drain(..valid);
+                        on_text(&piece);
+                        reply.push_str(&piece);
+                        recent.push(target_tok);
+                        generated += 1;
+
+                        let mismatch_pos = target_start_pos + 1 + i;
+                        self.cur_pos = mismatch_pos;
+                        last_hidden = self.forward_hidden(target_tok, self.cur_pos);
+                        self.cur_pos += 1;
+
+                        draft.cur_pos = mismatch_pos;
+                        draft.forward_hidden(target_tok, draft.cur_pos);
+                        draft.cur_pos += 1;
+                        break;
+                    }
+                }
+                self.spec_stats.2 += 1;
+
+                if stopped {
+                    break;
+                }
+
+                if all_accepted && !should_stop(generated, recent.len(), answer_from, in_think) {
+                    let bonus_tok = self.sample_next_token(&hiddens[m], &recent[answer_from.unwrap_or(0).min(recent.len())..], in_think, forbid_think);
+                    if self.stop_ids.contains(&bonus_tok) {
+                        break;
+                    }
+                    match self.think_ids {
+                        Some((open, _)) if bonus_tok == open => in_think = true,
+                        Some((_, close)) if bonus_tok == close => {
+                            in_think = false;
+                            answer_from = Some(recent.len() + 1);
+                        }
+                        _ => {}
+                    }
+                    pending.extend(self.token_bytes(bonus_tok));
+                    let valid = match std::str::from_utf8(&pending) {
+                        Ok(s) => s.len(),
+                        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                        Err(_) => pending.len(),
+                    };
+                    let piece = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    pending.drain(..valid);
+                    on_text(&piece);
+                    reply.push_str(&piece);
+                    recent.push(bonus_tok);
+                    generated += 1;
+
+                    self.ensure_kv_room(1);
+                    last_hidden = self.forward_hidden(bonus_tok, self.cur_pos);
+                    self.cur_pos += 1;
+
+                    draft.ensure_kv_room(1);
+                    draft.forward_hidden(bonus_tok, draft.cur_pos);
+                    draft.cur_pos += 1;
+                }
+            } else {
+                self.ensure_kv_room(1);
+                last_hidden = self.forward_hidden(next_id, self.cur_pos);
+                self.cur_pos += 1;
+            }
         }
         if !pending.is_empty() {
             let piece = String::from_utf8_lossy(&pending).into_owned();
@@ -1634,12 +2283,20 @@ impl SmolLm2Engine {
                     .collect();
                 self.cur_pos = reply_start;
                 self.feed(&answer);
+                if let Some(draft) = draft_engine.as_mut() {
+                    draft.cur_pos = reply_start;
+                    draft.feed(&answer);
+                }
             }
         }
         // Close the assistant turn in the cache (e.g. `<|im_end|>\n`) so the next user turn
         // follows the model's framing, whether we stopped on EOS or hit max_new_tokens.
         let closing = self.format.assistant_close.clone();
         self.feed(&closing);
+        if let Some(draft) = draft_engine.as_mut() {
+            draft.feed(&closing);
+        }
+        self.draft_engine = draft_engine;
         let secs = t0.elapsed().as_secs_f64();
         (reply, secs, turn_ids.len() + generated)
     }
