@@ -4,6 +4,8 @@
 *.gguf
 *.bin
 *.safetensors
+*.pack
+*.spindle.pack
 
 # Editor / OS noise
 .vscode/

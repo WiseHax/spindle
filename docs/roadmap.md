@@ -85,6 +85,21 @@ since it's bigger than the RAM we can use but small enough to iterate on.
 Done when: OLMoE-1B-7B runs at 10+ tok/s with a 3 GB budget, and the cache hit rate is
 printed with every reply.
 
+Status: first version in, not yet faster than mmap.
+
+- `--pack-experts` writes `<model>.spindle.pack`: every expert's gate/up/down back to back in
+  one 4 KiB-aligned slot (Granite 1B-A400M: 768 experts, 1224 MiB).
+- `--expert-cache-mib N` turns on an in-RAM cache of N MiB filled by unbuffered reads from
+  the pack, with per-layer fair share and frequency/recency eviction. Output is identical to
+  the mmap path (greedy, 3 prompts).
+- Measured on Granite 1B-A400M with ~800 MB free and `--reserve 256`: 5.7-10.2 tok/s with the
+  cache (43-83% hit rate depending on how big a budget free RAM allowed) against 8.7-33 tok/s
+  reading experts through the mmap. Unbuffered misses always go to the SSD, while mapped pages
+  often come back from the standby cache. So the cache is opt-in for now.
+- Not done: the cache needs to beat mmap before it's the default. Ideas: reads off the compute
+  thread with several in flight, buffered reads so misses can hit the OS cache, and a model
+  that really doesn't fit (OLMoE-1B-7B) where mmap has no standby cache to lean on.
+
 ### Phase 3: knowing which experts come next (months 2-4)
 
 Waiting for the router before starting a read is where the time goes. Read early instead.
