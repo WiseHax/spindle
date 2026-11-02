@@ -626,6 +626,26 @@ impl SmolLm2Engine {
         };
 
         let raw_bytes = MappedFile::open(path)?;
+        // A partial download still parses (the header is at the start), but tensors near the
+        // end would point past the file and fault on first use. Check every tensor fits.
+        let file_len = raw_bytes.len() as u64;
+        let mut needed = 0u64;
+        for t in &idx.tensors {
+            let rows: u64 = t.dims.iter().skip(1).product();
+            if let Some(rb) = row_bytes(t.dtype, t.dims[0] as usize) {
+                needed = needed.max(t.abs_file_offset + rb as u64 * rows);
+            }
+        }
+        if needed > file_len {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                format!(
+                    "the file is incomplete: it is {} MiB but its tensors need {} MiB. The download was probably cut off; download it again.",
+                    file_len >> 20,
+                    needed >> 20
+                ),
+            ));
+        }
         // `SPINDLE_FORCE_STREAM=1` treats any model as too big for RAM, to test that path.
         let force_stream = std::env::var("SPINDLE_FORCE_STREAM").is_ok_and(|v| v == "1");
         let prefetched = !force_stream && raw_bytes.prefetch_if_fits();
