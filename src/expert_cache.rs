@@ -170,7 +170,10 @@ impl ExpertCache {
     /// 1. Finds distinct victim slots that don't collide with any of `experts`.
     /// 2. Reads missing expert slabs directly from NVMe into the slots.
     /// 3. Updates cache mappings.
-    pub fn ensure_experts(&mut self, layer: usize, experts: &[usize]) -> std::io::Result<()> {
+    ///
+    /// Returns `(lookup_us, disk_us)`.
+    pub fn ensure_experts(&mut self, layer: usize, experts: &[usize]) -> std::io::Result<(u64, u64)> {
+        let t_start = std::time::Instant::now();
         self.tick += 1;
         let now = self.tick;
 
@@ -187,7 +190,8 @@ impl ExpertCache {
         }
 
         if misses.is_empty() {
-            return Ok(());
+            let lookup_us = t_start.elapsed().as_micros() as u64;
+            return Ok((lookup_us, 0));
         }
 
         // Choose victim slots for each miss without evicting any of the currently active experts
@@ -205,11 +209,14 @@ impl ExpertCache {
             }
         }
 
+        let mut disk_us = 0u64;
         // Read missing experts directly into their designated slots
         for &(e, slot_idx) in &to_fetch {
             self.misses += 1;
             let off = self.pack_idx.offset(layer, e);
+            let t_read = std::time::Instant::now();
             read_exact_at(&self.pack_file, self.slots[slot_idx].buf.as_mut_slice(), off)?;
+            disk_us += t_read.elapsed().as_micros() as u64;
             self.bytes_read += self.slot_bytes as u64;
 
             let slot = &mut self.slots[slot_idx];
@@ -221,7 +228,9 @@ impl ExpertCache {
             self.map.insert((layer, e), slot_idx);
         }
 
-        Ok(())
+        let total_us = t_start.elapsed().as_micros() as u64;
+        let lookup_us = total_us.saturating_sub(disk_us);
+        Ok((lookup_us, disk_us))
     }
 
     /// Fetches the base pointer of packed expert `(layer, expert)`.
@@ -293,7 +302,8 @@ impl ExpertCache {
 
     /// Prefetches missing experts for `layer` in a batch.
     pub fn prefetch_batch(&mut self, layer: usize, experts: &[usize]) -> std::io::Result<()> {
-        self.ensure_experts(layer, experts)
+        self.ensure_experts(layer, experts)?;
+        Ok(())
     }
 }
 

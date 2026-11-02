@@ -98,9 +98,24 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
             parts.push(format!("{} MiB free", g.status.available.load(ord) >> 20));
         }
     }
-    if let Some((mib, touched, total)) = engine.take_moe_stats() {
+    if let Some((mib, touched, total, timing)) = engine.take_moe_stats() {
         if detailed {
             parts.push(format!("{mib:.0} MiB experts/token, {touched}/{total} experts used"));
+            let total_us = timing.router_us + timing.cache_lookup_us + timing.disk_read_us + timing.expert_matvec_us;
+            if total_us > 0 {
+                let r_ms = timing.router_us as f64 / 1000.0;
+                let l_ms = timing.cache_lookup_us as f64 / 1000.0;
+                let d_ms = timing.disk_read_us as f64 / 1000.0;
+                let m_ms = timing.expert_matvec_us as f64 / 1000.0;
+                let t_ms = total_us as f64 / 1000.0;
+                parts.push(format!(
+                    "moe: router {:.1}ms ({:.0}%), lookup {:.1}ms ({:.0}%), disk {:.1}ms ({:.0}%), matvec {:.1}ms ({:.0}%)",
+                    r_ms, r_ms / t_ms * 100.0,
+                    l_ms, l_ms / t_ms * 100.0,
+                    d_ms, d_ms / t_ms * 100.0,
+                    m_ms, m_ms / t_ms * 100.0,
+                ));
+            }
         }
     }
     if let Some(c) = engine.expert_cache.as_ref() {

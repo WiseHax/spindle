@@ -353,6 +353,15 @@ unsafe fn ffn_forward(pool: Option<&WorkerPool>, base: *const u8, f: &Ffn, x: &[
     matvec(pool, base, &f.down, &g, out);
 }
 
+/// Detailed timing breakdown of MoE operations for a turn.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct MoeTiming {
+    pub router_us: u64,
+    pub cache_lookup_us: u64,
+    pub disk_read_us: u64,
+    pub expert_matvec_us: u64,
+}
+
 /// Running counters for the expert traffic of the current chat turn.
 #[derive(Default)]
 pub struct MoeStats {
@@ -360,6 +369,7 @@ pub struct MoeStats {
     pub expert_bytes: usize,
     /// One flag per `(layer, expert)`: was it used this turn?
     pub touched: Vec<bool>,
+    pub timing: MoeTiming,
 }
 
 /// Mixture-of-experts FFN: softmax router, top-`n_used` experts weighted by their router
@@ -374,6 +384,7 @@ unsafe fn moe_forward(
     prefetch: Option<&Prefetcher>,
     mut cache: Option<&mut crate::expert_cache::ExpertCache>,
 ) {
+    let t_router = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
     let mut probs = vec![0.0f32; m.n_expert];
     matvec(pool, base, &m.router, x, &mut probs);
     let max = probs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -385,6 +396,7 @@ unsafe fn moe_forward(
     chosen.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
     chosen.truncate(m.n_used);
     let wsum: f32 = chosen.iter().map(|&e| probs[e]).sum();
+    let router_us = t_router.map_or(0, |t| t.elapsed().as_micros() as u64);
 
     // Start reading every chosen expert now, so experts 2..k load while expert 1 computes.
     // Not needed when the expert cache serves them: that would read each expert twice.
@@ -393,10 +405,13 @@ unsafe fn moe_forward(
     }
 
     let layer = stats.as_ref().map(|s| s.1).unwrap_or(0);
-    if let Some(c) = cache.as_mut() {
-        let _ = c.ensure_experts(layer, &chosen);
-    }
+    let (lookup_us, disk_us) = if let Some(c) = cache.as_mut() {
+        c.ensure_experts(layer, &chosen).unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
 
+    let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
     out.fill(0.0);
     let mut tmp = vec![0.0f32; out.len()];
     let mut stats = stats;
@@ -438,6 +453,14 @@ unsafe fn moe_forward(
         for i in 0..out.len() {
             out[i] += g * tmp[i];
         }
+    }
+    let matvec_us = t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64);
+
+    if let Some((s, _)) = stats.as_mut() {
+        s.timing.router_us += router_us;
+        s.timing.cache_lookup_us += lookup_us;
+        s.timing.disk_read_us += disk_us;
+        s.timing.expert_matvec_us += matvec_us;
     }
 }
 
@@ -982,9 +1005,9 @@ impl SmolLm2Engine {
         self.cfg.n_expert > 0
     }
 
-    /// `(MiB of expert weights read per token, experts touched, total experts)` for the
+    /// `(MiB of expert weights read per token, experts touched, total experts, timing)` for the
     /// turn so far, then resets the counters.
-    pub fn take_moe_stats(&mut self) -> Option<(f64, usize, usize)> {
+    pub fn take_moe_stats(&mut self) -> Option<(f64, usize, usize, MoeTiming)> {
         if !self.is_moe() {
             return None;
         }
@@ -992,10 +1015,12 @@ impl SmolLm2Engine {
         let per_tok = s.expert_bytes as f64 / s.tokens.max(1) as f64 / (1024.0 * 1024.0);
         let touched = s.touched.iter().filter(|&&t| t).count();
         let total = s.touched.len();
+        let timing = s.timing;
         s.tokens = 0;
         s.expert_bytes = 0;
         s.touched.fill(false);
-        Some((per_tok, touched, total))
+        s.timing = MoeTiming::default();
+        Some((per_tok, touched, total, timing))
     }
 
     /// Repacks all MoE expert weights into a single contiguous 4096-aligned sidecar file
