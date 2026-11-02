@@ -62,6 +62,9 @@ produce correct text from a real file.
 
 Done when: a MoE model matches llama.cpp token for token on a fixed prompt.
 
+Status: Granite 3.1 1B-A400M (Q8_0) chats coherently, the first real MoE through the
+engine. 18 tok/s with `--reserve 256` and ~500 MB free; the llama.cpp comparison is next.
+
 ### Phase 2: experts from disk (months 1-2)
 
 The first model that really doesn't fit. OLMoE-1B-7B at Q4 (~4 GB) is the practice target,

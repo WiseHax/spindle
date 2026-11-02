@@ -7,8 +7,8 @@ either crawl or take the whole machine down with them. spindle doesn't use llama
 or any ML framework. The GGUF parser, tokenizer, transformer, AVX2 kernels and thread pool
 are all in this repo.
 
-It's early. It runs SmolLM2 135M/360M and Qwen3-0.6B today. The mixture-of-experts code
-passes its unit tests but hasn't been run on a real MoE file yet. The goal is to run models bigger than RAM
+It's early. It runs SmolLM2 135M/360M, Qwen3-0.6B and Granite 3.1 1B-A400M (a
+mixture-of-experts model: 8 of 32 experts per token) today. The goal is to run models bigger than RAM
 by streaming weights from the NVMe drive, mostly MoE models. That part isn't done yet; see
 [docs/roadmap.md](docs/roadmap.md).
 
