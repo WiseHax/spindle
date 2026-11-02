@@ -96,6 +96,7 @@ Without `--chat`, spindle answers `--prompt` once and exits.
 |---|---|---|
 | `--prompt "..."` | | send a first message right away |
 | `--verbose`, `-v` | off | print load, memory and threading details |
+| `--raw "text"`, `-n 32` | | plain completion with no chat framing, for comparing with llama.cpp |
 | `--temp` | 0.6 | 0 means greedy |
 | `--top-k` | 40 | |
 | `--top-p` | 0.9 | |
@@ -113,6 +114,15 @@ For honest SSD numbers, run `--probe` against a file of 1 GB or more.
 
 `$env:SPINDLE_FORCE_STREAM = "1"` makes spindle treat any model as too big for RAM. Useful for
 testing the low-memory path with a small model.
+
+## Checking against llama.cpp
+
+`tools\golden.ps1` runs the same prompts through spindle and llama.cpp with greedy decoding and
+reports the first place they differ:
+
+```powershell
+.	ools\golden.ps1 -Model qwen3-0.6b-q8_0.gguf -Llama C:\llama\llama-completion.exe
+```
 
 ## Layout
 
