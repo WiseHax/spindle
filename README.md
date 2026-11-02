@@ -121,7 +121,7 @@ testing the low-memory path with a small model.
 reports the first place they differ:
 
 ```powershell
-.	ools\golden.ps1 -Model qwen3-0.6b-q8_0.gguf -Llama C:\llama\llama-completion.exe
+.\tools\golden.ps1 -Model qwen3-0.6b-q8_0.gguf -Llama C:\llama\llama-completion.exe
 ```
 
 ## Layout
