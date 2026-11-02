@@ -2,9 +2,10 @@
 //!
 //! Replaces mmap-demand paging for MoE expert layers with an explicit, bounded RAM cache.
 //! Sized to a target memory budget (e.g. 256 MiB–1 GiB), it holds `N` 4096-byte-aligned
-//! expert slots. Buffered sequential reads (`FILE_FLAG_SEQUENTIAL_SCAN`) fetch missing experts
-//! from the repacked `.spindle.pack` file, allowing misses to be served from the OS file cache.
-//! Unbuffered direct I/O remains opt-in via `SPINDLE_DIRECT_IO=1`.
+//! expert slots. Misses are read with buffered random-access I/O, either from the repacked
+//! `.spindle.pack` (one read per expert) or straight from the GGUF (gate, up and down as
+//! three reads), so misses can be served from the OS file cache. Unbuffered direct I/O
+//! remains opt-in via `SPINDLE_DIRECT_IO=1`, for packs only.
 
 use std::{
     alloc::{alloc, dealloc, Layout},
@@ -15,9 +16,62 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use windows::Win32::Storage::FileSystem::{
-    FILE_FLAG_NO_BUFFERING, FILE_FLAG_RANDOM_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN,
+use windows::Win32::{
+    Storage::FileSystem::{FILE_FLAG_NO_BUFFERING, FILE_FLAG_RANDOM_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN},
+    System::{
+        SystemInformation::{CpuSetInformation, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION},
+        Threading::{GetCurrentProcess, GetCurrentThread, SetThreadAffinityMask, SetThreadSelectedCpuSets},
+    },
 };
+
+/// Pins the current reader thread to the E-core group (EfficiencyClass < max) if the CPU is
+/// hybrid, so background `ReadFile` / kernel page-cache copies never preempt the 4 P-cores
+/// while they run AVX2 `ffn_forward` on already-cached experts.
+fn pin_current_thread_to_ecores() {
+    unsafe {
+        let mut needed = 0u32;
+        let _ = GetSystemCpuSetInformation(None, 0, &mut needed, GetCurrentProcess(), 0);
+        if needed == 0 {
+            return;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        if !GetSystemCpuSetInformation(
+            Some(buf.as_mut_ptr() as *mut SYSTEM_CPU_SET_INFORMATION),
+            needed,
+            &mut needed,
+            GetCurrentProcess(),
+            0,
+        )
+        .as_bool()
+        {
+            return;
+        }
+        let mut cpus = Vec::new();
+        let mut off = 0usize;
+        while off + std::mem::size_of::<SYSTEM_CPU_SET_INFORMATION>() <= needed as usize {
+            let info = &*(buf.as_ptr().add(off) as *const SYSTEM_CPU_SET_INFORMATION);
+            if info.Type == CpuSetInformation {
+                let s = &info.Anonymous.CpuSet;
+                cpus.push((s.Id, s.LogicalProcessorIndex, s.EfficiencyClass));
+            }
+            let step = info.Size as usize;
+            if step == 0 {
+                break;
+            }
+            off += step;
+        }
+        let max_eff = cpus.iter().map(|c| c.2).max().unwrap_or(0);
+        let e_cpus: Vec<_> = cpus.into_iter().filter(|c| c.2 < max_eff).collect();
+        if e_cpus.is_empty() {
+            return;
+        }
+        let ids: Vec<u32> = e_cpus.iter().map(|c| c.0).collect();
+        let mask: usize = e_cpus.iter().fold(0usize, |acc, c| acc | (1usize << (c.1 as usize)));
+        let thread = GetCurrentThread();
+        let _ = SetThreadSelectedCpuSets(thread, &ids);
+        let _ = SetThreadAffinityMask(thread, mask);
+    }
+}
 
 use crate::expert_pack::{PackIndex, PACK_ALIGN};
 
@@ -65,6 +119,7 @@ struct CacheSlot {
 }
 
 struct ReadTask {
+    miss_idx: usize,
     expert: usize,
     slot_idx: usize,
     offset: u64,
@@ -73,6 +128,7 @@ struct ReadTask {
 }
 
 struct WorkerJob {
+    miss_idx: usize,
     expert: usize,
     slot_idx: usize,
     offset: u64,
@@ -83,6 +139,8 @@ struct WorkerJob {
 struct ReaderWorkerState {
     jobs: Vec<WorkerJob>,
     remaining: usize,
+    expert_rem: Vec<usize>,
+    expert_failed: Vec<Option<std::io::Error>>,
     failed: Vec<(usize, std::io::Error)>,
     shutdown: bool,
 }
@@ -99,6 +157,8 @@ impl ReaderPool {
             Mutex::new(ReaderWorkerState {
                 jobs: Vec::new(),
                 remaining: 0,
+                expert_rem: Vec::new(),
+                expert_failed: Vec::new(),
                 failed: Vec::new(),
                 shutdown: false,
             }),
@@ -118,6 +178,7 @@ impl ReaderPool {
             let handle = thread::Builder::new()
                 .name(format!("expert-reader-{i}"))
                 .spawn(move || {
+                    pin_current_thread_to_ecores();
                     let (lock, cvar) = &*state;
                     loop {
                         let job = {
@@ -138,10 +199,20 @@ impl ReaderPool {
 
                         let mut s = lock.lock().unwrap();
                         if let Err(e) = res {
+                            if job.miss_idx < s.expert_failed.len() && s.expert_failed[job.miss_idx].is_none() {
+                                s.expert_failed[job.miss_idx] = Some(std::io::Error::new(e.kind(), e.to_string()));
+                            }
                             s.failed.push((job.expert, e));
                         }
                         s.remaining -= 1;
-                        if s.remaining == 0 {
+                        let mut wake = s.remaining == 0;
+                        if job.miss_idx < s.expert_rem.len() {
+                            s.expert_rem[job.miss_idx] -= 1;
+                            if s.expert_rem[job.miss_idx] == 0 {
+                                wake = true;
+                            }
+                        }
+                        if wake {
                             done_cvar.notify_one();
                         }
                     }
@@ -152,35 +223,65 @@ impl ReaderPool {
         Ok(Self { state, done_cvar, handles })
     }
 
-    pub fn read_batch(&self, tasks: &[ReadTask]) -> Vec<(usize, std::io::Error)> {
+    pub fn start_batch(&self, tasks: &[ReadTask], n_misses: usize) {
         if tasks.is_empty() {
-            return Vec::new();
+            return;
         }
-
         let (lock, cvar) = &*self.state;
-        {
-            let mut s = lock.lock().unwrap();
-            s.jobs = tasks
-                .iter()
-                .map(|t| WorkerJob {
-                    expert: t.expert,
-                    slot_idx: t.slot_idx,
-                    offset: t.offset,
-                    dst_ptr: t.dst_ptr,
-                    len: t.len,
-                })
-                .collect();
-            s.remaining = tasks.len();
-            s.failed.clear();
-            cvar.notify_all();
+        let mut s = lock.lock().unwrap();
+        s.expert_rem.clear();
+        s.expert_rem.resize(n_misses, 0);
+        s.expert_failed.clear();
+        s.expert_failed.resize_with(n_misses, || None);
+        for t in tasks {
+            if t.miss_idx < n_misses {
+                s.expert_rem[t.miss_idx] += 1;
+            }
         }
+        // Workers pop from the back of `s.jobs`, so reverse `tasks` so `miss_idx = 0` is
+        // popped and completed first for per-expert pipelined compute.
+        s.jobs = tasks
+            .iter()
+            .rev()
+            .map(|t| WorkerJob {
+                miss_idx: t.miss_idx,
+                expert: t.expert,
+                slot_idx: t.slot_idx,
+                offset: t.offset,
+                dst_ptr: t.dst_ptr,
+                len: t.len,
+            })
+            .collect();
+        s.remaining = tasks.len();
+        s.failed.clear();
+        cvar.notify_all();
+    }
 
+    pub fn wait_one(&self, miss_idx: usize) -> Option<std::io::Error> {
+        let (lock, _) = &*self.state;
+        let mut s = lock.lock().unwrap();
+        while miss_idx < s.expert_rem.len() && s.expert_rem[miss_idx] > 0 {
+            s = self.done_cvar.wait(s).unwrap();
+        }
+        s.expert_failed.get_mut(miss_idx).and_then(|e| e.take())
+    }
+
+    pub fn wait_batch(&self) -> Vec<(usize, std::io::Error)> {
+        let (lock, _) = &*self.state;
         let mut s = lock.lock().unwrap();
         while s.remaining > 0 {
             s = self.done_cvar.wait(s).unwrap();
         }
-
         std::mem::take(&mut s.failed)
+    }
+
+    pub fn read_batch(&self, tasks: &[ReadTask]) -> Vec<(usize, std::io::Error)> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+        let n_misses = tasks.iter().map(|t| t.miss_idx + 1).max().unwrap_or(0);
+        self.start_batch(tasks, n_misses);
+        self.wait_batch()
     }
 }
 
@@ -198,12 +299,23 @@ impl Drop for ReaderPool {
     }
 }
 
+/// Where one expert's bytes live in the source file: up to three `(file_offset, len)`
+/// segments, copied back to back into a slot. A pack has one segment per expert; a GGUF
+/// has three (gate, up, down), so the slot ends up with the same layout either way.
+pub type ExpertSegments = [(u64, usize); 3];
+
 pub struct ExpertCache {
     slots: Vec<CacheSlot>,
     /// `(layer, expert)` -> index in `slots`
     map: HashMap<(usize, usize), usize>,
     tick: u64,
-    pub pack_idx: PackIndex,
+    /// Persistent LFU sketch across evictions (`[layer * n_expert + expert]`), aged periodically
+    /// so cold one-off outliers don't evict proven hot experts (TinyLFU admission).
+    expert_freq: Vec<u32>,
+    /// `segments[layer * n_expert + expert]`
+    segments: Vec<ExpertSegments>,
+    pub n_layers: usize,
+    pub n_expert: usize,
     reader_pool: ReaderPool,
     pub slot_bytes: usize,
     pub hits: u64,
@@ -220,11 +332,51 @@ impl ExpertCache {
         drop(meta_file);
 
         let slot_bytes = pack_idx.hdr.expert_slot_bytes as usize;
-        let total_experts = (pack_idx.hdr.n_layers as usize) * (pack_idx.hdr.n_expert as usize);
+        let segments = pack_idx.offsets.iter().map(|&off| [(off, slot_bytes), (0, 0), (0, 0)]).collect();
+        // Pack slots are 4K aligned, so unbuffered I/O is allowed here.
+        Self::open_segments(
+            pack_path,
+            segments,
+            pack_idx.hdr.n_layers as usize,
+            pack_idx.hdr.n_expert as usize,
+            slot_bytes,
+            budget_bytes,
+            true,
+        )
+    }
+
+    /// Reads experts straight from the model file, no pack needed: each expert's gate, up
+    /// and down slices (`segments`, file offsets) are copied back to back into a slot.
+    /// GGUF tensor data is only 32-byte aligned, so this always uses buffered reads.
+    pub fn open_gguf(
+        model_path: &str,
+        segments: Vec<ExpertSegments>,
+        n_layers: usize,
+        n_expert: usize,
+        budget_bytes: usize,
+    ) -> std::io::Result<Self> {
+        let payload = segments.iter().map(|s| s.iter().map(|x| x.1).sum::<usize>()).max().unwrap_or(0);
+        let slot_bytes = (payload + PACK_ALIGN - 1) & !(PACK_ALIGN - 1);
+        Self::open_segments(model_path, segments, n_layers, n_expert, slot_bytes, budget_bytes, false)
+    }
+
+    fn open_segments(
+        path: &str,
+        segments: Vec<ExpertSegments>,
+        n_layers: usize,
+        n_expert: usize,
+        slot_bytes: usize,
+        budget_bytes: usize,
+        allow_direct: bool,
+    ) -> std::io::Result<Self> {
+        let total_experts = n_layers * n_expert;
+        if slot_bytes == 0 || segments.len() != total_experts {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "expert table doesn't match the model shape"));
+        }
         let wanted_slots = (budget_bytes / slot_bytes).min(total_experts);
-        // One layer's worth of slots is the minimum: every expert a token picks in a layer
-        // must be resident at the same time.
-        let min_slots = pack_idx.hdr.n_expert as usize;
+        // Enough slots to hold all active experts a layer picks (plus headroom); capped at
+        // 32 so 128-expert models (Qwen3-30B-A3B, 8 active) don't demand 128 slots minimum.
+        let min_slots = n_expert.min(32);
         if wanted_slots < min_slots {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
@@ -247,19 +399,22 @@ impl ExpertCache {
 
         // Buffered random-access I/O by default so misses can hit the OS file cache.
         // Unbuffered direct I/O remains opt-in via SPINDLE_DIRECT_IO=1.
-        let direct = std::env::var("SPINDLE_DIRECT_IO").map_or(false, |v| v == "1");
+        let direct = allow_direct && std::env::var("SPINDLE_DIRECT_IO").map_or(false, |v| v == "1");
         let flags = if direct {
             (FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN).0
         } else {
             FILE_FLAG_RANDOM_ACCESS.0
         };
-        let reader_pool = ReaderPool::new(pack_path, flags, 8)?;
+        let reader_pool = ReaderPool::new(path, flags, 8)?;
 
         Ok(Self {
             slots,
             map: HashMap::with_capacity(wanted_slots),
             tick: 0,
-            pack_idx,
+            expert_freq: vec![0; total_experts],
+            segments,
+            n_layers,
+            n_expert,
             reader_pool,
             slot_bytes,
             hits: 0,
@@ -291,26 +446,40 @@ impl ExpertCache {
         self.map.get(&(layer, expert)).map(|&idx| self.slots[idx].buf.as_ptr())
     }
 
-    /// Ensures that all `experts` for `layer` are resident in cache.
+    /// Starts fetching any missing experts for `layer` in the background on the E-core
+    /// reader pool, while marking already-resident (hit) experts so they are ready for
+    /// immediate compute on the P-cores. Call `finish_layer` after computing the hits.
     ///
-    /// For any misses:
-    /// 1. Finds distinct victim slots that don't collide with any of `experts`.
-    /// 2. Reads missing expert slabs directly from NVMe into the slots.
-    /// 3. Updates cache mappings.
-    ///
-    /// Returns `(lookup_us, disk_us)`.
-    pub fn ensure_experts(&mut self, layer: usize, experts: &[usize]) -> std::io::Result<(u64, u64)> {
+    /// Returns `(lookup_us, pending_misses)` where each entry in `pending_misses` is `(expert, slot_idx)`.
+    pub fn begin_layer(&mut self, layer: usize, experts: &[usize]) -> (u64, Vec<(usize, usize)>) {
         let t_start = std::time::Instant::now();
         self.tick += 1;
         let now = self.tick;
 
+        // Windowed aging (W-TinyLFU): halve historical frequencies every 32 tokens so topic
+        // shifts can replace stale experts while cold 1-off outliers still get filtered.
+        let window = (self.n_layers.max(1) as u64) * 32;
+        if now % window == 0 {
+            for f in &mut self.expert_freq {
+                *f = (*f + 1) >> 1;
+            }
+            for s in &mut self.slots {
+                if s.layer != usize::MAX {
+                    s.freq = (s.freq + 1) >> 1;
+                }
+            }
+        }
+
         let mut misses = Vec::with_capacity(experts.len());
         for &e in experts {
+            let f_idx = layer * self.n_expert + e;
+            self.expert_freq[f_idx] = self.expert_freq[f_idx].saturating_add(1);
+            let freq = self.expert_freq[f_idx];
             if let Some(&slot_idx) = self.map.get(&(layer, e)) {
                 self.hits += 1;
                 let slot = &mut self.slots[slot_idx];
                 slot.last_used = now;
-                slot.freq = slot.freq.saturating_add(1);
+                slot.freq = freq;
             } else {
                 misses.push(e);
             }
@@ -318,44 +487,101 @@ impl ExpertCache {
 
         if misses.is_empty() {
             let lookup_us = t_start.elapsed().as_micros() as u64;
-            return Ok((lookup_us, 0));
+            return (lookup_us, Vec::new());
         }
 
-        // Choose victim slots for each miss without evicting any of the currently active experts
+        // Choose victim slots for each miss without evicting any of the currently active
+        // experts. W-TinyLFU admission: if the coldest victim was used recently (within 8
+        // tokens) and has a strictly higher frequency than the candidate, keep the hot
+        // victim in its slot and serve the cold outlier from the mapped file this token.
+        let n_layers_u64 = self.n_layers.max(1) as u64;
         let mut to_fetch = Vec::with_capacity(misses.len());
         let mut reserved_slots = Vec::with_capacity(misses.len());
 
         for &e in &misses {
+            let cand_freq = self.expert_freq[layer * self.n_expert + e];
             let victim_idx = self.choose_victim(layer, now, experts, &reserved_slots);
+            let victim = &self.slots[victim_idx];
+            let victim_token_age = now.saturating_sub(victim.last_used) / n_layers_u64 + 1;
+            if victim.layer != usize::MAX && cand_freq < victim.freq && victim_token_age <= 8 {
+                self.misses += 1;
+                continue;
+            }
             reserved_slots.push(victim_idx);
             to_fetch.push((e, victim_idx));
 
-            let victim = &self.slots[victim_idx];
             if victim.layer != usize::MAX {
                 self.map.remove(&(victim.layer, victim.expert));
             }
         }
 
-        let mut tasks = Vec::with_capacity(to_fetch.len());
-        for &(e, slot_idx) in &to_fetch {
-            let off = self.pack_idx.offset(layer, e);
-            let ptr = self.slots[slot_idx].buf.as_mut_slice().as_mut_ptr() as usize;
-            tasks.push(ReadTask {
-                expert: e,
-                slot_idx,
-                offset: off,
-                dst_ptr: ptr,
-                len: self.slot_bytes,
-            });
+        if to_fetch.is_empty() {
+            let lookup_us = t_start.elapsed().as_micros() as u64;
+            return (lookup_us, Vec::new());
         }
 
+        let mut tasks = Vec::with_capacity(to_fetch.len() * 3);
+        for (miss_idx, &(e, slot_idx)) in to_fetch.iter().enumerate() {
+            let segs = self.segments[layer * self.n_expert + e];
+            let base = self.slots[slot_idx].buf.as_mut_slice().as_mut_ptr() as usize;
+            let mut at = 0usize;
+            for &(off, len) in segs.iter().filter(|s| s.1 > 0) {
+                tasks.push(ReadTask { miss_idx, expert: e, slot_idx, offset: off, dst_ptr: base + at, len });
+                at += len;
+            }
+        }
+
+        self.reader_pool.start_batch(&tasks, to_fetch.len());
+        let lookup_us = t_start.elapsed().as_micros() as u64;
+        (lookup_us, to_fetch)
+    }
+
+    /// Waits for `to_fetch[miss_idx]` to finish reading and installs it into the cache map
+    /// immediately, so the P-cores can compute `to_fetch[miss_idx]` while `to_fetch[miss_idx+1..]`
+    /// continue reading on the E-cores. Returns the microseconds spent waiting.
+    pub fn wait_one_miss(&mut self, layer: usize, to_fetch: &[(usize, usize)], miss_idx: usize) -> u64 {
+        let now = self.tick;
         let t_read = std::time::Instant::now();
-        let failed = self.reader_pool.read_batch(&tasks);
+        let failed = self.reader_pool.wait_one(miss_idx);
+        let disk_us = t_read.elapsed().as_micros() as u64;
+
+        let (e, slot_idx) = to_fetch[miss_idx];
+        self.misses += 1;
+        if let Some(err) = failed {
+            crate::vlog!("[expert:cache] read failed for layer {layer} expert {e}: {err}; falling back to mmap");
+            let slot = &mut self.slots[slot_idx];
+            slot.layer = usize::MAX;
+            slot.expert = usize::MAX;
+            return disk_us;
+        }
+
+        self.bytes_read += self.segments[layer * self.n_expert + e].iter().map(|s| s.1 as u64).sum::<u64>();
+        let freq = self.expert_freq[layer * self.n_expert + e].max(1);
+        let slot = &mut self.slots[slot_idx];
+        slot.layer = layer;
+        slot.expert = e;
+        slot.last_used = now;
+        slot.freq = freq;
+
+        self.map.insert((layer, e), slot_idx);
+        disk_us
+    }
+
+    /// Waits for the in-flight reads started by `begin_layer` to complete and installs the
+    /// newly fetched experts into the cache map. Returns `disk_wait_us` (the time spent
+    /// waiting after hit-expert compute finished).
+    pub fn finish_layer(&mut self, layer: usize, to_fetch: &[(usize, usize)]) -> u64 {
+        if to_fetch.is_empty() {
+            return 0;
+        }
+        let now = self.tick;
+        let t_read = std::time::Instant::now();
+        let failed = self.reader_pool.wait_batch();
         let disk_us = t_read.elapsed().as_micros() as u64;
 
         let failed_map: HashMap<usize, std::io::Error> = failed.into_iter().collect();
 
-        for &(e, slot_idx) in &to_fetch {
+        for &(e, slot_idx) in to_fetch {
             self.misses += 1;
             if let Some(err) = failed_map.get(&e) {
                 crate::vlog!("[expert:cache] read failed for layer {layer} expert {e}: {err}; falling back to mmap");
@@ -365,18 +591,25 @@ impl ExpertCache {
                 continue;
             }
 
-            self.bytes_read += self.slot_bytes as u64;
+            self.bytes_read += self.segments[layer * self.n_expert + e].iter().map(|s| s.1 as u64).sum::<u64>();
+            let freq = self.expert_freq[layer * self.n_expert + e].max(1);
             let slot = &mut self.slots[slot_idx];
             slot.layer = layer;
             slot.expert = e;
             slot.last_used = now;
-            slot.freq = 1;
+            slot.freq = freq;
 
             self.map.insert((layer, e), slot_idx);
         }
 
-        let total_us = t_start.elapsed().as_micros() as u64;
-        let lookup_us = total_us.saturating_sub(disk_us);
+        disk_us
+    }
+
+    /// Ensures that all `experts` for `layer` are resident in cache.
+    /// Returns `(lookup_us, disk_us)`.
+    pub fn ensure_experts(&mut self, layer: usize, experts: &[usize]) -> std::io::Result<(u64, u64)> {
+        let (lookup_us, to_fetch) = self.begin_layer(layer, experts);
+        let disk_us = self.finish_layer(layer, &to_fetch);
         Ok((lookup_us, disk_us))
     }
 
@@ -398,7 +631,11 @@ impl ExpertCache {
 
         // 2. Fair-share per layer: in cyclic transformer scans, Layer 23 should never
         // evict Layer 0's hot repeat experts.
-        let n_layers = (self.pack_idx.hdr.n_layers as usize).max(1);
+        // Measure age in tokens (passes over all layers), not raw layer ticks: otherwise an
+        // expert that skipped 1 token looks 24-48x older than a cold 1-off loaded this layer,
+        // and Layer 0 looks 24-48x older than Layer N-1 within the very same token.
+        let n_layers = self.n_layers.max(1);
+        let token_age = |last: u64| ((now.saturating_sub(last)) / (n_layers as u64) + 1) as f64;
         let fair_share = (self.slots.len() / n_layers).max(1);
         let this_layer_count = self.slots.iter().filter(|s| s.layer == layer).count();
 
@@ -411,7 +648,7 @@ impl ExpertCache {
                     && !pinned_experts.contains(&slot.expert)
                     && !reserved_slots.contains(&i)
                 {
-                    let age = (now.saturating_sub(slot.last_used) + 1) as f64;
+                    let age = token_age(slot.last_used);
                     let freq = (slot.freq as f64).powi(2);
                     let score = freq / age;
                     if score < lowest_score {
@@ -436,7 +673,7 @@ impl ExpertCache {
             if slot.layer == layer && pinned_experts.contains(&slot.expert) {
                 continue;
             }
-            let age = (now.saturating_sub(slot.last_used) + 1) as f64;
+            let age = token_age(slot.last_used);
             let freq = (slot.freq as f64).powi(2);
             let score = freq / age;
             if score < best_score {
@@ -614,6 +851,43 @@ mod tests {
 
         drop(cache);
         let _ = std::fs::remove_file(temp_pack);
+    }
+
+    /// GGUF-direct mode: gate, up and down live in three separate tensors (far apart in
+    /// the file) and their sizes differ per layer. Each slot must hold gate|up|down back
+    /// to back, byte for byte.
+    #[test]
+    fn gguf_direct_reads_scattered_segments() {
+        let (n_layers, n_expert) = (2usize, 4usize);
+        let file_bytes: Vec<u8> = (0..256 * 1024).map(|i| ((i * 31 + i / 997) % 253) as u8).collect();
+        let path = std::env::temp_dir().join("test_gguf_direct.bin");
+        std::fs::write(&path, &file_bytes).unwrap();
+
+        // Tensor regions: gate at 0x1000.., up at 0x10000.., down at 0x20000.., per layer.
+        let lens = |l: usize| (300 + l * 17, 300 + l * 17, 700 + l * 2000);
+        let mut segs = Vec::new();
+        for l in 0..n_layers {
+            let (g, u, d) = lens(l);
+            for e in 0..n_expert {
+                let k = (l * n_expert + e) as u64;
+                segs.push([(0x1000 + k * g as u64 + 3, g), (0x10000 + k * u as u64 + 5, u), (0x20000 + k * d as u64 + 7, d)]);
+            }
+        }
+        let mut cache = ExpertCache::open_gguf(path.to_str().unwrap(), segs.clone(), n_layers, n_expert, 64 * 4096).unwrap();
+        let all: Vec<usize> = (0..n_expert).collect();
+        for l in 0..n_layers {
+            cache.ensure_experts(l, &all).unwrap();
+            for e in 0..n_expert {
+                let s = segs[l * n_expert + e];
+                let expected: Vec<u8> = s.iter().flat_map(|&(o, n)| file_bytes[o as usize..o as usize + n].iter().copied()).collect();
+                let ptr = cache.get_expert_ptr(l, e).expect("resident");
+                let got = unsafe { std::slice::from_raw_parts(ptr, expected.len()) };
+                assert_eq!(got, &expected[..], "layer {l} expert {e}");
+            }
+        }
+        assert_eq!(cache.misses, 8);
+        drop(cache);
+        let _ = std::fs::remove_file(path);
     }
 }
 
