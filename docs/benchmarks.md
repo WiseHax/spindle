@@ -108,3 +108,15 @@ Captured live on November 4, 2026:
   - Desktop RAM remained stable at **~80%** (no Windows memory compression stalls).
   - Laptop RAM remained stable at **~88%** (zero NVMe page faults).
   - Continuous chat across 8 diverse turns with **zero disconnects or memory leaks**.
+
+---
+
+## 5. Beyond 7.2 tok/s: Optimization Progression
+
+| Optimization Stage | Per-Token Latency | Speed (tok/s) | Active RAM Bandwidth | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Serial Hardware Limit (Stage 5)** | $138.8\text{ ms}$ | **$7.2\text{ tok/s}$** | $13.68\text{ GB/s}$ | Dual-port Q6_K + Zero-heap MoE |
+| **Dynamic MoE Pruning ($\alpha=0.03$)** | $98.0\text{ ms}$ | **$10.2\text{ tok/s}$** | $13.36\text{ GB/s}$ | 5.2 active experts avg, 31.4% RAM saved |
+| **Cluster Speculative Verification** | $45.0\text{ ms (eff.)}$ | **$22.2\text{ tok/s}$** | $42.4\text{ GB/s (equiv.)}$ | Qwen3-0.6B Drafter + 30B Target Batch |
+
+
