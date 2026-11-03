@@ -102,3 +102,4 @@ In multi-threaded CPU inference, calling `malloc` and `free` concurrently across
    - Pre-allocated `moe_tmp: Vec<f32>` passed into `moe_forward`.
    - Eliminates over **140,000 heap allocations** per generation sequence.
    - All router probabilities and indices stay hot in **L1 Data Cache**.
+
