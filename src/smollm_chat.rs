@@ -2593,6 +2593,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_qwen3_0_6b_draft_load_and_generate() {
+        let path = "qwen3-0.6b-q8_0.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut eng = SmolLm2Engine::load(path).expect("load qwen3-0.6b-q8_0.gguf");
+        unsafe {
+            let (reply, secs, toks) = eng.generate_reply("Hi", 8, false, &mut |_| {});
+            println!("[qwen3-0.6b] {toks} tokens in {secs:.3}s => {:.1} tok/s | reply: {reply:?}", toks as f64 / secs);
+        }
+    }
+
+    #[test]
+    fn test_speculative_decoding_smollm2() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut target = SmolLm2Engine::load(path).expect("load target");
+        let draft = SmolLm2Engine::load(path).expect("load draft");
+        target.enable_draft(draft);
+        unsafe {
+            let (reply, secs, toks) = target.generate_reply("Hi", 16, false, &mut |_| {});
+            println!("[speculative:test] {toks} tokens in {secs:.3}s | stats: {:?} | reply: {reply:?}", target.spec_stats);
+            assert!(target.spec_stats.0 > 0, "Expected accepted draft tokens");
+        }
+    }
+
     /// Non-ASCII text must survive encode -> decode (it used to be dropped silently).
     #[test]
     fn non_ascii_round_trips_through_tokenizer() {
