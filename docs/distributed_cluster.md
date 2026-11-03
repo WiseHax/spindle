@@ -122,3 +122,4 @@ Intermediate transformer activations are high-dimensional float vectors ($D = 40
    - `recv_frame_into` reuses pre-allocated heap buffers (`scratch_payload`) across all tokens. Zero `malloc`/`free` calls during generation.
 3. **Graceful Worker Reconnect & Re-binding**:
    - Worker automatically resets cleanly on client exit without hanging or leaking port 42424.
+
