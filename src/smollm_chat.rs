@@ -2772,6 +2772,64 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_moe_pruning() {
+        let (dim, ff, n_exp, k) = (16usize, 16usize, 8usize, 4usize);
+        let mut buf: Vec<f32> = Vec::new();
+        let mut seed = 42u64;
+        let mut push = |n: usize, buf: &mut Vec<f32>| -> usize {
+            let off = buf.len() * 4;
+            for _ in 0..n {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                buf.push(((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5);
+            }
+            off
+        };
+        let mat = |offset: usize, cols: usize, rows: usize| Mat { dtype: GgmlType::F32, offset, cols, rows };
+        let router = mat(push(dim * n_exp, &mut buf), dim, n_exp);
+        let gate = mat(push(dim * ff * n_exp, &mut buf), dim, ff);
+        let up = mat(push(dim * ff * n_exp, &mut buf), dim, ff);
+        let down = mat(push(ff * dim * n_exp, &mut buf), ff, dim);
+        let x: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.5).sin()).collect();
+        let base = buf.as_ptr() as *const u8;
+
+        let moe_full = Moe {
+            router,
+            experts: Ffn { gate, up, down },
+            n_expert: n_exp,
+            n_used: k,
+            norm: true,
+            shared: None,
+            shared_gate: None,
+            moe_prune: 0.0,
+        };
+        let moe_pruned = Moe {
+            router,
+            experts: Ffn { gate, up, down },
+            n_expert: n_exp,
+            n_used: k,
+            norm: true,
+            shared: None,
+            shared_gate: None,
+            moe_prune: 0.10,
+        };
+
+        let mut out_full = vec![0.0f32; dim];
+        let mut out_pruned = vec![0.0f32; dim];
+        let mut tmp = vec![0.0f32; dim];
+
+        unsafe {
+            moe_forward(None, base, &moe_full, &x, &mut out_full, None, None, None, &mut tmp);
+            moe_forward(None, base, &moe_pruned, &x, &mut out_pruned, None, None, None, &mut tmp);
+        }
+
+        assert!(out_full.iter().all(|v| v.is_finite()));
+        assert!(out_pruned.iter().all(|v| v.is_finite()));
+        println!("[test:moe_prune] Out full: {:.4?}, Out pruned: {:.4?}", &out_full[..4], &out_pruned[..4]);
+    }
+
+    #[test]
     fn test_layer_sharding_matches_full_model() {
         let path = "smollm2-135m-q4_k_m.gguf";
         if !std::path::Path::new(path).exists() {
