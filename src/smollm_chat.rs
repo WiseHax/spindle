@@ -178,7 +178,7 @@ struct Layer {
     ffn: FfnKind,
 }
 
-fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig) -> std::io::Result<Vec<Layer>> {
+fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig, layer_range: std::ops::Range<usize>) -> std::io::Result<Vec<Layer>> {
     let find = |name: &str| idx.tensor_by_name.get(name).map(|&i| &idx.tensors[i]);
     let mat = |name: &str| find(name).map(Mat::of).ok_or_else(|| invalid(format!("missing tensor {name}")));
     // Norms and biases are small F32 vectors used in place.
@@ -191,7 +191,7 @@ fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig) -> std::io::Result<Vec<
     };
     let need = |name: &str| vec_f32(name)?.ok_or_else(|| invalid(format!("missing tensor {name}")));
 
-    (0..c.n_layers)
+    layer_range
         .map(|l| {
             let n = |s: &str| format!("blk.{l}.{s}");
             let ffn = if find(&n("ffn_gate_inp.weight")).is_some() {
@@ -251,7 +251,8 @@ fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig) -> std::io::Result<Vec<
 // ---------------------------------------------------------------- math helpers
 
 /// Below this many weights a matvec runs on one thread (sync cost > math).
-const PAR_MIN_WEIGHTS: usize = 64 * 1024;
+/// With zero-syscall atomic spin workers, parallelizing down to 16K weights yields near-linear speedups.
+const PAR_MIN_WEIGHTS: usize = 16 * 1024;
 
 /// `out = W * x`, split by rows across `pool` (if any).
 unsafe fn matvec(pool: Option<&WorkerPool>, base: *const u8, m: &Mat, x: &[f32], out: &mut [f32]) {
@@ -390,7 +391,8 @@ unsafe fn moe_forward_batch(
         return;
     }
     if bsz == 1 {
-        moe_forward(pool, base, m, &xs[0], &mut outs[0], stats, prefetch, cache);
+        let mut tmp = vec![0.0f32; outs[0].len()];
+        moe_forward(pool, base, m, &xs[0], &mut outs[0], stats, prefetch, cache, &mut tmp);
         return;
     }
 
@@ -569,18 +571,37 @@ unsafe fn moe_forward(
     stats: Option<(&mut MoeStats, usize)>,
     prefetch: Option<&Prefetcher>,
     mut cache: Option<&mut crate::expert_cache::ExpertCache>,
+    tmp: &mut [f32],
 ) {
     let t_router = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
-    let mut probs = vec![0.0f32; m.n_expert];
-    matvec(pool, base, &m.router, x, &mut probs);
+    let mut stack_probs = [0.0f32; 256];
+    let mut heap_probs;
+    let probs: &mut [f32] = if m.n_expert <= 256 {
+        &mut stack_probs[..m.n_expert]
+    } else {
+        heap_probs = vec![0.0f32; m.n_expert];
+        &mut heap_probs
+    };
+
+    matvec(pool, base, &m.router, x, probs);
     let max = probs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     probs.iter_mut().for_each(|p| *p = (*p - max).exp());
     let sum: f32 = probs.iter().sum();
     probs.iter_mut().for_each(|p| *p /= sum);
 
-    let mut chosen: Vec<usize> = (0..m.n_expert).collect();
-    chosen.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
-    chosen.truncate(m.n_used);
+    let mut stack_chosen = [0usize; 256];
+    let mut heap_chosen;
+    let chosen_slice: &mut [usize] = if m.n_expert <= 256 {
+        for i in 0..m.n_expert {
+            stack_chosen[i] = i;
+        }
+        &mut stack_chosen[..m.n_expert]
+    } else {
+        heap_chosen = (0..m.n_expert).collect::<Vec<usize>>();
+        &mut heap_chosen
+    };
+    chosen_slice.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
+    let chosen = &chosen_slice[..m.n_used];
     let wsum: f32 = chosen.iter().map(|&e| probs[e]).sum();
     let router_us = t_router.map_or(0, |t| t.elapsed().as_micros() as u64);
 
@@ -592,7 +613,7 @@ unsafe fn moe_forward(
 
     let layer = stats.as_ref().map(|s| s.1).unwrap_or(0);
     let (lookup_us, pending_misses) = if let Some(c) = cache.as_mut() {
-        c.begin_layer(layer, &chosen)
+        c.begin_layer(layer, chosen)
     } else {
         (0, Vec::new())
     };
@@ -676,11 +697,10 @@ unsafe fn moe_forward(
         (disk_us, hit_us + miss_us)
     } else {
         let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
-        let mut tmp = vec![0.0f32; out.len()];
-        for &e in &chosen {
+        for &e in chosen {
             let w = if m.norm { probs[e] / wsum } else { probs[e] };
             let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
-            run_expert(e, c_ptr, &mut tmp);
+            run_expert(e, c_ptr, tmp);
             for i in 0..out.len() {
                 out[i] += w * tmp[i];
             }
@@ -694,8 +714,7 @@ unsafe fn moe_forward(
 
     let t_sh = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
     if let Some(sh) = &m.shared {
-        let mut tmp = vec![0.0f32; out.len()];
-        ffn_forward(pool, base, sh, x, &mut tmp);
+        ffn_forward(pool, base, sh, x, tmp);
         let g = match m.shared_gate {
             Some(off) => {
                 let w = f32_at(base, off, x.len());
@@ -834,6 +853,7 @@ pub struct SmolLm2Engine {
     /// The GGUF file, memory-mapped read-only (weights are used in place, never copied).
     pub raw_bytes: MappedFile,
     layers: Vec<Layer>,
+    pub layer_range: std::ops::Range<usize>,
     rope: Rope,
     embed: Mat,
     lm_head: Mat,
@@ -868,6 +888,8 @@ pub struct SmolLm2Engine {
     pub draft_engine: Option<Box<SmolLm2Engine>>,
     /// Speculative decoding stats `(accepted_draft_tokens, total_drafted_tokens, verify_batches)` for the turn.
     pub spec_stats: (usize, usize, usize),
+    /// Optional cluster network client for distributed inference across multiple machines.
+    pub cluster_client: Option<crate::cluster_net::ClusterClient>,
 }
 
 /// How a conversation is framed in tokens. Built once at load from the model's special
@@ -891,13 +913,37 @@ const GRANITE_SYSTEM_PROMPT: &str = "You are Granite, developed by IBM. You are 
 
 impl SmolLm2Engine {
     pub fn load(path: &str) -> std::io::Result<Self> {
-        Self::load_with_index(path, GgufModelIndex::parse_file(path)?)
+        let idx = GgufModelIndex::parse_file(path)?;
+        let c = ModelConfig::from_gguf(&idx)?;
+        Self::load_with_index_sharded(path, idx, 0..c.n_layers)
     }
 
     /// Like `load`, reusing an already-parsed index (the vocab + merge tables are large).
     pub fn load_with_index(path: &str, idx: GgufModelIndex) -> std::io::Result<Self> {
         let c = ModelConfig::from_gguf(&idx)?;
-        let layers = resolve_layers(&idx, &c)?;
+        Self::load_with_index_sharded(path, idx, 0..c.n_layers)
+    }
+
+    /// Loads only a slice of layers (`layer_range.start..layer_range.end`) for distributed pipeline parallelism.
+    pub fn load_sharded(path: &str, layer_range: std::ops::Range<usize>) -> std::io::Result<Self> {
+        Self::load_with_index_sharded(path, GgufModelIndex::parse_file(path)?, layer_range)
+    }
+
+    /// Loads a specific layer range reusing an already-parsed GGUF index.
+    pub fn load_with_index_sharded(
+        path: &str,
+        idx: GgufModelIndex,
+        layer_range: std::ops::Range<usize>,
+    ) -> std::io::Result<Self> {
+        let c = ModelConfig::from_gguf(&idx)?;
+        if layer_range.start >= layer_range.end || layer_range.end > c.n_layers {
+            return Err(invalid(format!(
+                "invalid layer range {:?}: model has {} layers",
+                layer_range, c.n_layers
+            )));
+        }
+        let n_local_layers = layer_range.len();
+        let layers = resolve_layers(&idx, &c, layer_range.clone())?;
         let tensor = |name: &str| idx.tensor_by_name.get(name).map(|&i| &idx.tensors[i]);
         let embed = Mat::of(tensor("token_embd.weight").ok_or_else(|| invalid("missing token_embd.weight".into()))?);
         let lm_head = tensor("output.weight").map(Mat::of).unwrap_or(embed);
@@ -951,11 +997,32 @@ impl SmolLm2Engine {
         }
         // `SPINDLE_FORCE_STREAM=1` treats any model as too big for RAM, to test that path.
         let force_stream = std::env::var("SPINDLE_FORCE_STREAM").is_ok_and(|v| v == "1");
-        let prefetched = !force_stream && raw_bytes.prefetch_if_fits();
+        let sharded_ratio = n_local_layers as f64 / c.n_layers as f64;
+        let sharded_needed = (file_len as f64 * sharded_ratio) as u64;
+        let avail_ram = crate::mmap_file::available_ram_bytes();
+        let fits_in_ram = sharded_needed <= avail_ram.saturating_sub(128 * 1024 * 1024);
+        let prefetched = if force_stream {
+            false
+        } else if fits_in_ram {
+            let mut ranges = Vec::new();
+            for ly in &layers {
+                let (start, len, _) = layer_extent(ly, &c);
+                ranges.push((start, len));
+            }
+            if layer_range.end == c.n_layers {
+                ranges.push((lm_head.offset, lm_head.rows * row_bytes(lm_head.dtype, lm_head.cols).unwrap_or(0)));
+                ranges.push((output_norm, c.dim * 4));
+            }
+            raw_bytes.prefetch_ranges(&ranges);
+            true
+        } else {
+            raw_bytes.prefetch_if_fits()
+        };
         crate::vlog!(
-            "[model:mmap] {:.1} MiB mapped ({})",
+            "[model:mmap] {:.1} MiB mapped (sharded {:.1} MiB: {})",
             raw_bytes.len() as f64 / (1024.0 * 1024.0),
-            if prefetched { "prefetching into page cache" } else { "paged on demand: larger than half of free RAM" }
+            sharded_needed as f64 / (1024.0 * 1024.0),
+            if prefetched { "prefetching into page cache" } else { "paged on demand: larger than available RAM" }
         );
 
         // Preflight: the KV-cache is the one big private allocation. Size it to what's free
@@ -966,17 +1033,17 @@ impl SmolLm2Engine {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2048)
             .clamp(64, c.ctx_len);
-        let per_pos = 2 * c.n_layers * c.kv_dim * 2;
+        let per_pos = 2 * n_local_layers * c.kv_dim * 2;
         let scratch = c.vocab * 8 + 64 * 1024 * 1024;
         let avail = crate::mmap_file::available_ram_bytes() as usize;
-        let max_seq = wanted.min((avail / 4).saturating_sub(scratch) / per_pos);
+        let max_seq = wanted.min((avail / 2).saturating_sub(scratch) / per_pos.max(1));
         if max_seq < 64 {
             return Err(Error::new(
                 ErrorKind::OutOfMemory,
                 format!(
                     "not enough free RAM for this model: {} MiB free, need about {} MiB. Close some apps and retry.",
                     avail >> 20,
-                    ((64 * per_pos + scratch) * 4) >> 20
+                    ((64 * per_pos + scratch) * 2) >> 20
                 ),
             ));
         }
@@ -990,13 +1057,15 @@ impl SmolLm2Engine {
             v.resize(n, 0);
             Ok(v)
         };
-        let k_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
-        let v_cache = alloc(c.n_layers * max_seq * c.kv_dim)?;
+        let k_cache = alloc(n_local_layers * max_seq * c.kv_dim)?;
+        let v_cache = alloc(n_local_layers * max_seq * c.kv_dim)?;
         crate::vlog!(
-            "[model:config] {} | dim={} layers={} heads={}/{} kv (head_dim {}) vocab={} rope_theta={}{} | KV-cache {max_seq} pos = {kv_mib:.1} MiB",
+            "[model:config] {} | dim={} layers={}/{} (range {:?}) heads={}/{} kv (head_dim {}) vocab={} rope_theta={}{} | KV-cache {max_seq} pos = {kv_mib:.1} MiB",
             idx.architecture,
             c.dim,
+            n_local_layers,
             c.n_layers,
+            layer_range,
             c.n_heads,
             c.n_kv_heads,
             c.head_dim,
@@ -1036,6 +1105,7 @@ impl SmolLm2Engine {
             idx,
             raw_bytes,
             layers,
+            layer_range,
             embed,
             lm_head,
             output_norm,
@@ -1058,6 +1128,7 @@ impl SmolLm2Engine {
             moe_stats: MoeStats { touched: vec![false; c.n_layers * c.n_expert], ..Default::default() },
             draft_engine: None,
             spec_stats: (0, 0, 0),
+            cluster_client: None,
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -1144,6 +1215,9 @@ impl SmolLm2Engine {
 
     /// Forgets the whole conversation (system prompt is re-fed on the next turn).
     pub fn reset_kv(&mut self) {
+        if let Some(client) = self.cluster_client.as_mut() {
+            let _ = client.reset_kv();
+        }
         self.cur_pos = 0;
         self.n_keep = 0;
         if let Some(draft) = self.draft_engine.as_mut() {
@@ -1387,7 +1461,7 @@ impl SmolLm2Engine {
         let n_move = n_ctx - n_discard;
 
         let mut k_tmp = vec![0.0f32; c.kv_dim];
-        for l in 0..c.n_layers {
+        for l in 0..self.layers.len() {
             let layer = l * self.max_seq;
             for i in 0..n_move {
                 let src = (layer + self.n_keep + n_discard + i) * c.kv_dim;
@@ -1411,6 +1485,23 @@ impl SmolLm2Engine {
     /// the model's layers once per chunk instead of once per token.
     unsafe fn feed(&mut self, ids: &[usize]) -> Vec<f32> {
         let mut last_hidden = vec![0.0f32; self.cfg.dim];
+        let mut client = self.cluster_client.take();
+        if let Some(c) = client.as_mut() {
+            for chunk in ids.chunks(32) {
+                self.ensure_kv_room(chunk.len());
+                let worker_hiddens = c
+                    .prefill(chunk, self.cur_pos)
+                    .expect("cluster prefill failed");
+                let mut hiddens =
+                    self.forward_batch_slice(None, Some(&worker_hiddens), self.cur_pos);
+                self.cur_pos += chunk.len();
+                if let Some(h) = hiddens.pop() {
+                    last_hidden = h;
+                }
+            }
+            self.cluster_client = client;
+            return last_hidden;
+        }
         for chunk in ids.chunks(32) {
             self.ensure_kv_room(chunk.len());
             if chunk.len() == 1 {
@@ -1427,34 +1518,67 @@ impl SmolLm2Engine {
         last_hidden
     }
 
+    /// Evaluates one token at `pos`, coordinating with the cluster worker if connected.
+    #[inline]
+    pub unsafe fn step_token(&mut self, token_id: usize, pos: usize) -> Vec<f32> {
+        if self.cluster_client.is_some() {
+            let mut client = self.cluster_client.take().unwrap();
+            let worker_act = client.step(token_id, pos).expect("cluster worker step failed");
+            self.cluster_client = Some(client);
+            self.forward_slice(None, Some(&worker_act), pos)
+        } else {
+            self.forward_hidden(token_id, pos)
+        }
+    }
+
     /// Runs a batch of tokens `token_ids` starting at `start_pos` synchronously layer-by-layer
     /// (`l in 0..n_layers` on the outer loop, `b in 0..token_ids.len()` on the inner loop) and
-    /// returns the final-normed hidden state for each token in `token_ids`.
-    #[target_feature(enable = "avx2,fma,f16c")]
+    /// returns the hidden state for each token in `token_ids`.
+    #[inline]
     pub unsafe fn forward_batch(&mut self, token_ids: &[usize], start_pos: usize) -> Vec<Vec<f32>> {
-        let bsz = token_ids.len();
+        self.forward_batch_slice(Some(token_ids), None, start_pos)
+    }
+
+    /// Evaluates this engine's assigned layer partition (`self.layer_range`) for a batch of inputs.
+    /// - If `token_ids` is Some, loads initial embeddings (Stage 0).
+    /// - If `in_hiddens` is Some, uses the provided activation vectors from the upstream stage (Stage 1).
+    #[target_feature(enable = "avx2,fma,f16c")]
+    pub unsafe fn forward_batch_slice(
+        &mut self,
+        token_ids: Option<&[usize]>,
+        in_hiddens: Option<&[Vec<f32>]>,
+        start_pos: usize,
+    ) -> Vec<Vec<f32>> {
+        let bsz = token_ids.map_or_else(|| in_hiddens.map_or(0, |h| h.len()), |t| t.len());
         if bsz == 0 {
             return Vec::new();
         }
         if bsz == 1 {
-            return vec![self.forward_hidden(token_ids[0], start_pos)];
+            let tid = token_ids.map(|t| t[0]);
+            let in_h = in_hiddens.map(|h| h[0].as_slice());
+            return vec![self.forward_slice(tid, in_h, start_pos)];
         }
         let c = self.cfg;
         let base = self.raw_bytes.as_ptr();
         let pool = self.pool.as_ref();
 
-        let rb = row_bytes(self.embed.dtype, c.dim).expect("unsupported embedding type");
-        let mut xs: Vec<Vec<f32>> = token_ids
-            .iter()
-            .map(|&tid| {
-                let row = std::slice::from_raw_parts(base.add(self.embed.offset + tid * rb), rb);
-                let mut x = dequant_row(self.embed.dtype, row, c.dim);
-                if c.embedding_scale != 1.0 {
-                    x.iter_mut().for_each(|v| *v *= c.embedding_scale);
-                }
-                x
-            })
-            .collect();
+        let mut xs: Vec<Vec<f32>> = match (token_ids, in_hiddens) {
+            (Some(ids), _) => {
+                let rb = row_bytes(self.embed.dtype, c.dim).expect("unsupported embedding type");
+                ids.iter()
+                    .map(|&tid| {
+                        let row = std::slice::from_raw_parts(base.add(self.embed.offset + tid * rb), rb);
+                        let mut x = dequant_row(self.embed.dtype, row, c.dim);
+                        if c.embedding_scale != 1.0 {
+                            x.iter_mut().for_each(|v| *v *= c.embedding_scale);
+                        }
+                        x
+                    })
+                    .collect()
+            }
+            (None, Some(hiddens)) => hiddens.to_vec(),
+            (None, None) => return Vec::new(),
+        };
 
         let mut x_norms = vec![vec![0.0f32; c.dim]; bsz];
         let mut proj_outs = vec![vec![0.0f32; c.dim]; bsz];
@@ -1468,17 +1592,17 @@ impl SmolLm2Engine {
 
         let hint = self.prefetcher.as_ref();
         let first_streamed = self.streamer.as_ref().map_or(usize::MAX, |s| s.first);
-        for l in 0..c.n_layers {
-            let ly = self.layers[l];
+        for (local_l, &ly) in self.layers.iter().enumerate() {
+            let global_l = self.layer_range.start + local_l;
             let streamed = match self.streamer.as_mut() {
-                Some(st) if l >= st.first => Some(st.take(l).expect("reading a layer from the model file failed")),
+                Some(st) if global_l >= st.first => Some(st.take(global_l).expect("reading a layer from the model file failed")),
                 _ => None,
             };
             let lbase = match (&streamed, &self.layer_spans) {
-                (Some(buf), Some(spans)) => buf.as_ptr().wrapping_sub(spans[l].0),
+                (Some(buf), Some(spans)) => buf.as_ptr().wrapping_sub(spans[global_l].0),
                 _ => base,
             };
-            if let (Some(pf), Some(next)) = (hint.filter(|_| l + 1 < first_streamed), self.layers.get(l + 1)) {
+            if let (Some(pf), Some(next)) = (hint.filter(|_| global_l + 1 < first_streamed), self.layers.get(local_l + 1)) {
                 let mut r = vec![span(&next.wq), span(&next.wk), span(&next.wv), span(&next.wo)];
                 match &next.ffn {
                     FfnKind::Dense(f) => r.extend(f.spans()),
@@ -1508,24 +1632,36 @@ impl SmolLm2Engine {
                 self.rope.rotate(&mut q, c.head_dim, pos as f32);
                 self.rope.rotate(&mut k, c.head_dim, pos as f32);
 
-                let kv_off = (l * self.max_seq + pos) * c.kv_dim;
+                let kv_off = (local_l * self.max_seq + pos) * c.kv_dim;
                 f32_to_f16_slice(&k, &mut self.k_cache[kv_off..kv_off + c.kv_dim]);
                 f32_to_f16_slice(&v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
 
-                attn_out.fill(0.0);
-                for h in 0..c.n_heads {
-                    let kvh = h / (c.n_heads / c.n_kv_heads);
-                    let q_head = &q[h * c.head_dim..(h + 1) * c.head_dim];
-                    let out_head = &mut attn_out[h * c.head_dim..(h + 1) * c.head_dim];
+                let n_heads = c.n_heads;
+                let head_dim = c.head_dim;
+                let kv_dim = c.kv_dim;
+                let heads_per_kv = c.n_heads / c.n_kv_heads;
+                let n_vec = head_dim / 8;
+                let max_seq = self.max_seq;
+                let q_addr = q.as_ptr() as usize;
+                let k_addr = self.k_cache.as_ptr() as usize;
+                let v_addr = self.v_cache.as_ptr() as usize;
+                let out_addr = attn_out.as_mut_ptr() as usize;
+
+                let compute_head_fn = |h: usize| unsafe {
+                    let kvh = h / heads_per_kv;
+                    let q_head = (q_addr as *const f32).add(h * head_dim);
+                    let out_head = (out_addr as *mut f32).add(h * head_dim);
 
                     let mut m_prev = f32::NEG_INFINITY;
                     let mut l_prev = 0.0f32;
-                    for t in 0..=pos {
-                        let t_off = (l * self.max_seq + t) * c.kv_dim + kvh * c.head_dim;
-                        let k_head = &self.k_cache[t_off..t_off + c.head_dim];
-                        let v_head = &self.v_cache[t_off..t_off + c.head_dim];
+                    let mut acc_v = [_mm256_setzero_ps(); 16];
 
-                        let score = dot_f16_row_avx2(k_head.as_ptr() as *const u8, q_head.as_ptr(), c.head_dim) * scale;
+                    for t in 0..=pos {
+                        let t_off = (local_l * max_seq + t) * kv_dim + kvh * head_dim;
+                        let k_head = (k_addr as *const u16).add(t_off);
+                        let v_head = (v_addr as *const u16).add(t_off);
+
+                        let score = dot_f16_row_avx2(k_head as *const u8, q_head, head_dim) * scale;
                         let m_new = m_prev.max(score);
                         let alpha = (m_prev - m_new).exp();
                         let p = (score - m_new).exp();
@@ -1533,16 +1669,35 @@ impl SmolLm2Engine {
                         m_prev = m_new;
 
                         let (va, vp) = (_mm256_set1_ps(alpha), _mm256_set1_ps(p));
-                        for d in (0..c.head_dim).step_by(8) {
-                            let o = out_head.as_mut_ptr().add(d);
-                            let ov = _mm256_mul_ps(_mm256_loadu_ps(o), va);
-                            let vv = _mm256_cvtph_ps(_mm_loadu_si128(v_head.as_ptr().add(d) as *const __m128i));
-                            _mm256_storeu_ps(o, _mm256_fmadd_ps(vp, vv, ov));
+                        for d in 0..n_vec {
+                            let ov = _mm256_mul_ps(acc_v[d], va);
+                            let vv = _mm256_cvtph_ps(_mm_loadu_si128(v_head.add(d * 8) as *const __m128i));
+                            acc_v[d] = _mm256_fmadd_ps(vp, vv, ov);
                         }
                     }
-                    let inv_l = 1.0f32 / l_prev.max(1e-9);
-                    for d in 0..c.head_dim {
-                        out_head[d] *= inv_l;
+                    let inv_l = _mm256_set1_ps(1.0f32 / l_prev.max(1e-9));
+                    for d in 0..n_vec {
+                        _mm256_storeu_ps(out_head.add(d * 8), _mm256_mul_ps(acc_v[d], inv_l));
+                    }
+                };
+
+                if let Some(p) = pool {
+                    if p.n_threads() > 1 && n_heads >= p.n_threads() {
+                        p.run(&|t, n| {
+                            let h0 = n_heads * t / n;
+                            let h1 = n_heads * (t + 1) / n;
+                            for h in h0..h1 {
+                                compute_head_fn(h);
+                            }
+                        });
+                    } else {
+                        for h in 0..n_heads {
+                            compute_head_fn(h);
+                        }
+                    }
+                } else {
+                    for h in 0..n_heads {
+                        compute_head_fn(h);
                     }
                 }
 
@@ -1565,7 +1720,7 @@ impl SmolLm2Engine {
                     m,
                     &x_norms,
                     &mut proj_outs,
-                    Some((&mut self.moe_stats, l)),
+                    Some((&mut self.moe_stats, global_l)),
                     hint,
                     self.expert_cache.as_mut(),
                 ),
@@ -1580,26 +1735,46 @@ impl SmolLm2Engine {
             }
         }
 
-        for b in 0..bsz {
-            rmsnorm(&xs[b], f32_at(base, self.output_norm, c.dim), &mut x_norms[b], c.rms_eps);
+        if self.layer_range.end == self.cfg.n_layers {
+            for b in 0..bsz {
+                rmsnorm(&xs[b], f32_at(base, self.output_norm, c.dim), &mut x_norms[b], c.rms_eps);
+            }
+            x_norms
+        } else {
+            xs
         }
-        x_norms
     }
 
-    /// Runs one token at position `pos` through every layer and returns the final-normed
-    /// hidden state (`dim` floats).
+    /// Evaluates this engine's assigned layer partition (`self.layer_range`).
+    /// - If `token_id` is Some, initializes `x` from the embedding table (Stage 0 / Worker).
+    /// - If `in_hidden` is Some, uses the provided activation vector from the previous stage.
+    /// - Evaluates `self.layers`, storing local keys/values in `k_cache`/`v_cache`.
+    /// - If `self.layer_range.end == self.cfg.n_layers`, applies `output_norm` and returns normalized hidden state.
+    /// - Otherwise, returns the un-normalized residual hidden state ready for the next node.
     #[target_feature(enable = "avx2,fma,f16c")]
-    pub unsafe fn forward_hidden(&mut self, token_id: usize, pos: usize) -> Vec<f32> {
+    pub unsafe fn forward_slice(
+        &mut self,
+        token_id: Option<usize>,
+        in_hidden: Option<&[f32]>,
+        pos: usize,
+    ) -> Vec<f32> {
         let c = self.cfg;
         let base = self.raw_bytes.as_ptr();
         let pool = self.pool.as_ref();
 
-        let rb = row_bytes(self.embed.dtype, c.dim).expect("unsupported embedding type");
-        let row = std::slice::from_raw_parts(base.add(self.embed.offset + token_id * rb), rb);
-        let mut x = dequant_row(self.embed.dtype, row, c.dim);
-        if c.embedding_scale != 1.0 {
-            x.iter_mut().for_each(|v| *v *= c.embedding_scale);
-        }
+        let mut x = if let Some(tid) = token_id {
+            let rb = row_bytes(self.embed.dtype, c.dim).expect("unsupported embedding type");
+            let row = std::slice::from_raw_parts(base.add(self.embed.offset + tid * rb), rb);
+            let mut val = dequant_row(self.embed.dtype, row, c.dim);
+            if c.embedding_scale != 1.0 {
+                val.iter_mut().for_each(|v| *v *= c.embedding_scale);
+            }
+            val
+        } else if let Some(h) = in_hidden {
+            h.to_vec()
+        } else {
+            panic!("forward_slice requires token_id or in_hidden");
+        };
 
         let mut x_norm = vec![0.0f32; c.dim];
         let mut q = vec![0.0f32; c.q_dim];
@@ -1607,27 +1782,24 @@ impl SmolLm2Engine {
         let mut v = vec![0.0f32; c.kv_dim];
         let mut attn_out = vec![0.0f32; c.q_dim];
         let mut proj_out = vec![0.0f32; c.dim];
+        let mut moe_tmp = vec![0.0f32; c.dim];
         if self.is_moe() {
             self.moe_stats.tokens += 1;
         }
 
         let hint = self.prefetcher.as_ref();
         let first_streamed = self.streamer.as_ref().map_or(usize::MAX, |s| s.first);
-        for l in 0..c.n_layers {
-            let ly = self.layers[l];
-            // Streamed layer: its bytes arrive in a private buffer; tensor offsets are file
-            // offsets, so shift the base back by where the layer starts in the file.
+        for (local_l, &ly) in self.layers.iter().enumerate() {
+            let global_l = self.layer_range.start + local_l;
             let streamed = match self.streamer.as_mut() {
-                Some(st) if l >= st.first => Some(st.take(l).expect("reading a layer from the model file failed")),
+                Some(st) if global_l >= st.first => Some(st.take(global_l).expect("reading a layer from the model file failed")),
                 _ => None,
             };
             let lbase = match (&streamed, &self.layer_spans) {
-                (Some(buf), Some(spans)) => buf.as_ptr().wrapping_sub(spans[l].0),
+                (Some(buf), Some(spans)) => buf.as_ptr().wrapping_sub(spans[global_l].0),
                 _ => base,
             };
-            // The next layer's attention (and router or dense FFN) loads during this one,
-            // unless the layer streamer is already reading it.
-            if let (Some(pf), Some(next)) = (hint.filter(|_| l + 1 < first_streamed), self.layers.get(l + 1)) {
+            if let (Some(pf), Some(next)) = (hint.filter(|_| global_l + 1 < first_streamed), self.layers.get(local_l + 1)) {
                 let mut r = vec![span(&next.wq), span(&next.wk), span(&next.wv), span(&next.wo)];
                 match &next.ffn {
                     FfnKind::Dense(f) => r.extend(f.spans()),
@@ -1655,44 +1827,74 @@ impl SmolLm2Engine {
             self.rope.rotate(&mut q, c.head_dim, pos as f32);
             self.rope.rotate(&mut k, c.head_dim, pos as f32);
 
-            let kv_off = (l * self.max_seq + pos) * c.kv_dim;
+            let kv_off = (local_l * self.max_seq + pos) * c.kv_dim;
             f32_to_f16_slice(&k, &mut self.k_cache[kv_off..kv_off + c.kv_dim]);
             f32_to_f16_slice(&v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
 
             // Grouped-query attention with an online softmax over positions 0..=pos.
             let scale = c.attn_scale.unwrap_or(1.0 / (c.head_dim as f32).sqrt());
-            attn_out.fill(0.0);
-            for h in 0..c.n_heads {
-                let kvh = h / (c.n_heads / c.n_kv_heads);
-                let q_head = &q[h * c.head_dim..(h + 1) * c.head_dim];
-                let out_head = &mut attn_out[h * c.head_dim..(h + 1) * c.head_dim];
+            let n_heads = c.n_heads;
+            let head_dim = c.head_dim;
+            let kv_dim = c.kv_dim;
+            let heads_per_kv = c.n_heads / c.n_kv_heads;
+            let n_vec = head_dim / 8;
+            let max_seq = self.max_seq;
+            let q_addr = q.as_ptr() as usize;
+            let k_addr = self.k_cache.as_ptr() as usize;
+            let v_addr = self.v_cache.as_ptr() as usize;
+            let out_addr = attn_out.as_mut_ptr() as usize;
+
+            let compute_head_fn = |h: usize| unsafe {
+                let kvh = h / heads_per_kv;
+                let q_head = (q_addr as *const f32).add(h * head_dim);
+                let out_head = (out_addr as *mut f32).add(h * head_dim);
 
                 let mut m_prev = f32::NEG_INFINITY;
                 let mut l_prev = 0.0f32;
-                for t in 0..=pos {
-                    let t_off = (l * self.max_seq + t) * c.kv_dim + kvh * c.head_dim;
-                    let k_head = &self.k_cache[t_off..t_off + c.head_dim];
-                    let v_head = &self.v_cache[t_off..t_off + c.head_dim];
+                let mut acc_v = [_mm256_setzero_ps(); 16];
 
-                    let score = dot_f16_row_avx2(k_head.as_ptr() as *const u8, q_head.as_ptr(), c.head_dim) * scale;
+                for t in 0..=pos {
+                    let t_off = (local_l * max_seq + t) * kv_dim + kvh * head_dim;
+                    let k_head = (k_addr as *const u16).add(t_off);
+                    let v_head = (v_addr as *const u16).add(t_off);
+
+                    let score = dot_f16_row_avx2(k_head as *const u8, q_head, head_dim) * scale;
                     let m_new = m_prev.max(score);
                     let alpha = (m_prev - m_new).exp();
                     let p = (score - m_new).exp();
                     l_prev = l_prev * alpha + p;
                     m_prev = m_new;
 
-                    // out = out * alpha + p * v
                     let (va, vp) = (_mm256_set1_ps(alpha), _mm256_set1_ps(p));
-                    for d in (0..c.head_dim).step_by(8) {
-                        let o = out_head.as_mut_ptr().add(d);
-                        let ov = _mm256_mul_ps(_mm256_loadu_ps(o), va);
-                        let vv = _mm256_cvtph_ps(_mm_loadu_si128(v_head.as_ptr().add(d) as *const __m128i));
-                        _mm256_storeu_ps(o, _mm256_fmadd_ps(vp, vv, ov));
+                    for d in 0..n_vec {
+                        let ov = _mm256_mul_ps(acc_v[d], va);
+                        let vv = _mm256_cvtph_ps(_mm_loadu_si128(v_head.add(d * 8) as *const __m128i));
+                        acc_v[d] = _mm256_fmadd_ps(vp, vv, ov);
                     }
                 }
-                let inv_l = 1.0f32 / l_prev.max(1e-9);
-                for d in 0..c.head_dim {
-                    out_head[d] *= inv_l;
+                let inv_l = _mm256_set1_ps(1.0f32 / l_prev.max(1e-9));
+                for d in 0..n_vec {
+                    _mm256_storeu_ps(out_head.add(d * 8), _mm256_mul_ps(acc_v[d], inv_l));
+                }
+            };
+
+            if let Some(p) = pool {
+                if p.n_threads() > 1 && n_heads >= p.n_threads() {
+                    p.run(&|t, n| {
+                        let h0 = n_heads * t / n;
+                        let h1 = n_heads * (t + 1) / n;
+                        for h in h0..h1 {
+                            compute_head_fn(h);
+                        }
+                    });
+                } else {
+                    for h in 0..n_heads {
+                        compute_head_fn(h);
+                    }
+                }
+            } else {
+                for h in 0..n_heads {
+                    compute_head_fn(h);
                 }
             }
 
@@ -1711,9 +1913,10 @@ impl SmolLm2Engine {
                     m,
                     &x_norm,
                     &mut proj_out,
-                    Some((&mut self.moe_stats, l)),
+                    Some((&mut self.moe_stats, global_l)),
                     hint,
                     self.expert_cache.as_mut(),
+                    &mut moe_tmp,
                 ),
             }
             for i in 0..c.dim {
@@ -1724,8 +1927,18 @@ impl SmolLm2Engine {
             }
         }
 
-        rmsnorm(&x, f32_at(base, self.output_norm, c.dim), &mut x_norm, c.rms_eps);
-        x_norm
+        if self.layer_range.end == self.cfg.n_layers {
+            rmsnorm(&x, f32_at(base, self.output_norm, c.dim), &mut x_norm, c.rms_eps);
+            x_norm
+        } else {
+            x
+        }
+    }
+
+    /// Evaluates all assigned layers for `token_id` at `pos`.
+    #[inline]
+    pub unsafe fn forward_hidden(&mut self, token_id: usize, pos: usize) -> Vec<f32> {
+        self.forward_slice(Some(token_id), None, pos)
     }
 
     /// Computes LM-head logits for `hidden` and picks the next token using `self.sampler`:
@@ -2119,7 +2332,7 @@ impl SmolLm2Engine {
 
                 if draft_tokens.is_empty() {
                     self.ensure_kv_room(1);
-                    last_hidden = self.forward_hidden(next_id, self.cur_pos);
+                    last_hidden = self.step_token(next_id, self.cur_pos);
                     self.cur_pos += 1;
                     continue;
                 }
@@ -2133,7 +2346,15 @@ impl SmolLm2Engine {
 
                 self.ensure_kv_room(verify_batch.len());
                 let target_start_pos = self.cur_pos;
-                let hiddens = self.forward_batch(&verify_batch, target_start_pos);
+                let hiddens = if self.cluster_client.is_some() {
+                    let mut client = self.cluster_client.take().unwrap();
+                    let w_hiddens = client.prefill(&verify_batch, target_start_pos).expect("cluster prefill failed");
+                    let h = self.forward_batch_slice(None, Some(&w_hiddens), target_start_pos);
+                    self.cluster_client = Some(client);
+                    h
+                } else {
+                    self.forward_batch(&verify_batch, target_start_pos)
+                };
                 self.cur_pos += verify_batch.len();
 
                 // 4. Verify draft tokens sequentially against target logits
@@ -2252,7 +2473,7 @@ impl SmolLm2Engine {
                     generated += 1;
 
                     self.ensure_kv_room(1);
-                    last_hidden = self.forward_hidden(bonus_tok, self.cur_pos);
+                    last_hidden = self.step_token(bonus_tok, self.cur_pos);
                     self.cur_pos += 1;
 
                     draft.ensure_kv_room(1);
@@ -2261,7 +2482,7 @@ impl SmolLm2Engine {
                 }
             } else {
                 self.ensure_kv_room(1);
-                last_hidden = self.forward_hidden(next_id, self.cur_pos);
+                last_hidden = self.step_token(next_id, self.cur_pos);
                 self.cur_pos += 1;
             }
         }
@@ -2429,7 +2650,8 @@ mod tests {
                 shared_gate: shared.then_some(sh_gate),
             };
             let mut got = vec![0.0f32; dim];
-            unsafe { moe_forward(None, base, &moe, &x, &mut got, None, None, None) };
+            let mut tmp = vec![0.0f32; dim];
+            unsafe { moe_forward(None, base, &moe, &x, &mut got, None, None, None, &mut tmp) };
 
             // Reference.
             let logits: Vec<f32> = (0..n_exp).map(|e| (0..dim).map(|c| w(&router, 0, e, c) * x[c]).sum()).collect();
@@ -2469,6 +2691,66 @@ mod tests {
             for (a, b) in got.iter().zip(&want) {
                 assert!((a - b).abs() < 1e-4, "norm={norm} shared={shared}: {a} vs {b}");
             }
+        }
+    }
+
+    #[test]
+    fn test_layer_sharding_matches_full_model() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut full = SmolLm2Engine::load(path).expect("load full");
+        let n_layers = full.cfg.n_layers;
+        let mid = n_layers / 2;
+
+        let mut stage0 = SmolLm2Engine::load_sharded(path, 0..mid).expect("load stage 0");
+        let mut stage1 = SmolLm2Engine::load_sharded(path, mid..n_layers).expect("load stage 1");
+
+        assert_eq!(stage0.layers.len(), mid);
+        assert_eq!(stage1.layers.len(), n_layers - mid);
+
+        let prompt = "Rust is a systems programming language";
+        let tokens = full.encode_chatml(prompt);
+        assert!(!tokens.is_empty());
+
+        for (pos, &tok) in tokens.iter().enumerate() {
+            unsafe {
+                let full_out = full.forward_hidden(tok, pos);
+
+                let stage0_out = stage0.forward_slice(Some(tok), None, pos);
+                let stage1_out = stage1.forward_slice(None, Some(&stage0_out), pos);
+
+                assert_eq!(full_out.len(), stage1_out.len());
+                for (i, (&f, &s)) in full_out.iter().zip(&stage1_out).enumerate() {
+                    let diff = (f - s).abs();
+                    assert!(
+                        diff < 1e-3,
+                        "Mismatch at pos {pos}, dim {i}: full={f}, sharded={s}, diff={diff}"
+                    );
+                }
+            }
+        }
+        println!("[test] Sharded layer split (0..{mid} + {mid}..{n_layers}) matched full model across {} tokens!", tokens.len());
+
+        // Also verify batched forward_batch_slice equivalence reusing the loaded engines
+        unsafe {
+            full.reset_kv();
+            stage0.reset_kv();
+            stage1.reset_kv();
+
+            let full_outs = full.forward_batch(&tokens, 0);
+            let s0_outs = stage0.forward_batch_slice(Some(&tokens), None, 0);
+            let s1_outs = stage1.forward_batch_slice(None, Some(&s0_outs), 0);
+
+            assert_eq!(full_outs.len(), s1_outs.len());
+            for b in 0..tokens.len() {
+                for i in 0..full.cfg.dim {
+                    let diff = (full_outs[b][i] - s1_outs[b][i]).abs();
+                    assert!(diff < 1e-3, "Batch mismatch at token {b}, dim {i}: full={}, sharded={}, diff={diff}", full_outs[b][i], s1_outs[b][i]);
+                }
+            }
+            println!("[test] Batched sharded prefill matched full model across {} tokens!", tokens.len());
         }
     }
 }
