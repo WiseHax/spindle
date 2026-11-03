@@ -746,6 +746,8 @@ struct CliConfig {
     wire_format: cluster_net::WireFormat,
     /// `--threads <N>`: number of compute threads for AVX2 GEMV.
     threads: Option<usize>,
+    /// `--moe-prune <f32>`: relative expert pruning threshold (e.g. 0.03).
+    moe_prune: Option<f32>,
 }
 
 fn parse_cli() -> CliConfig {
@@ -775,6 +777,7 @@ fn parse_cli() -> CliConfig {
         layer_range: None,
         wire_format: cluster_net::WireFormat::Fp16,
         threads: None,
+        moe_prune: None,
     };
 
     let mut pos = Vec::new();
@@ -803,6 +806,10 @@ fn parse_cli() -> CliConfig {
             }
             "--threads" | "-t" if i + 1 < args.len() => {
                 cfg.threads = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--moe-prune" | "--expert-prune" if i + 1 < args.len() => {
+                cfg.moe_prune = args[i + 1].parse().ok();
                 i += 2;
             }
             "--wire-format" if i + 1 < args.len() => {
@@ -1015,6 +1022,9 @@ fn main() -> Result<()> {
                         let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
                     }
                 });
+                if let Some(p) = cli.moe_prune {
+                    engine.set_moe_prune(p);
+                }
 
                 let bind_addr = cli.bind_addr;
                 let listener = match std::net::TcpListener::bind(bind_addr) {
@@ -1229,6 +1239,9 @@ fn main() -> Result<()> {
             engine.enable_threads(n_threads, move |i| {
                 let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
             });
+            if let Some(p) = cli.moe_prune {
+                engine.set_moe_prune(p);
+            }
             engine.set_sampler(cli.sampler);
             let sc = cli.sampler;
             vlog!(
