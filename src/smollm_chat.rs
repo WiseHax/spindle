@@ -1264,7 +1264,9 @@ impl SmolLm2Engine {
 
     /// Attaches a small draft engine for speculative decoding (`--draft <path>`).
     pub fn enable_draft(&mut self, mut draft: SmolLm2Engine) {
-        draft.max_seq = self.max_seq;
+        let max_seq = self.max_seq.min(draft.max_seq);
+        self.max_seq = max_seq;
+        draft.max_seq = max_seq;
         draft.system_prompt = self.system_prompt;
         self.draft_engine = Some(Box::new(draft));
     }
@@ -2476,7 +2478,7 @@ impl SmolLm2Engine {
 
                         let mismatch_pos = target_start_pos + 1 + i;
                         self.cur_pos = mismatch_pos;
-                        last_hidden = self.forward_hidden(target_tok, self.cur_pos);
+                        last_hidden = self.step_token(target_tok, self.cur_pos);
                         self.cur_pos += 1;
 
                         draft.cur_pos = mismatch_pos;
