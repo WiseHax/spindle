@@ -33,6 +33,12 @@ wrong.
 - **Draft-guided prefetch.** Use a small draft model's lookahead to predict experts several
   tokens early, without training a predictor.
 - **Streaming layout.** Repack experts so each one is one contiguous, aligned read.
+- **Distributed Asymmetric Layer Sharding (Spindle RIOT-Wire).** Instead of tensor-parallelism
+  (which requires high-bandwidth PCIe/NVLink), pipeline contiguous layer partitions across
+  asymmetric consumer PCs (e.g. 16 GB Desktop + 8 GB Laptop) so the entire model fits in RAM.
+  Only 4 KB of intermediate activation data travels over WiFi per token.
+- **Hardware Wire Compression & Zero-Retransmit XOR FEC.** Real-time AVX2 F16C/FP8 tensor compression
+  in < 300 ns combined with SIMD XOR parity reconstruction, eliminating WiFi packet-drop lag spikes.
 - **Energy.** Report Joules per token, and offer a battery mode.
 
 ## Measurements from the dev laptop
@@ -69,3 +75,21 @@ What this means:
 6. [SSD-LLaMA](https://arxiv.org/html/2609.18110v1)
 7. [A dynamic parallel method for performance optimization on hybrid CPUs](https://huggingface.co/papers/2411.19542)
 8. [SSD Offloading for LLM MoE Weights Considered Harmful in Energy Efficiency](https://www.alphaxiv.org/abs/2508.06978)
+
+## Advanced Research Roadmap (Spindle Phase 4)
+
+The following 4 research directions are slated for upcoming implementation phases:
+
+1. **Dynamic Auto-tune Layer Balancer**:
+   - Rather than statically fixing the layer split (e.g. 32 desktop / 16 laptop), monitor live generation step latencies and TCP RTT over the wire.
+   - Dynamically migrate border layers between worker and master to equalize per-step compute time, maintaining 100% CPU saturation on both nodes.
+
+2. **Turbo-Quant INT8 KV-Cache**:
+   - Currently, the KV-cache stores keys and values in IEEE-754 FP16 (45 MiB per 2048 tokens on SmolLM2, ~300 MiB on 30B).
+   - Dynamic per-head symmetric INT8 quantization will cut KV-cache memory footprints in half, allowing 8k+ context length on low-RAM nodes without paging to SSD.
+
+3. **Draft-Predicted MoE Lookahead**:
+   - Leverage the E-core speculative drafter (e.g. SmolLM2-135M or Qwen3-0.6B) running 4 tokens ahead to evaluate router gates and pre-fetch the exact expert weights needed for future tokens before the main verifier arrives at those layers.
+
+4. **Tri-Node Heterogeneous Mobile Cluster (ARM64 Android / iOS)**:
+   - Compile Spindle's pure-Rust engine for `aarch64-linux-android` (via Termux / NDK) and iOS to pool unused smartphone RAM (6 GB to 12 GB per modern phone) into the Spindle RIOT-Wire cluster mesh over local WiFi, expanding the cluster's aggregate RAM without purchasing additional desktop hardware.
