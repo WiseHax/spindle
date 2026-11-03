@@ -911,5 +911,56 @@ mod tests {
         println!("[test:cluster] Distributed Generation Success across socket! Output: {generated_text:?}");
         assert!(!generated_text.is_empty());
     }
+
+    #[test]
+    fn test_cluster_loopback_speculative_decoding() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let local_addr = listener.local_addr().expect("local addr");
+
+        // Spawn worker node on background thread with layers 0..15
+        let handle = std::thread::spawn(move || {
+            let mut worker_engine = SmolLm2Engine::load_sharded(path, 0..15).expect("load worker");
+            let (stream, _) = listener.accept().expect("accept");
+            serve_worker_connection(&mut worker_engine, stream, WireFormat::Fp16).expect("serve");
+        });
+
+        // Run Master on main thread with layers 15..30
+        let mut master_engine = SmolLm2Engine::load_sharded(path, 15..30).expect("load master");
+        let client = match ClusterClient::connect(
+            local_addr,
+            &master_engine.idx.model_name,
+            master_engine.cfg.dim,
+            master_engine.cfg.n_layers,
+            (15, 30),
+            WireFormat::Fp16,
+        ) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                println!("[test:cluster] Skipping live socket test (sandbox network isolation active: {e})");
+                return;
+            }
+            Err(e) => panic!("client connect error: {e}"),
+        };
+
+        master_engine.cluster_client = Some(client);
+        let draft_engine = SmolLm2Engine::load(path).expect("load draft");
+        master_engine.enable_draft(draft_engine);
+
+        unsafe {
+            let (reply, secs, toks) = master_engine.generate_reply("Hi", 8, false, &mut |_| {});
+            println!("[cluster:spec:test] {toks} tokens in {secs:.3}s | stats: {:?} | reply: {reply:?}", master_engine.spec_stats);
+            assert!(master_engine.spec_stats.0 > 0, "Expected accepted draft tokens across cluster");
+        }
+
+        if let Some(mut client) = master_engine.cluster_client.take() {
+            let _ = client.stream.send_frame(FRAME_SHUTDOWN, WireFormat::Fp32, &[]);
+        }
+        let _ = handle.join();
+    }
 }
 
