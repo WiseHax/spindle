@@ -10,6 +10,9 @@ use crate::{
 
 const HELP: &str = "\
 /clear       start a new conversation
+/model       display model metadata, architecture, and memory footprint
+/cluster     check distributed cluster peer status and network ping RTT
+/bench       run a fast 32-token generation benchmark (tok/s)
 /think       toggle reasoning mode on/off (/think on, /think off)
 /stats       show or hide memory details after each reply
 /max <n>     set maximum generation tokens (default: 2048)
@@ -92,6 +95,17 @@ pub fn print_header(engine: &SmolLm2Engine, opts: &ChatOptions) {
 
 fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Option<&Governor>, detailed: bool) -> String {
     let mut parts = vec![format!("{:.1} tok/s", tokens as f64 / secs), format!("{tokens} tokens"), format!("{secs:.1} s")];
+    if let Some(client) = engine.cluster_client.as_mut() {
+        if let Ok(rtt) = client.ping() {
+            parts.push(format!("cluster mesh (RTT {:.2} ms)", rtt.as_secs_f64() * 1000.0));
+        } else {
+            parts.push("cluster mesh".to_string());
+        }
+    } else if !engine.is_streaming() {
+        parts.push("100% RAM resident".to_string());
+    } else {
+        parts.push("streaming from disk".to_string());
+    }
     if detailed {
         let (ws, private, _) = memory_guard::process_counters();
         parts.push(format!("{} MiB RAM ({} MiB private)", ws >> 20, private >> 20));
@@ -192,6 +206,64 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
             "/clear" | "/reset" => {
                 engine.reset_kv();
                 println!("{}", dim("new conversation"));
+            }
+            "/model" | "/info" => {
+                let mib = engine.raw_bytes.len() >> 20;
+                let c = engine.cfg;
+                println!("{}  {}", bold("model:"), accent(&engine.idx.model_name));
+                println!(
+                    "  arch: {} · dim: {} · layers: {}/{} (range: {}..{}) · heads: {}/{}",
+                    engine.idx.architecture, c.dim,
+                    engine.layer_range.len(), c.n_layers,
+                    engine.layer_range.start, engine.layer_range.end,
+                    c.n_heads, c.n_kv_heads
+                );
+                let (ws, private, _) = memory_guard::process_counters();
+                let free_ram = crate::mmap_file::available_ram_bytes() >> 20;
+                println!(
+                    "  memory: {mib} MiB file · {} MiB resident · {} MiB private · {free_ram} MiB free RAM",
+                    ws >> 20, private >> 20
+                );
+                println!(
+                    "  kv-cache: {}/{} tokens ({:.1} MiB allocated)",
+                    engine.cur_pos, engine.max_seq,
+                    ((engine.k_cache.len() + engine.v_cache.len()) * 2) as f64 / (1024.0 * 1024.0)
+                );
+            }
+            "/cluster" | "/nodes" => {
+                if let Some(client) = engine.cluster_client.as_mut() {
+                    let rtt = client.ping().unwrap_or(std::time::Duration::from_millis(1));
+                    println!("{}  {}", bold("spindle cluster:"), accent("online"));
+                    println!(
+                        "  partition: worker (layers {}..{}) + local (layers {}..{}) = {} total",
+                        client.worker_range.0, client.worker_range.1,
+                        engine.layer_range.start, engine.layer_range.end,
+                        engine.cfg.n_layers
+                    );
+                    println!(
+                        "  transport: wire {:?} · LAN ping RTT: {:.2} µs ({:.2} ms)",
+                        client.wire_format,
+                        rtt.as_secs_f64() * 1e6,
+                        rtt.as_secs_f64() * 1e3
+                    );
+                } else {
+                    println!("{}  {}", bold("spindle cluster:"), dim("standalone (no peer connected)"));
+                    println!(
+                        "  run with '--peer <IP:PORT> --layer-range <start>..<end>' to join a cluster"
+                    );
+                }
+            }
+            "/bench" => {
+                println!("{}", dim("running quick benchmark (32 tokens)..."));
+                let t_bench0 = std::time::Instant::now();
+                let prompt = "Explain in one sentence why systems programming in Rust is reliable and performant.";
+                let (_, secs, tokens) = unsafe { engine.generate_reply(prompt, 32, false, &mut |_| {}) };
+                let t_total = t_bench0.elapsed().as_secs_f64();
+                let speed = tokens as f64 / secs.max(0.001);
+                println!(
+                    "{} benchmark: {} tokens in {:.2}s -> {:.1} tok/s (wall: {:.2}s)",
+                    accent("✓"), tokens, secs, speed, t_total
+                );
             }
             "/think" | "/think toggle" => {
                 allow_think = !allow_think;
