@@ -150,6 +150,8 @@ struct Moe {
     /// Always-on expert (Qwen2-MoE), optionally scaled by `sigmoid(shared_gate · x)`.
     shared: Option<Ffn>,
     shared_gate: Option<usize>,
+    /// Relative probability cutoff for dynamic MoE expert pruning (0.0 = disabled).
+    moe_prune: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -219,6 +221,7 @@ fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig, layer_range: std::ops::
                     norm: c.expert_norm,
                     shared,
                     shared_gate: vec_f32(&n("ffn_gate_inp_shexp.weight"))?,
+                    moe_prune: 0.0,
                 })
             } else if find(&n("ffn_gate.0.weight")).is_some() {
                 return Err(invalid("old per-expert Mixtral layout (ffn_gate.N) is not supported; re-convert the GGUF".into()));
@@ -413,6 +416,20 @@ unsafe fn moe_forward_batch(
         let mut chosen: Vec<usize> = (0..m.n_expert).collect();
         chosen.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
         chosen.truncate(m.n_used);
+        chosen.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+
+        let mut num_keep = m.n_used;
+        if m.moe_prune > 0.0 && m.n_used > 2 {
+            let max_p = probs[chosen[0]];
+            let min_keep = 2.max(m.n_used / 2);
+            let cutoff = max_p * m.moe_prune;
+            let mut k = min_keep;
+            while k < m.n_used && probs[chosen[k]] >= cutoff {
+                k += 1;
+            }
+            num_keep = k;
+        }
+        chosen.truncate(num_keep);
         wsum_batch[b] = chosen.iter().map(|&e| probs[e]).sum();
         for &e in &chosen {
             if !unique_experts.contains(&e) {
@@ -601,7 +618,21 @@ unsafe fn moe_forward(
         &mut heap_chosen
     };
     chosen_slice.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
-    let chosen = &chosen_slice[..m.n_used];
+    let top_chosen = &mut chosen_slice[..m.n_used];
+    top_chosen.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+
+    let mut num_keep = m.n_used;
+    if m.moe_prune > 0.0 && m.n_used > 2 {
+        let max_p = probs[top_chosen[0]];
+        let min_keep = 2.max(m.n_used / 2);
+        let cutoff = max_p * m.moe_prune;
+        let mut k = min_keep;
+        while k < m.n_used && probs[top_chosen[k]] >= cutoff {
+            k += 1;
+        }
+        num_keep = k;
+    }
+    let chosen = &top_chosen[..num_keep];
     let wsum: f32 = chosen.iter().map(|&e| probs[e]).sum();
     let router_us = t_router.map_or(0, |t| t.elapsed().as_micros() as u64);
 
@@ -1136,6 +1167,11 @@ impl SmolLm2Engine {
         if !engine.stop_ids.contains(&end) {
             engine.stop_ids.insert(0, end);
         }
+        if let Ok(v) = std::env::var("SPINDLE_MOE_PRUNE") {
+            if let Ok(p) = v.parse::<f32>() {
+                engine.set_moe_prune(p);
+            }
+        }
         Ok(engine)
     }
 
@@ -1231,6 +1267,15 @@ impl SmolLm2Engine {
         draft.max_seq = self.max_seq;
         draft.system_prompt = self.system_prompt;
         self.draft_engine = Some(Box::new(draft));
+    }
+
+    /// Sets the dynamic MoE expert pruning threshold (e.g. 0.03 = prune experts with prob < 3% of max).
+    pub fn set_moe_prune(&mut self, threshold: f32) {
+        for layer in &mut self.layers {
+            if let FfnKind::Moe(m) = &mut layer.ffn {
+                m.moe_prune = threshold;
+            }
+        }
     }
 
     /// Locks up to `budget` bytes of weights into RAM and returns how many were locked.
@@ -2648,6 +2693,7 @@ mod tests {
                 norm,
                 shared: shared.then_some(sh),
                 shared_gate: shared.then_some(sh_gate),
+                moe_prune: 0.0,
             };
             let mut got = vec![0.0f32; dim];
             let mut tmp = vec![0.0f32; dim];
