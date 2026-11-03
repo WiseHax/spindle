@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 mod chat_cli;
+mod cluster_net;
 mod expert_cache;
 mod expert_pack;
 mod gguf_loader;
@@ -737,6 +738,14 @@ struct CliConfig {
     draft_path: Option<String>,
     /// `--think`: enable reasoning model thinking mode (default: false for fast direct reply).
     think: bool,
+    /// `--node`: runs as a distributed worker node serving layers over network.
+    node_mode: bool,
+    /// `--layer-range <start>..<end>`: selective layer range to load into RAM.
+    layer_range: Option<std::ops::Range<usize>>,
+    /// `--wire-format <fp16|fp8|fp32>`: network tensor compression format.
+    wire_format: cluster_net::WireFormat,
+    /// `--threads <N>`: number of compute threads for AVX2 GEMV.
+    threads: Option<usize>,
 }
 
 fn parse_cli() -> CliConfig {
@@ -762,12 +771,48 @@ fn parse_cli() -> CliConfig {
         expert_cache_mib: None,
         draft_path: None,
         think: false,
+        node_mode: false,
+        layer_range: None,
+        wire_format: cluster_net::WireFormat::Fp16,
+        threads: None,
     };
 
     let mut pos = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "node" | "--node" => {
+                cfg.node_mode = true;
+                i += 1;
+            }
+            "--layer-range" | "-l" if i + 1 < args.len() => {
+                let s = args[i + 1].trim();
+                let parts: Vec<&str> = if s.contains("..") {
+                    s.split("..").collect()
+                } else if s.contains('-') {
+                    s.split('-').collect()
+                } else {
+                    vec![s]
+                };
+                if parts.len() == 2 {
+                    if let (Ok(start), Ok(end)) = (parts[0].parse::<usize>(), parts[1].parse::<usize>()) {
+                        cfg.layer_range = Some(start..end);
+                    }
+                }
+                i += 2;
+            }
+            "--threads" | "-t" if i + 1 < args.len() => {
+                cfg.threads = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--wire-format" if i + 1 < args.len() => {
+                match args[i + 1].to_ascii_lowercase().as_str() {
+                    "fp8" => cfg.wire_format = cluster_net::WireFormat::Fp8,
+                    "fp32" => cfg.wire_format = cluster_net::WireFormat::Fp32,
+                    _ => cfg.wire_format = cluster_net::WireFormat::Fp16,
+                }
+                i += 2;
+            }
             "--role" if i + 1 < args.len() => {
                 cfg.role = args[i + 1].clone();
                 i += 2;
@@ -859,16 +904,23 @@ fn parse_cli() -> CliConfig {
                 cfg.think = true;
                 i += 1;
             }
+            "chat" => {
+                cfg.chat_mode = true;
+                i += 1;
+            }
             other => {
                 pos.push(other.to_string());
                 i += 1;
             }
         }
     }
-    if let Some(p) = pos.first() {
-        cfg.path = p.clone();
+    for p in &pos {
+        if p != "node" && p != "chat" {
+            cfg.path = p.clone();
+            break;
+        }
     }
-    if let Some(g) = pos.get(1).and_then(|s| s.parse().ok()) {
+    if let Some(g) = pos.iter().filter(|s| *s != "node" && *s != "chat" && *s != &cfg.path).next().and_then(|s| s.parse().ok()) {
         cfg.create_gib = g;
     }
     cfg
@@ -925,13 +977,111 @@ fn main() -> Result<()> {
             && gguf_idx.tensor_by_name.contains_key("blk.0.attn_q.weight")
         {
             lock_thread_to_core(topo.worker_pcores[0], "chat-pcore")?;
-            let mut engine = match smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("{}", ui::warn(&format!("could not load {path}: {e}")));
-                    std::process::exit(1);
-                }
+            let mut engine = match cli.layer_range.clone() {
+                Some(range) => match smollm_chat::SmolLm2Engine::load_with_index_sharded(path, gguf_idx, range) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("{}", ui::warn(&format!("could not load {path}: {e}")));
+                        std::process::exit(1);
+                    }
+                },
+                None => match smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("{}", ui::warn(&format!("could not load {path}: {e}")));
+                        std::process::exit(1);
+                    }
+                },
             };
+
+            if cli.node_mode {
+                let n_threads = cli.threads.unwrap_or_else(|| {
+                    std::env::var("CHAT_THREADS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or_else(|| {
+                            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+                        })
+                })
+                .clamp(1, 32);
+                let chat_cores = [
+                    topo.worker_pcores[0],
+                    topo.worker_pcores[1],
+                    topo.worker_pcores[2],
+                    topo.producer_pcore,
+                ];
+                engine.enable_threads(n_threads, move |i| {
+                    if i < chat_cores.len() {
+                        let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
+                    }
+                });
+
+                let bind_addr = cli.bind_addr;
+                let listener = match std::net::TcpListener::bind(bind_addr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("{}", ui::warn(&format!("failed to bind worker on {bind_addr}: {e}")));
+                        std::process::exit(1);
+                    }
+                };
+                let actual = listener.local_addr().unwrap();
+                println!("{}  {}", ui::bold("spindle"), ui::accent("worker node"));
+                println!(
+                    "{} · Listening on {} · Layers {}..{} ({}/{} layers resident in RAM) · {} compute threads",
+                    engine.idx.model_name,
+                    actual,
+                    engine.layer_range.start,
+                    engine.layer_range.end,
+                    engine.layer_range.len(),
+                    engine.cfg.n_layers,
+                    n_threads,
+                );
+                println!("{}", ui::dim("Waiting for Master connection... (Press Ctrl+C to stop)"));
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(s) => {
+                            let _ = cluster_net::serve_worker_connection(&mut engine, s, cli.wire_format);
+                        }
+                        Err(e) => eprintln!("incoming connection error: {e}"),
+                    }
+                }
+                return Ok(());
+            }
+
+            if let Some(peer) = cli.peer_addr {
+                let peer_sock = std::net::SocketAddr::V4(peer);
+                println!("Connecting to Spindle Worker at {peer_sock}...");
+                let client = match cluster_net::ClusterClient::connect(
+                    peer_sock,
+                    &engine.idx.model_name,
+                    engine.cfg.dim,
+                    engine.cfg.n_layers,
+                    (engine.layer_range.start, engine.layer_range.end),
+                    cli.wire_format,
+                ) {
+                    Ok(mut c) => {
+                        let rtt = c.ping().unwrap_or(Duration::from_millis(1));
+                        println!(
+                            "{} Connected to Worker at {} (RTT: {:.2} ms)",
+                            ui::accent("✓"),
+                            peer_sock,
+                            rtt.as_secs_f64() * 1000.0
+                        );
+                        println!(
+                            "  Distributed Pipeline: Worker (layers {}..{}) + Local (layers {}..{}) = {} total layers",
+                            c.worker_range.0, c.worker_range.1,
+                            engine.layer_range.start, engine.layer_range.end,
+                            engine.cfg.n_layers
+                        );
+                        c
+                    }
+                    Err(e) => {
+                        eprintln!("{}", ui::warn(&format!("failed to connect to worker {peer_sock}: {e}")));
+                        std::process::exit(1);
+                    }
+                };
+                engine.cluster_client = Some(client);
+            }
 
             if cli.pack_experts {
                 if !engine.is_moe() {
@@ -1069,11 +1219,13 @@ fn main() -> Result<()> {
                 topo.worker_pcores[2],
                 topo.producer_pcore,
             ];
-            let n_threads = std::env::var("CHAT_THREADS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(chat_cores.len())
-                .clamp(1, chat_cores.len());
+            let n_threads = cli.threads.unwrap_or_else(|| {
+                std::env::var("CHAT_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(chat_cores.len())
+            })
+            .clamp(1, 32);
             engine.enable_threads(n_threads, move |i| {
                 let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
             });
