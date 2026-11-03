@@ -25,6 +25,7 @@ struct Shared {
     generation: AtomicUsize,
     remaining: AtomicUsize,
     shutdown: AtomicBool,
+    parked_mask: AtomicUsize,
     job: UnsafeCell<Option<*const JobFn>>,
 }
 
@@ -49,6 +50,7 @@ impl WorkerPool {
             generation: AtomicUsize::new(0),
             remaining: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            parked_mask: AtomicUsize::new(0),
             job: UnsafeCell::new(None),
         });
         let pin = Arc::new(pin);
@@ -88,8 +90,13 @@ impl WorkerPool {
         }
         s.remaining.store(n - 1, Ordering::Relaxed);
         s.generation.fetch_add(1, Ordering::Release);
-        for h in &self.handles {
-            h.thread().unpark();
+        let parked = s.parked_mask.load(Ordering::Relaxed);
+        if parked != 0 {
+            for (i, h) in self.handles.iter().enumerate() {
+                if (parked & (1 << (i + 1))) != 0 {
+                    h.thread().unpark();
+                }
+            }
         }
         f(0, n);
         while s.remaining.load(Ordering::Acquire) != 0 {
@@ -119,7 +126,14 @@ fn worker_loop(s: &Shared, idx: usize) {
             spins += 1;
             spin_loop();
         } else {
+            s.parked_mask.fetch_or(1 << idx, Ordering::Release);
+            if s.generation.load(Ordering::Acquire) != seen {
+                s.parked_mask.fetch_and(!(1 << idx), Ordering::Release);
+                continue;
+            }
             thread::park();
+            s.parked_mask.fetch_and(!(1 << idx), Ordering::Release);
+            spins = 0;
         }
     }
 }
