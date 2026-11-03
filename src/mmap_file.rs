@@ -79,7 +79,8 @@ impl MappedFile {
     /// but only if it comfortably fits (≤ half of currently available RAM). Otherwise pages
     /// are faulted in on demand. Returns whether a prefetch was issued.
     pub fn prefetch_if_fits(&self) -> bool {
-        if self.len as u64 > available_ram_bytes() / 2 {
+        let avail = available_ram_bytes();
+        if self.len as u64 > avail.saturating_sub(64 * 1024 * 1024) {
             return false;
         }
         let range = WIN32_MEMORY_RANGE_ENTRY {
