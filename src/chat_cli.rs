@@ -129,6 +129,7 @@ pub struct ChatOptions {
     pub threads: usize,
     pub max_tokens: usize,
     pub allow_think: bool,
+    pub tui: bool,
 }
 
 pub fn print_header(engine: &SmolLm2Engine, opts: &ChatOptions) {
@@ -238,6 +239,11 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
 
 /// Runs `opts.first_prompt` (if any), then the interactive loop.
 pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOptions) {
+    if opts.tui && opts.interactive {
+        crate::tui::run_tui(engine, governor, opts);
+        return;
+    }
+
     let mut allow_think = opts.allow_think;
     let mut show_think = opts.allow_think;
     let mut detailed = crate::ui::verbose();

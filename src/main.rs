@@ -21,6 +21,7 @@ mod q4k_gemv;
 mod rio_mesh;
 mod smollm_chat;
 mod tools;
+mod tui;
 mod ui;
 mod worker_pool;
 mod memory_guard;
@@ -756,6 +757,8 @@ struct CliConfig {
     draft_len: Option<usize>,
     /// `--tools`: enables agentic tools (file operations, web search, sandboxed execution).
     tools: bool,
+    /// `--tui`: launches the full-screen OpenCode-style TUI interface.
+    tui: bool,
 }
 
 fn load_config_file(cfg: &mut CliConfig) {
@@ -796,6 +799,7 @@ fn load_config_file(cfg: &mut CliConfig) {
                 "threads" => cfg.threads = val.parse().ok(),
                 "moe_prune" => cfg.moe_prune = val.parse().ok(),
                 "tools" => cfg.tools = val.parse().unwrap_or(false),
+                "tui" => cfg.tui = val.parse().unwrap_or(false),
                 "think" => cfg.think = val.parse().unwrap_or(false),
                 "draft" => cfg.draft_path = Some(val.to_string()),
                 "draft_len" => cfg.draft_len = val.parse().ok(),
@@ -858,6 +862,7 @@ fn parse_cli() -> CliConfig {
         system_prompt: None,
         draft_len: None,
         tools: false,
+        tui: true,
     };
 
     // Load defaults from spindle.toml if present in current directory
@@ -1000,6 +1005,14 @@ fn parse_cli() -> CliConfig {
             }
             "--tools" => {
                 cfg.tools = true;
+                i += 1;
+            }
+            "--tui" => {
+                cfg.tui = true;
+                i += 1;
+            }
+            "--no-tui" => {
+                cfg.tui = false;
                 i += 1;
             }
             "--think" => {
@@ -1399,6 +1412,7 @@ fn main() -> Result<()> {
                 threads: n_threads,
                 max_tokens: if cli.max_tokens == 32 { 2048 } else { cli.max_tokens },
                 allow_think: cli.think,
+                tui: cli.tui,
             };
             chat_cli::print_header(&engine, &opts);
             chat_cli::run(&mut engine, governor.as_ref(), opts);
