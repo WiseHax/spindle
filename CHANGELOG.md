@@ -33,6 +33,10 @@ First release. Spindle runs Qwen3-30B-A3B across two PCs on a home network (7–
   (with a progress bar, speed and time left), connecting to the worker, and processing the
   system prompt (with a progress bar). Before, startup printed a few lines and then paused
   silently while the system prompt was processed.
+- The full-screen interface opens on a loading screen while the system prompt is
+  processed: the startup steps already done, the current one, and a progress bar driven by
+  the tokens actually processed, with speed and time left. Starting a new conversation
+  (`/new`, `/tools`, `/system`) shows the same screen.
 - Weights that fit in RAM are read in at startup, so the first reply doesn't wait on the disk.
 - Fixed the read-ahead ranges for resident weights: most layers were being skipped.
 - If the worker can't be reached, the error says how to start it and which port to open.

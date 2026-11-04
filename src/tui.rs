@@ -599,6 +599,71 @@ fn fmt_tokens(n: usize) -> String {
     }
 }
 
+/// Letters of the "spindle" wordmark, three rows each.
+const LOGO: [[&str; 3]; 7] = [
+    ["█▀▀▀", "▀▀▀█", "▀▀▀▀"],
+    ["█▀▀█", "█▀▀▀", "▀   "],
+    ["▀█▀", " █ ", "▀▀▀"],
+    ["█▀▀▄", "█  █", "▀  ▀"],
+    ["█▀▀▄", "█  █", "▀▀▀ "],
+    ["█   ", "█   ", "▀▀▀▀"],
+    ["█▀▀▀", "█▀▀ ", "▀▀▀▀"],
+];
+
+/// What the loading screen shows.
+struct LoadingView {
+    title: String,
+    /// Phases finished before the full-screen UI opened (label, result).
+    done_steps: Vec<(String, String)>,
+    label: String,
+    what: String,
+    done: usize,
+    total: usize,
+    started: Instant,
+}
+
+/// Processes the system prompt while the loading screen shows its real progress. The work
+/// runs on a scoped thread so the screen keeps animating between 128-token chunks (one
+/// chunk can take a second or more on a two-PC setup).
+fn prefill_with_loading(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, title: &str, done_steps: &[(String, String)]) {
+    if engine.n_keep != 0 {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let done = AtomicUsize::new(0);
+    let total = AtomicUsize::new(0);
+    let finished = AtomicBool::new(false);
+    let mut view = LoadingView {
+        title: title.to_string(),
+        done_steps: done_steps.to_vec(),
+        label: "Prompt".into(),
+        what: if engine.enable_tools { "system prompt and tool descriptions".into() } else { "system prompt".into() },
+        done: 0,
+        total: 0,
+        started: Instant::now(),
+    };
+    let eng = &mut *engine;
+    std::thread::scope(|sc| {
+        let (done, total, finished) = (&done, &total, &finished);
+        sc.spawn(move || {
+            unsafe {
+                eng.prefill_system_with(&mut |d, t| {
+                    total.store(t, Ordering::Relaxed);
+                    done.store(d, Ordering::Relaxed);
+                });
+            }
+            finished.store(true, Ordering::Release);
+        });
+        while !finished.load(Ordering::Acquire) {
+            view.done = done.load(Ordering::Relaxed);
+            view.total = total.load(Ordering::Relaxed);
+            tui.render_loading(&view);
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    });
+    tui.info.ctx_used = engine.cur_pos;
+}
+
 fn spinner_frame(t0: Instant) -> char {
     const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     FRAMES[(t0.elapsed().as_millis() / 80) as usize % FRAMES.len()]
@@ -1248,31 +1313,102 @@ impl SpindleTui {
         let _ = self.canvas.flush();
     }
 
+    /// The three-row "spindle" wordmark centered at row `top`: "spin" muted, "dle" bright,
+    /// like opencode's two-tone wordmark.
+    fn draw_logo(&mut self, w: u16, top: u16) {
+        let logo_w: u16 = LOGO.iter().map(|g| g[0].chars().count() as u16 + 1).sum::<u16>() - 1;
+        let lx = w.saturating_sub(logo_w) / 2;
+        for row in 0..3 {
+            let mut x = lx;
+            for (i, g) in LOGO.iter().enumerate() {
+                let fg = if i < 4 { MUTED } else { TEXT };
+                x = self.canvas.text(x, top + row, w, g[row as usize], fg, BG, false) + 1;
+            }
+        }
+    }
+
+    fn draw_footer(&mut self, w: u16, h: u16) {
+        let fy = h - 1;
+        let cwd = self.cwd_label();
+        self.canvas.text(2, fy, w.saturating_sub(20), &cwd, MUTED, BG, false);
+        let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
+        self.canvas.text(w.saturating_sub(ver.len() as u16 + 2), fy, w, &ver, MUTED, BG, false);
+    }
+
+    /// Full-screen loading view: the startup phases already done, the current one with a
+    /// spinner, and a progress bar driven by real counts (tokens processed).
+    fn render_loading(&mut self, view: &LoadingView) {
+        let (w, h) = terminal_size();
+        self.canvas.resize(w, h);
+        self.canvas.clear();
+        let card_w = w.saturating_sub(4).min(80);
+        let inner = card_w.saturating_sub(6);
+        let steps = view.done_steps.len() as u16;
+        // logo, gap, card (title, blank, steps, current, blank, bar, detail)
+        let card_h = 2 + steps + 1 + 1 + 1 + 1 + 2;
+        let top = h.saturating_sub(3 + 2 + card_h + 2) / 2;
+        self.draw_logo(w, top);
+        let bx = w.saturating_sub(card_w) / 2;
+        let cy = top + 5;
+        self.canvas.fill(bx, cy, card_w, card_h, PANEL);
+        for row in cy..cy + card_h {
+            self.canvas.put(bx, row, '┃', PRIMARY, PANEL, false);
+        }
+        let x0 = bx + 3;
+        let max_x = bx + card_w - 2;
+        let mut y = cy + 1;
+        self.canvas.text(x0, y, max_x, &view.title, TEXT, PANEL, true);
+        y += 2;
+        for (label, result) in &view.done_steps {
+            let x = self.canvas.text(x0, y, max_x, "✓ ", SUCCESS, PANEL, false);
+            let x = self.canvas.text(x, y, max_x, &format!("{label:<9}"), MUTED, PANEL, false);
+            self.canvas.text(x, y, max_x, result, MUTED, PANEL, false);
+            y += 1;
+        }
+        let x = self.canvas.text(x0, y, max_x, &format!("{} ", spinner_frame(self.t0)), PRIMARY, PANEL, false);
+        let x = self.canvas.text(x, y, max_x, &format!("{:<9}", view.label), TEXT, PANEL, true);
+        self.canvas.text(x, y, max_x, &view.what, TEXT, PANEL, false);
+        y += 2;
+        // Progress bar: thin line, filled part in the primary color.
+        let frac = if view.total > 0 { (view.done as f64 / view.total as f64).clamp(0.0, 1.0) } else { 0.0 };
+        let pct = format!(" {:>3.0}%", frac * 100.0);
+        let bar_w = inner.saturating_sub(pct.len() as u16) as usize;
+        let filled = (frac * bar_w as f64).round() as usize;
+        let bar: String = "━".repeat(filled);
+        let rest: String = "━".repeat(bar_w - filled);
+        let x = self.canvas.text(x0, y, max_x, &bar, PRIMARY, PANEL, false);
+        let x = self.canvas.text(x, y, max_x, &rest, BORDER_SUBTLE, PANEL, false);
+        self.canvas.text(x, y, max_x, &pct, TEXT, PANEL, false);
+        y += 1;
+        let secs = view.started.elapsed().as_secs_f64();
+        let mut detail = format!("{} / {} tokens", crate::loading::fmt_count(view.done), crate::loading::fmt_count(view.total));
+        if view.done > 0 && secs > 0.5 {
+            let rate = view.done as f64 / secs;
+            detail.push_str(&format!(" · {rate:.0} tok/s"));
+            let left = view.total.saturating_sub(view.done) as f64 / rate;
+            if left >= 1.0 {
+                detail.push_str(&format!(" · {} left", crate::loading::fmt_secs(left)));
+            }
+        } else {
+            detail.push_str(&format!(" · {}", crate::loading::fmt_secs(secs)));
+        }
+        self.canvas.text(x0, y, max_x, &detail, MUTED, PANEL, false);
+        let hint = "processed once per session; replies only process your new message";
+        if cy + card_h + 2 < h - 1 {
+            let hx = w.saturating_sub(hint.chars().count() as u16) / 2;
+            self.canvas.text(hx, cy + card_h + 1, w, hint, MUTED, BG, false);
+        }
+        self.draw_footer(w, h);
+        let _ = self.canvas.flush();
+    }
+
     fn render_home(&mut self, w: u16, h: u16) {
-        // "spin" muted + "dle" bright, like opencode's two-tone wordmark.
-        const GLYPHS: [(char, [&str; 3]); 7] = [
-            ('s', ["█▀▀▀", "▀▀▀█", "▀▀▀▀"]),
-            ('p', ["█▀▀█", "█▀▀▀", "▀   "]),
-            ('i', ["▀█▀", " █ ", "▀▀▀"]),
-            ('n', ["█▀▀▄", "█  █", "▀  ▀"]),
-            ('d', ["█▀▀▄", "█  █", "▀▀▀ "]),
-            ('l', ["█   ", "█   ", "▀▀▀▀"]),
-            ('e', ["█▀▀▀", "█▀▀ ", "▀▀▀▀"]),
-        ];
-        let logo_w: u16 = GLYPHS.iter().map(|(_, g)| g[0].chars().count() as u16 + 1).sum::<u16>() - 1;
         let box_w = w.saturating_sub(4).min(75);
         let (rows, cursor) = self.prompt_rows(box_w.saturating_sub(6) as usize);
         let prompt_h = rows.len() as u16 + 4;
         let block_h = 3 + 2 + prompt_h;
         let top = h.saturating_sub(block_h + 2) / 2;
-        let lx = w.saturating_sub(logo_w) / 2;
-        for row in 0..3 {
-            let mut x = lx;
-            for (i, (_, g)) in GLYPHS.iter().enumerate() {
-                let fg = if i < 4 { MUTED } else { TEXT };
-                x = self.canvas.text(x, top + row, w, g[row as usize], fg, BG, false) + 1;
-            }
-        }
+        self.draw_logo(w, top);
         let bx = w.saturating_sub(box_w) / 2;
         let py = top + 5;
         self.draw_popup(bx, py, box_w);
@@ -1283,12 +1419,7 @@ impl SpindleTui {
             let hx = w.saturating_sub(hint.chars().count() as u16) / 2;
             self.canvas.text(hx, hint_y, w, hint, MUTED, BG, false);
         }
-        // Footer: directory left, version right.
-        let fy = h - 1;
-        let cwd = self.cwd_label();
-        self.canvas.text(2, fy, w.saturating_sub(20), &cwd, MUTED, BG, false);
-        let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
-        self.canvas.text(w.saturating_sub(ver.len() as u16 + 2), fy, w, &ver, MUTED, BG, false);
+        self.draw_footer(w, h);
     }
 
     fn render_session(&mut self, w: u16, h: u16) {
@@ -1632,11 +1763,8 @@ pub fn run_tui(engine: &mut SmolLm2Engine, _governor: Option<&crate::memory_guar
         ..Default::default()
     };
 
-    if engine.n_keep == 0 {
-        tui.render();
-        unsafe { engine.prefill_system() };
-        tui.info.ctx_used = engine.cur_pos;
-    }
+    prefill_with_loading(&mut tui, engine, "Starting the session", &opts.startup);
+    tui.render();
     if let Some(p) = opts.first_prompt.clone() {
         run_turn(&mut tui, engine, &p, agent_opts);
     }
@@ -1664,8 +1792,7 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
     };
     let restart_context = |tui: &mut SpindleTui, engine: &mut SmolLm2Engine| {
         engine.reset_kv();
-        unsafe { engine.prefill_system() };
-        tui.info.ctx_used = engine.cur_pos;
+        prefill_with_loading(tui, engine, "Starting a new conversation", &[]);
     };
     match head.as_str() {
         "/help" | "/?" => {

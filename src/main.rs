@@ -1541,9 +1541,11 @@ fn main() -> Result<()> {
                 }
                 l.step("Engine", "").done(&parts.join(" · "));
             }
-            // Process the system prompt now, while the progress display is up, rather than
-            // as a silent pause before the first reply.
-            if cli.raw.is_none() {
+            // Process the system prompt now, while a progress display is up, rather than as a
+            // silent pause before the first reply. The full-screen UI does this on its own
+            // loading screen; the line-based chat and one-shot prompts do it here.
+            let uses_tui = cli.tui && cli.chat_mode && cli.raw.is_none();
+            if cli.raw.is_none() && !uses_tui {
                 let step = loader.as_ref().map(|l| l.step("Prompt", "processing the system prompt"));
                 let mut total = 0;
                 engine.prefill_system_with(&mut |done, all| {
@@ -1556,8 +1558,11 @@ fn main() -> Result<()> {
                     s.done(&format!("system prompt cached ({} tokens) · context {} tokens", loading::fmt_count(total), loading::fmt_count(engine.max_seq)));
                 }
             }
+            let startup = loader.as_ref().map(|l| l.results()).unwrap_or_default();
             if let Some(l) = loader {
-                l.finish("Ready");
+                if !uses_tui {
+                    l.finish("Ready");
+                }
             }
             let sc = cli.sampler;
             vlog!(
@@ -1581,6 +1586,7 @@ fn main() -> Result<()> {
                 max_tokens: if cli.max_tokens == 32 { 2048 } else { cli.max_tokens },
                 allow_think: cli.think,
                 tui: cli.tui,
+                startup,
             };
             chat_cli::print_header(&engine, &opts);
             chat_cli::run(&mut engine, governor.as_ref(), opts);

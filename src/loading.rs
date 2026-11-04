@@ -34,6 +34,8 @@ pub fn clear_active_line() {
 pub struct Loader {
     animate: bool,
     started: Instant,
+    /// `(label, result)` of every finished phase, for the full-screen UI to show.
+    results: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Loader {
@@ -43,7 +45,7 @@ impl Loader {
         println!();
         println!("  {}  {}", crate::ui::bold(title), crate::ui::dim(subtitle));
         println!();
-        Self { animate, started: Instant::now() }
+        Self { animate, started: Instant::now(), results: Arc::default() }
     }
 
     /// Begins a phase. `detail` is shown next to the spinner until the phase ends.
@@ -64,7 +66,12 @@ impl Loader {
                 }
             })
         });
-        Step { label: label.to_string(), state, stop, ticker, started, finished: false }
+        Step { label: label.to_string(), state, stop, ticker, started, finished: false, results: self.results.clone() }
+    }
+
+    /// The phases finished so far, as `(label, result)`.
+    pub fn results(&self) -> Vec<(String, String)> {
+        self.results.lock().unwrap().clone()
     }
 
     /// Prints the closing line ("Ready in 12.4 s").
@@ -89,6 +96,7 @@ pub struct Step {
     ticker: Option<std::thread::JoinHandle<()>>,
     started: Instant,
     finished: bool,
+    results: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Step {
@@ -102,6 +110,7 @@ impl Step {
     /// Ends the phase with a check mark and `result`.
     pub fn done(mut self, result: &str) {
         self.end();
+        self.results.lock().unwrap().push((self.label.clone(), result.to_string()));
         let secs = self.started.elapsed().as_secs_f64();
         let mark = crate::ui::green("✓");
         println!("  {mark} {}  {}  {}", pad(&self.label), result, crate::ui::dim(&fmt_secs(secs)));

@@ -156,6 +156,8 @@ pub struct ChatOptions {
     pub max_tokens: usize,
     pub allow_think: bool,
     pub tui: bool,
+    /// Startup phases already shown, `(label, result)`, repeated on the TUI loading screen.
+    pub startup: Vec<(String, String)>,
 }
 
 /// One line for the line-based chat (the TUI draws its own header). The model, memory
