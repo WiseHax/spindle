@@ -150,6 +150,7 @@ pub fn has_console_input() -> bool {
 pub struct Canvas {
     pub width: u16,
     pub height: u16,
+    needs_clear: bool,
     grid: Vec<Cell>,
 }
 
@@ -159,6 +160,7 @@ impl Canvas {
         Self {
             width,
             height,
+            needs_clear: false,
             grid: vec![Cell::default(); size],
         }
     }
@@ -169,6 +171,7 @@ impl Canvas {
         }
         self.width = width;
         self.height = height;
+        self.needs_clear = true;
         let size = (width as usize) * (height as usize);
         self.grid = vec![Cell::default(); size];
     }
@@ -245,8 +248,14 @@ impl Canvas {
     /// and zero risk of accidental terminal scrolling.
     pub fn flush(&mut self) -> io::Result<()> {
         let mut buf = String::with_capacity((self.width as usize) * (self.height as usize) * 8);
-        // Home cursor to (1, 1)
-        buf.push_str("\x1b[H");
+        if self.needs_clear {
+            // Screen dimensions changed: clear entire screen to eliminate stale artifacts outside new viewport
+            buf.push_str("\x1b[2J\x1b[H");
+            self.needs_clear = false;
+        } else {
+            // Home cursor to (1, 1)
+            buf.push_str("\x1b[H");
+        }
 
         let mut cur_fg = Rgb(0, 0, 0);
         let mut cur_bg = Rgb(0, 0, 0);
@@ -562,20 +571,24 @@ pub struct InputBuffer {
 
 impl InputBuffer {
     pub fn insert(&mut self, ch: char) {
-        self.text.insert(self.cursor, ch);
+        let byte_pos = self.text.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.text.len());
+        self.text.insert(byte_pos, ch);
         self.cursor += 1;
     }
 
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            self.text.remove(self.cursor);
+            let byte_pos = self.text.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.text.len());
+            self.text.remove(byte_pos);
         }
     }
 
     pub fn delete(&mut self) {
-        if self.cursor < self.text.len() {
-            self.text.remove(self.cursor);
+        let char_count = self.text.chars().count();
+        if self.cursor < char_count {
+            let byte_pos = self.text.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.text.len());
+            self.text.remove(byte_pos);
         }
     }
 
@@ -586,7 +599,7 @@ impl InputBuffer {
     }
 
     pub fn move_right(&mut self) {
-        if self.cursor < self.text.len() {
+        if self.cursor < self.text.chars().count() {
             self.cursor += 1;
         }
     }
@@ -596,7 +609,7 @@ impl InputBuffer {
     }
 
     pub fn move_end(&mut self) {
-        self.cursor = self.text.len();
+        self.cursor = self.text.chars().count();
     }
 
     pub fn clear(&mut self) {
@@ -606,7 +619,7 @@ impl InputBuffer {
 
     pub fn set_text(&mut self, s: &str) {
         self.text = s.to_string();
-        self.cursor = self.text.len();
+        self.cursor = self.text.chars().count();
     }
 }
 
@@ -1561,6 +1574,26 @@ mod tests {
 
         buf.delete();
         assert_eq!(buf.text, "hy");
+
+        // Multi-byte UTF-8 test (ñ is 2 bytes: 0xC3 0xB1)
+        buf.clear();
+        buf.insert('k');
+        buf.insert('u');
+        buf.insert('m');
+        buf.insert('u');
+        buf.insert('s');
+        buf.insert('t');
+        buf.insert('a');
+        assert_eq!(buf.text, "kumusta");
+        assert_eq!(buf.cursor, 7);
+
+        buf.insert('ñ');
+        assert_eq!(buf.text, "kumustañ");
+        assert_eq!(buf.cursor, 8);
+
+        buf.backspace();
+        assert_eq!(buf.text, "kumusta");
+        assert_eq!(buf.cursor, 7);
     }
 
     #[test]
