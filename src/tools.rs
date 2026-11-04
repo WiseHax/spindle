@@ -352,6 +352,12 @@ pub fn truncate_middle(s: &str, max: usize) -> String {
     format!("{}\n\n... [{} bytes omitted] ...\n\n{}", &s[..h], t - h, &s[t..])
 }
 
+/// Guard reasons are lowercase phrases; permission prompts start with a capital.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+}
+
 /// Is `p` inside the current working directory? (Writes elsewhere need confirmation.)
 fn inside_workspace(p: &Path) -> bool {
     let Ok(cwd) = std::env::current_dir() else { return true };
@@ -373,9 +379,9 @@ fn inside_workspace(p: &Path) -> bool {
 
 fn check_write(path: &str, ctx: &mut ToolCtx) -> Result<(), String> {
     match guard::check_path(path, true) {
-        GuardDecision::Block(r) => return Err(format!("blocked by security guard: {r}")),
+        GuardDecision::Block(r) => return Err(format!("refused: {r}")),
         GuardDecision::NeedConfirmation(r) => {
-            if !(ctx.confirm)(&format!("{r}: {path}")) {
+            if !(ctx.confirm)(&format!("{}: {path}", capitalize(&r))) {
                 return Err("the user declined this action".into());
             }
         }
@@ -468,7 +474,7 @@ fn read_file(path: &str, offset: Option<usize>, limit: Option<usize>, max_chars:
         return ToolOutcome::err("→", "Read".into(), "missing 'path'".into());
     }
     if let GuardDecision::Block(r) = guard::check_path(path, false) {
-        return ToolOutcome::err("→", title(first), format!("blocked by security guard: {r}"));
+        return ToolOutcome::err("→", title(first), format!("refused: {r}"));
     }
     let p = Path::new(path);
     if p.is_dir() {
@@ -812,9 +818,9 @@ fn run_command(cmd: &str, timeout_s: usize, ctx: &mut ToolCtx) -> ToolOutcome {
         return ToolOutcome::err("$", title, "missing 'command'".into());
     }
     match guard::check_command(cmd) {
-        GuardDecision::Block(r) => return ToolOutcome::err("$", title, format!("blocked by security guard: {r}")),
+        GuardDecision::Block(r) => return ToolOutcome::err("$", title, format!("refused: {r}")),
         GuardDecision::NeedConfirmation(r) => {
-            if !(ctx.confirm)(&format!("{r}: {cmd}")) {
+            if !(ctx.confirm)(&format!("{}: {cmd}", capitalize(&r))) {
                 return ToolOutcome::err("$", title, "the user declined running this command".into());
             }
         }

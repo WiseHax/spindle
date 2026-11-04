@@ -1,15 +1,20 @@
-//! Spindle Security Guard: Anti-Host Sabotage and Permission Boundary.
+//! Command and path checks for the agent's tools.
 //!
-//! Designed specifically to protect the host user while allowing maximum developer
-//! freedom (especially with abliterated or uncensored local models).
+//! Local models follow instructions from files and web pages as readily as from the user,
+//! so every shell command and file path the model asks for is checked here first:
 //!
-//! Core Principles:
-//! 1. Developer Freedom: Normal dev tasks (cargo, rustc, python, git, npm, file edits)
-//!    run seamlessly without annoying preachy refusals.
-//! 2. Anti-Host Sabotage: Strictly intercepts and blocks commands that attempt to wipe
-//!    the host OS, tamper with boot/recovery records, or hijack user accounts.
-//! 3. Credential Protection: Cloaks sensitive host secrets (SSH keys, SAM hive, crypto wallets).
-//! 4. Human-in-the-Loop Authority: Prompts the user before executing high-impact actions.
+//! - Ordinary development work (cargo, git, python, npm, file edits in the project) runs
+//!   without prompts.
+//! - Commands that can destroy the system or take over accounts are refused outright:
+//!   formatting drives, partitioning, deleting shadow copies, editing the boot
+//!   configuration, creating or elevating users, disabling Defender or the firewall,
+//!   deleting Windows directories, fork bombs.
+//! - SSH private keys and the SAM database can't be read, and system directories can't
+//!   be written.
+//! - Actions that lose work (discarding git changes, writing to Program Files) ask the user.
+//!
+//! This is a guard rail against mistakes and prompt injection, not a sandbox: a determined
+//! command can still get around pattern checks, so keep tools off for untrusted input.
 
 use std::{
     process::Command,
@@ -18,15 +23,15 @@ use std::{
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GuardDecision {
-    /// Safe to execute immediately.
+    /// Run it.
     Allow,
-    /// Potentially impactful; requires user confirmation ([Y/n]).
+    /// Ask the user first (the string says why).
     NeedConfirmation(String),
-    /// Anti-sabotage violation; strictly blocked to protect the host.
+    /// Refuse (the string says why).
     Block(String),
 }
 
-/// Evaluates command strings against anti-sabotage security policies.
+/// Checks a shell command before the agent runs it.
 pub fn check_command(cmd: &str) -> GuardDecision {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -35,61 +40,88 @@ pub fn check_command(cmd: &str) -> GuardDecision {
     let lower = trimmed.to_lowercase();
 
     // 1. HARD BLOCKS: Host Destruction & OS Brick Prevention
-    if lower.contains("format ") || lower.starts_with("format") {
-        return GuardDecision::Block("Drive formatting is blocked to protect host filesystems".into());
+    // The `format` program as a command word, not `--format` or `Format-Table`.
+    if words(&lower).any(|w| matches!(w, "format" | "format.com" | "format.exe")) {
+        return GuardDecision::Block("formatting drives is not allowed".into());
     }
     if lower.contains("diskpart") {
-        return GuardDecision::Block("Diskpart partitioning utility is blocked".into());
+        return GuardDecision::Block("diskpart is not allowed".into());
     }
     if lower.contains("vssadmin") && (lower.contains("delete") || lower.contains("shadow")) {
-        return GuardDecision::Block("Volume shadow copy tampering (ransomware signature) blocked".into());
+        return GuardDecision::Block("deleting or resizing shadow copies is not allowed".into());
     }
     if lower.contains("bcdedit") && (lower.contains("delete") || lower.contains("set")) {
-        return GuardDecision::Block("Windows Boot Configuration tampering blocked".into());
+        return GuardDecision::Block("changing the boot configuration is not allowed".into());
     }
 
     // 2. HARD BLOCKS: Account Hijacking & Backdoor Creation
     if lower.contains("net user") && (lower.contains("/add") || lower.contains("/delete")) {
-        return GuardDecision::Block("Host account creation or modification blocked".into());
+        return GuardDecision::Block("creating or changing user accounts is not allowed".into());
     }
     if lower.contains("net localgroup") && lower.contains("/add") {
-        return GuardDecision::Block("Privilege escalation to administrators blocked".into());
+        return GuardDecision::Block("adding users to Administrators is not allowed".into());
     }
     if lower.contains("disablerealtimemonitoring") || (lower.contains("advfirewall") && lower.contains("off")) {
-        return GuardDecision::Block("Tampering with host antivirus or firewall blocked".into());
+        return GuardDecision::Block("changing antivirus or firewall settings is not allowed".into());
     }
 
     // 3. HARD BLOCKS: Root & OS System Directory Mass Wipes
     if lower.contains("del /s") || lower.contains("del /f /s") || lower.contains("rmdir /s") {
-        if lower.contains("c:\\windows") || lower.contains("c:\\") || lower.contains("%systemroot%") {
-            return GuardDecision::Block("Mass deletion of Windows OS directories blocked".into());
+        if targets_system(&lower) {
+            return GuardDecision::Block("deleting Windows system directories is not allowed".into());
         }
     }
     if lower.contains("rm -rf /") || lower.contains("rm -rf /*") {
-        return GuardDecision::Block("Root filesystem wipe blocked".into());
+        return GuardDecision::Block("wiping the root filesystem is not allowed".into());
     }
 
     // 4. HARD BLOCKS: Fork Bombs & Endless Resource Exhaustion
     if lower.contains("%0|%0") || lower.contains(":(){ :|:& };:") {
-        return GuardDecision::Block("Fork-bomb resource exhaustion payload blocked".into());
+        return GuardDecision::Block("this looks like a fork bomb".into());
     }
 
     // 5. PROMPT CONFIRMATION: Impactful Developer Actions
-    if lower.contains("rmdir /s") || lower.contains("rmdir /q") || lower.contains("del /s") || lower.contains("rm -rf") {
-        return GuardDecision::NeedConfirmation("Recursive directory deletion".into());
+    let ps_recursive = (lower.contains("remove-item") || words(&lower).any(|w| matches!(w, "rm" | "rd" | "del" | "ri" | "rmdir")))
+        && lower.contains("-r");
+    if ps_recursive && targets_system(&lower) {
+        return GuardDecision::Block("deleting Windows system directories is not allowed".into());
+    }
+    if lower.contains("rmdir /s") || lower.contains("rmdir /q") || lower.contains("rd /s") || lower.contains("del /s") || lower.contains("rm -rf") || ps_recursive {
+        return GuardDecision::NeedConfirmation("this deletes a directory recursively".into());
     }
     if lower.contains("git reset --hard") || lower.contains("git clean -f") {
-        return GuardDecision::NeedConfirmation("Uncommitted git changes will be discarded".into());
+        return GuardDecision::NeedConfirmation("this discards uncommitted git changes".into());
     }
     if lower.contains("reg add") || lower.contains("reg delete") {
-        return GuardDecision::NeedConfirmation("Windows Registry modification".into());
+        return GuardDecision::NeedConfirmation("this changes the Windows registry".into());
     }
     if lower.contains("shutdown") || lower.contains("restart-computer") {
-        return GuardDecision::NeedConfirmation("System reboot or shutdown".into());
+        return GuardDecision::NeedConfirmation("this restarts or shuts down the PC".into());
     }
 
     // 6. ALL OTHER DEV COMMANDS ALLOWED (cargo, python, git, rustc, npm, curl, etc.)
     GuardDecision::Allow
+}
+
+/// The command's words, split on whitespace and shell separators.
+fn words(lower: &str) -> impl Iterator<Item = &str> {
+    lower.split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')')).filter(|w| !w.is_empty())
+}
+
+/// True when a command names the Windows directory or the root of a drive (`C:\`, `D:\*`),
+/// as opposed to some folder inside a drive.
+fn targets_system(lower: &str) -> bool {
+    if lower.contains("\\windows") || lower.contains("%systemroot%") || lower.contains("$env:windir") || lower.contains("$env:systemroot") {
+        return true;
+    }
+    let b = lower.as_bytes();
+    (0..b.len().saturating_sub(2)).any(|i| {
+        b[i].is_ascii_alphabetic()
+            && b[i + 1] == b':'
+            && b[i + 2] == b'\\'
+            && (i == 0 || !b[i - 1].is_ascii_alphanumeric())
+            && b.get(i + 3).is_none_or(|&c| matches!(c, b' ' | b'"' | b'\'' | b'*'))
+    })
 }
 
 /// Evaluates file paths against sensitive credential access and system protections.
@@ -98,19 +130,19 @@ pub fn check_path(path_str: &str, is_write: bool) -> GuardDecision {
 
     // Block access to private credentials & identity stores
     if lower.contains(".ssh\\id_") || lower.contains(".ssh/id_") || lower.ends_with("id_rsa") || lower.ends_with("id_ed25519") {
-        return GuardDecision::Block("Host private SSH keys are protected against theft".into());
+        return GuardDecision::Block("SSH private keys are off limits".into());
     }
     if lower.contains("\\system32\\config\\sam") || lower.contains("\\system32\\config\\system") {
-        return GuardDecision::Block("Windows SAM credential database is protected".into());
+        return GuardDecision::Block("the Windows SAM database is off limits".into());
     }
 
     // If writing, block touching critical OS directories
     if is_write {
         if lower.starts_with("c:\\windows") || lower.contains("\\windows\\system32") {
-            return GuardDecision::Block("Writing into Windows System directories is forbidden".into());
+            return GuardDecision::Block("writing to Windows system directories is not allowed".into());
         }
         if lower.starts_with("c:\\program files") || lower.starts_with("c:\\program files (x86)") {
-            return GuardDecision::NeedConfirmation("Writing to system Program Files directory".into());
+            return GuardDecision::NeedConfirmation("this writes to Program Files".into());
         }
     }
 
@@ -197,6 +229,9 @@ mod tests {
         assert_eq!(check_command("git status"), GuardDecision::Allow);
         assert_eq!(check_command("rustc --version"), GuardDecision::Allow);
         assert_eq!(check_command("echo 'Hello World'"), GuardDecision::Allow);
+        assert_eq!(check_command("git log --format=%h -3"), GuardDecision::Allow);
+        assert_eq!(check_command("git log --format %h -3"), GuardDecision::Allow);
+        assert_eq!(check_command("Get-ChildItem | Format-Table Name"), GuardDecision::Allow);
     }
 
     #[test]
@@ -230,6 +265,17 @@ mod tests {
         assert!(matches!(check_command("git reset --hard HEAD~1"), GuardDecision::NeedConfirmation(_)));
         assert!(matches!(check_command("rmdir /s /q temp_build"), GuardDecision::NeedConfirmation(_)));
         assert!(matches!(check_command("reg delete HKLM\\Software\\Test"), GuardDecision::NeedConfirmation(_)));
+        assert!(matches!(check_command("Remove-Item -Recurse -Force .\\build"), GuardDecision::NeedConfirmation(_)));
+        assert!(matches!(check_command("rd /s /q C:\\Users\\me\\proj\\target"), GuardDecision::NeedConfirmation(_)));
+        assert!(matches!(check_command("rmdir /s /q C:\\Users\\me\\old"), GuardDecision::NeedConfirmation(_)));
+    }
+
+    #[test]
+    fn test_recursive_deletes_of_system_locations_blocked() {
+        assert!(matches!(check_command("Remove-Item -Recurse -Force C:\\"), GuardDecision::Block(_)));
+        assert!(matches!(check_command("Remove-Item C:\\Windows\\System32 -Recurse"), GuardDecision::Block(_)));
+        assert!(matches!(check_command("rmdir /s /q D:\\*"), GuardDecision::Block(_)));
+        assert!(matches!(check_command("format D: /q"), GuardDecision::Block(_)));
     }
 }
 
