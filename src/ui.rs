@@ -55,6 +55,26 @@ pub fn accent(s: &str) -> String {
     paint("36", s)
 }
 
+pub fn cyan(s: &str) -> String {
+    paint("36", s)
+}
+
+pub fn magenta(s: &str) -> String {
+    paint("35", s)
+}
+
+pub fn green(s: &str) -> String {
+    paint("32", s)
+}
+
+pub fn bold_accent(s: &str) -> String {
+    paint("1;36", s)
+}
+
+pub fn bold_magenta(s: &str) -> String {
+    paint("1;35", s)
+}
+
 pub fn warn(s: &str) -> String {
     paint("33", s)
 }
