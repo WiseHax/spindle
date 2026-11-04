@@ -7,9 +7,7 @@ peer = "192.168.1.10:42424"
 layer_range = "35..48"
 wire_format = "fp8"
 threads = 4
-moe_prune = 0.03
+moe_prune = 0.05
 tools = true
 think = false
-draft = "qwen3-0.6b-q8_0.gguf"
-draft_len = 3
 

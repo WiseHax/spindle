@@ -956,8 +956,11 @@ impl SpindleTui {
         self.canvas.fill_rect(0, 0, w, 1, ' ', Rgb::WHITE, header_bg);
         self.canvas.print(2, 0, "SPINDLE v0.1.0", Rgb::BRIGHT_BLUE, header_bg, true, false);
 
-        let draft_part = self.draft_name.as_ref().map(|d| format!(" · spec: {d}")).unwrap_or_default();
-        let status = format!("· {} · {}{} · 9.0+ tok/s target", self.model_name, self.layers_info, draft_part);
+        let status = if let Some(d) = &self.draft_name {
+            format!("· {} · {} · spec: {d}", self.model_name, self.layers_info)
+        } else {
+            format!("· {} · {}", self.model_name, self.layers_info)
+        };
         if let Some(p) = &self.cluster_peer {
             let mesh_str = format!("mesh: {p}");
             let mx = w.saturating_sub(mesh_str.len() as u16 + 4);
@@ -1005,6 +1008,19 @@ impl SpindleTui {
                         bold: false,
                         dim: false,
                     });
+                }
+            } else if msg.role == "system" {
+                let sys_max_w = (w.saturating_sub(10)).max(20) as usize;
+                for raw_line in msg.text.lines() {
+                    let wrapped = wrap_text(raw_line, sys_max_w);
+                    for s_line in wrapped {
+                        lines.push(ViewportLine {
+                            text: format!("  {s_line}"),
+                            fg: Rgb::ICE_CYAN,
+                            bold: false,
+                            dim: false,
+                        });
+                    }
                 }
             } else {
                 // Assistant message
@@ -1251,7 +1267,8 @@ pub fn run_tui(
         tui.draft_name = Some(draft.idx.model_name.clone());
     }
 
-    let max_tokens = if opts.max_tokens > 0 { opts.max_tokens.min(engine.max_seq) } else { 2048.min(engine.max_seq) };
+    let mut allow_think = opts.allow_think;
+    let mut max_tokens = if opts.max_tokens > 0 { opts.max_tokens.min(engine.max_seq) } else { 2048.min(engine.max_seq) };
 
     if engine.n_keep == 0 {
         tui.render_warming("Prefilling system prompt and tools across cluster mesh...");
@@ -1262,7 +1279,7 @@ pub fn run_tui(
 
     // If an initial prompt was provided, execute it immediately
     if let Some(first_p) = opts.first_prompt {
-        execute_tui_turn(&mut tui, engine, governor, &first_p, opts.allow_think, max_tokens);
+        execute_tui_turn(&mut tui, engine, governor, &first_p, allow_think, max_tokens);
     }
 
     // Main TUI interactive event loop
@@ -1271,16 +1288,223 @@ pub fn run_tui(
             if user_prompt == "/exit" || user_prompt == "/quit" || user_prompt == "exit" || user_prompt == "quit" {
                 break;
             }
-            if user_prompt == "/clear" {
-                tui.history.clear();
-                tui.scroll_offset = 0;
+            if handle_slash_command(&mut tui, engine, &user_prompt, &mut allow_think, &mut max_tokens) {
                 continue;
             }
-            execute_tui_turn(&mut tui, engine, governor, &user_prompt, opts.allow_think, max_tokens);
+            execute_tui_turn(&mut tui, engine, governor, &user_prompt, allow_think, max_tokens);
         }
     }
 
     drop(guard);
+}
+
+/// Dispatches interactive slash commands within the TUI without sending them as LLM prompts.
+fn handle_slash_command(
+    tui: &mut SpindleTui,
+    engine: &mut crate::smollm_chat::SmolLm2Engine,
+    cmd_line: &str,
+    allow_think: &mut bool,
+    max_tokens: &mut usize,
+) -> bool {
+    let trimmed = cmd_line.trim();
+    if !trimmed.starts_with('/') {
+        return false;
+    }
+
+    tui.push_message("user", trimmed, None);
+    tui.scroll_offset = 0;
+
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "/help" | "/?" => {
+            let help_text = "\
+╭─ Available Slash Commands ─────────────────────────────────────────────╮
+│  /help                       show this command reference               │
+│  /clear                      reset KV-cache & start fresh conversation │
+│  /cluster                    view distributed mesh status & ping RTT   │
+│  /model                      inspect model tensors, layers & RAM       │
+│  /tools [on|off]             toggle agentic tools (files, search, cmd) │
+│  /moe-prune [threshold]      inspect or dynamically tune expert cutoff │
+│  /think [on|off]             toggle reasoning mode                     │
+│  /system [prompt|reset]      inspect or dynamically set system prompt  │
+│  /review                     semantic AI review of uncommitted git diff│
+│  /diff                       view uncommitted git diff of current edits│
+│  /undo                       revert the last file change made by agent │
+│  /bench [n]                  run on-demand speed benchmark (default 32)│
+│  /stats                      view memory residency & KV cache stats    │
+│  /exit                       quit interactive session                  │
+╰────────────────────────────────────────────────────────────────────────╯";
+            tui.push_message("system", help_text, None);
+        }
+        "/clear" | "/reset" => {
+            engine.reset_kv();
+            tui.history.clear();
+            tui.scroll_offset = 0;
+            unsafe {
+                engine.prefill_system();
+            }
+            return true;
+        }
+        "/model" | "/info" => {
+            let mib = engine.raw_bytes.len() >> 20;
+            let c = engine.cfg;
+            let (ws, private, _) = crate::memory_guard::process_counters();
+            let free_ram = crate::mmap_file::available_ram_bytes() >> 20;
+            let info = format!(
+                "Model: {}\nArchitecture: {} (dim: {}, layers: {}/{}, heads: {}/{})\nMemory: {} MiB file · {} MiB resident · {} MiB private · {} MiB free RAM\nKV-Cache: {}/{} tokens ({:.1} MiB allocated)",
+                engine.idx.model_name,
+                engine.idx.architecture, c.dim,
+                engine.layer_range.len(), c.n_layers,
+                c.n_heads, c.n_kv_heads,
+                mib, ws >> 20, private >> 20, free_ram,
+                engine.cur_pos, engine.max_seq,
+                ((engine.k_cache.len() + engine.v_cache.len()) * 2) as f64 / (1024.0 * 1024.0)
+            );
+            tui.push_message("system", &info, None);
+        }
+        "/cluster" | "/nodes" => {
+            if let Some(client) = engine.cluster_client.as_mut() {
+                let rtt = client.ping().unwrap_or(std::time::Duration::from_millis(1));
+                let info = format!(
+                    "Cluster Mesh: ONLINE\nPartition: Worker (layers {}..{}) + Local (layers {}..{}) = {} total layers\nTransport: Wire {:?} · Network Ping RTT: {:.2} ms ({:.1} µs)",
+                    client.worker_range.0, client.worker_range.1,
+                    engine.layer_range.start, engine.layer_range.end,
+                    engine.cfg.n_layers,
+                    client.wire_format,
+                    rtt.as_secs_f64() * 1e3,
+                    rtt.as_secs_f64() * 1e6
+                );
+                tui.push_message("system", &info, None);
+            } else {
+                tui.push_message("system", "Cluster Mesh: standalone (no peer connected)", None);
+            }
+        }
+        "/tools" | "/tools toggle" => {
+            let now = !engine.enable_tools;
+            engine.set_tools_enabled(now);
+            let msg = if now { "Agentic tools: ON (files, web search, shell enabled)" } else { "Agentic tools: OFF (pure chat mode)" };
+            tui.push_message("system", msg, None);
+        }
+        "/tools on" => {
+            engine.set_tools_enabled(true);
+            tui.push_message("system", "Agentic tools: ON (files, web search, shell enabled)", None);
+        }
+        "/tools off" => {
+            engine.set_tools_enabled(false);
+            tui.push_message("system", "Agentic tools: OFF (pure chat mode)", None);
+        }
+        "/think" | "/think toggle" => {
+            *allow_think = !*allow_think;
+            let msg = if *allow_think { "Reasoning mode (<think>): ON" } else { "Reasoning mode (<think>): OFF (fast direct reply)" };
+            tui.push_message("system", msg, None);
+        }
+        "/think on" => {
+            *allow_think = true;
+            tui.push_message("system", "Reasoning mode (<think>): ON", None);
+        }
+        "/think off" => {
+            *allow_think = false;
+            tui.push_message("system", "Reasoning mode (<think>): OFF (fast direct reply)", None);
+        }
+        "/moe-prune" => {
+            let p = engine.moe_prune();
+            let status = if p > 0.0 { format!("active (threshold {p:.3})") } else { "disabled (all 8 experts active)".to_string() };
+            let msg = format!("MoE Pruning Cutoff: {status}\nUse '/moe-prune <threshold>' (e.g. 0.05) to tune");
+            tui.push_message("system", &msg, None);
+        }
+        cmd if cmd.starts_with("/moe-prune ") => {
+            if let Ok(p) = cmd[11..].trim().parse::<f32>() {
+                engine.set_moe_prune(p);
+                tui.prune_val = p;
+                let msg = if p > 0.0 {
+                    format!("Dynamic MoE pruning set to {:.3} ({:.1}% energy cutoff)", p, p * 100.0)
+                } else {
+                    "Dynamic MoE pruning disabled (all 8 experts active)".to_string()
+                };
+                tui.push_message("system", &msg, None);
+            } else {
+                tui.push_message("system", "Usage: /moe-prune <threshold, e.g. 0.05>", None);
+            }
+        }
+        "/review" => {
+            let output = std::process::Command::new("git").args(["diff", "HEAD"]).output();
+            match output {
+                Ok(out) => {
+                    let diff_str = String::from_utf8_lossy(&out.stdout);
+                    let trimmed = diff_str.trim();
+                    if trimmed.is_empty() {
+                        tui.push_message("system", "No uncommitted git changes found to review.", None);
+                    } else {
+                        let max_diff = if trimmed.len() > 8000 { &trimmed[..8000] } else { trimmed };
+                        let prompt = format!(
+                            "Please perform a thorough code review of the following uncommitted git diff:\n\n\
+                            ```diff\n{max_diff}\n```\n\n\
+                            Identify any potential bugs, regressions, performance issues, or architectural improvements."
+                        );
+                        execute_tui_turn(tui, engine, None, &prompt, *allow_think, *max_tokens);
+                        return true;
+                    }
+                }
+                Err(e) => {
+                    tui.push_message("system", &format!("Could not execute git diff: {e}"), None);
+                }
+            }
+        }
+        "/diff" => {
+            let output = std::process::Command::new("git").args(["diff", "--stat"]).output();
+            match output {
+                Ok(out) => {
+                    let stat_str = String::from_utf8_lossy(&out.stdout);
+                    if stat_str.trim().is_empty() {
+                        tui.push_message("system", "Working tree clean. No uncommitted modifications.", None);
+                    } else {
+                        tui.push_message("system", stat_str.trim(), None);
+                    }
+                }
+                Err(e) => {
+                    tui.push_message("system", &format!("Could not run git diff: {e}"), None);
+                }
+            }
+        }
+        "/undo" => {
+            match crate::tools::pop_undo() {
+                Some(Ok(msg)) => tui.push_message("system", &msg, None),
+                Some(Err(e)) => tui.push_message("system", &format!("Undo failed: {e}"), None),
+                None => tui.push_message("system", "No recent file modifications to undo.", None),
+            }
+        }
+        cmd if cmd.starts_with("/bench") => {
+            let n_tokens = if cmd.starts_with("/bench ") {
+                cmd[7..].trim().parse::<usize>().unwrap_or(32).clamp(1, 256)
+            } else {
+                32
+            };
+            tui.push_message("system", &format!("Running on-demand benchmark generating {n_tokens} tokens..."), None);
+            tui.render_chat();
+            let prompt = "Explain in one sentence why systems programming in Rust is reliable and performant.";
+            let (reply, secs, tokens) = unsafe { engine.generate_reply(prompt, n_tokens, false, &mut |_| {}) };
+            let speed = tokens as f64 / secs.max(0.001);
+            let result_msg = format!("Benchmark complete: {:.1} tok/s ({tokens} tokens in {:.2}s)\nSample: \"{}\"", speed, secs, reply.trim());
+            tui.push_message("system", &result_msg, None);
+        }
+        "/stats" => {
+            let (ws, private, _) = crate::memory_guard::process_counters();
+            let free_ram = crate::mmap_file::available_ram_bytes() >> 20;
+            let stats_msg = format!(
+                "Engine Performance & Memory:\n  Resident: {} MiB · Private: {} MiB · Available RAM: {} MiB\n  KV-Cache: {}/{} tokens\n  MoE Tokens Evaluated: {}",
+                ws >> 20, private >> 20, free_ram,
+                engine.cur_pos, engine.max_seq,
+                engine.moe_stats.tokens
+            );
+            tui.push_message("system", &stats_msg, None);
+        }
+        other => {
+            tui.push_message("system", &format!("Unknown command '{other}'. Type /help for available commands."), None);
+        }
+    }
+
+    tui.render_chat();
+    true
 }
 
 /// Executes a conversation turn ASYNCHRONOUSLY on a background worker thread.

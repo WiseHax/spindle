@@ -831,27 +831,6 @@ fn auto_discover_model() -> Option<String> {
     None
 }
 
-fn auto_discover_draft() -> Option<String> {
-    if let Ok(entries) = std::fs::read_dir(".") {
-        let mut drafts: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".gguf") && (name.contains("draft") || name.contains("0.6b")) {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !drafts.is_empty() {
-            drafts.sort();
-            return Some(drafts[0].clone());
-        }
-    }
-    None
-}
-
 fn parse_cli() -> CliConfig {
     let args: Vec<String> = std::env::args().collect();
     let mut cfg = CliConfig {
@@ -1078,14 +1057,6 @@ fn parse_cli() -> CliConfig {
     if (cfg.path == "dummy_weights.bin" || !std::path::Path::new(&cfg.path).exists()) && !cfg.probe {
         if let Some(m) = auto_discover_model() {
             cfg.path = m;
-        }
-    }
-    if !cfg.node_mode && cfg.draft_path.is_none() {
-        if let Some(d) = auto_discover_draft() {
-            cfg.draft_path = Some(d);
-            if cfg.draft_len.is_none() {
-                cfg.draft_len = Some(3);
-            }
         }
     }
     if cfg.path.ends_with(".gguf") && !cfg.node_mode && !cfg.probe && !cfg.chat_mode && !cfg.prompt_given {
