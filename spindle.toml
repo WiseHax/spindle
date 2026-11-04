@@ -1,0 +1,13 @@
+# Spindle All-In-One Agentic Configuration
+# When this file is present, running 'spindle' without arguments automatically
+# connects to the cluster mesh and launches the agentic assistant.
+
+model = "Qwen3-30B-A3B-Q4_K_M.gguf"
+peer = "192.168.1.10:42424"
+layer_range = "35..48"
+wire_format = "fp8"
+threads = 4
+moe_prune = 0.03
+tools = true
+think = false
+

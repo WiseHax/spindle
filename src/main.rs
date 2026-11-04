@@ -15,10 +15,12 @@ mod cluster_net;
 mod expert_cache;
 mod expert_pack;
 mod gguf_loader;
+mod guard;
 mod moe_engine;
 mod q4k_gemv;
 mod rio_mesh;
 mod smollm_chat;
+mod tools;
 mod ui;
 mod worker_pool;
 mod memory_guard;
@@ -748,6 +750,81 @@ struct CliConfig {
     threads: Option<usize>,
     /// `--moe-prune <f32>`: relative expert pruning threshold (e.g. 0.03).
     moe_prune: Option<f32>,
+    /// `--system-prompt <text>`: custom system prompt.
+    system_prompt: Option<String>,
+    /// `--draft-len <n>`: speculative decoding batch length (1..16).
+    draft_len: Option<usize>,
+    /// `--tools`: enables agentic tools (file operations, web search, sandboxed execution).
+    tools: bool,
+}
+
+fn load_config_file(cfg: &mut CliConfig) {
+    let content = match std::fs::read_to_string("spindle.toml") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            let val = v.trim().trim_matches('"').trim_matches('\'');
+            match key {
+                "model" => cfg.path = val.to_string(),
+                "peer" => cfg.peer_addr = val.parse().ok(),
+                "layer_range" => {
+                    let parts: Vec<&str> = if val.contains("..") {
+                        val.split("..").collect()
+                    } else if val.contains('-') {
+                        val.split('-').collect()
+                    } else {
+                        vec![val]
+                    };
+                    if parts.len() == 2 {
+                        if let (Ok(s), Ok(e)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
+                            cfg.layer_range = Some(s..e);
+                        }
+                    }
+                }
+                "wire_format" => match val.to_lowercase().as_str() {
+                    "fp8" => cfg.wire_format = cluster_net::WireFormat::Fp8,
+                    "fp32" => cfg.wire_format = cluster_net::WireFormat::Fp32,
+                    _ => cfg.wire_format = cluster_net::WireFormat::Fp16,
+                },
+                "threads" => cfg.threads = val.parse().ok(),
+                "moe_prune" => cfg.moe_prune = val.parse().ok(),
+                "tools" => cfg.tools = val.parse().unwrap_or(false),
+                "think" => cfg.think = val.parse().unwrap_or(false),
+                "draft" => cfg.draft_path = Some(val.to_string()),
+                "draft_len" => cfg.draft_len = val.parse().ok(),
+                "system_prompt" => cfg.system_prompt = Some(val.to_string()),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn auto_discover_model() -> Option<String> {
+    if let Ok(entries) = std::fs::read_dir(".") {
+        let mut ggufs: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".gguf") && !name.contains("draft") && !name.contains("0.6b") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !ggufs.is_empty() {
+            ggufs.sort();
+            return Some(ggufs[0].clone());
+        }
+    }
+    None
 }
 
 fn parse_cli() -> CliConfig {
@@ -778,7 +855,13 @@ fn parse_cli() -> CliConfig {
         wire_format: cluster_net::WireFormat::Fp16,
         threads: None,
         moe_prune: None,
+        system_prompt: None,
+        draft_len: None,
+        tools: false,
     };
+
+    // Load defaults from spindle.toml if present in current directory
+    load_config_file(&mut cfg);
 
     let mut pos = Vec::new();
     let mut i = 1;
@@ -907,6 +990,18 @@ fn parse_cli() -> CliConfig {
                 cfg.draft_path = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--system-prompt" if i + 1 < args.len() => {
+                cfg.system_prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--draft-len" if i + 1 < args.len() => {
+                cfg.draft_len = args[i + 1].parse().ok();
+                i += 2;
+            }
+            "--tools" => {
+                cfg.tools = true;
+                i += 1;
+            }
             "--think" => {
                 cfg.think = true;
                 i += 1;
@@ -914,6 +1009,25 @@ fn parse_cli() -> CliConfig {
             "chat" => {
                 cfg.chat_mode = true;
                 i += 1;
+            }
+            "--help" | "-h" => {
+                println!("{}", crate::ui::bold("Spindle: Pure-Rust Distributed MoE Inference Engine"));
+                println!("\nUsage:");
+                println!("  spindle chat <model.gguf> [options]         Start interactive chat");
+                println!("  spindle node <model.gguf> [options]         Start worker node server");
+                println!("\nOptions:");
+                println!("  --peer <IP:PORT>             Connect to worker node in cluster");
+                println!("  --bind <IP:PORT>             Bind address for worker node");
+                println!("  --layer-range <start..end>   Partition layers (e.g. 35..48)");
+                println!("  --wire-format <fp8|fp16>     Tensor wire compression (default: fp16)");
+                println!("  --moe-prune <threshold>      Dynamic MoE expert pruning (e.g. 0.03)");
+                println!("  --threads <n>                CPU worker threadpool count");
+                println!("  --system-prompt <prompt>     Custom assistant system prompt");
+                println!("  --draft <draft.gguf>         Speculative decoding draft model");
+                println!("  --draft-len <n>              Speculative draft batch length (1..16)");
+                println!("  --tools                      Enable agentic tools (files, web search, shell)");
+                println!("  --think                      Enable chain-of-thought reasoning");
+                std::process::exit(0);
             }
             other => {
                 pos.push(other.to_string());
@@ -926,6 +1040,15 @@ fn parse_cli() -> CliConfig {
             cfg.path = p.clone();
             break;
         }
+    }
+    if (cfg.path == "dummy_weights.bin" || !std::path::Path::new(&cfg.path).exists()) && !cfg.probe {
+        if let Some(m) = auto_discover_model() {
+            cfg.path = m;
+        }
+    }
+    if cfg.path.ends_with(".gguf") && !cfg.node_mode && !cfg.probe && !cfg.chat_mode && !cfg.prompt_given {
+        cfg.chat_mode = true;
+        cfg.tools = true;
     }
     if let Some(g) = pos.iter().filter(|s| *s != "node" && *s != "chat" && *s != &cfg.path).next().and_then(|s| s.parse().ok()) {
         cfg.create_gib = g;
@@ -1073,7 +1196,7 @@ fn main() -> Result<()> {
                         let rtt = c.ping().unwrap_or(Duration::from_millis(1));
                         println!(
                             "{} Connected to Worker at {} (RTT: {:.2} ms)",
-                            ui::accent("✓"),
+                            ui::accent("[OK]"),
                             peer_sock,
                             rtt.as_secs_f64() * 1000.0
                         );
@@ -1241,6 +1364,15 @@ fn main() -> Result<()> {
             });
             if let Some(p) = cli.moe_prune {
                 engine.set_moe_prune(p);
+            }
+            if let Some(prompt) = &cli.system_prompt {
+                engine.set_system_prompt(prompt);
+            }
+            if let Some(len) = cli.draft_len {
+                engine.set_draft_len(len);
+            }
+            if cli.tools {
+                engine.set_tools_enabled(true);
             }
             engine.set_sampler(cli.sampler);
             let sc = cli.sampler;
