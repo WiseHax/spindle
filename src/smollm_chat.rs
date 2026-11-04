@@ -1101,6 +1101,8 @@ pub struct SmolLm2Engine {
     /// Background prefetch hints, only when the model doesn't fit in RAM. Declared before
     /// `raw_bytes` so it is dropped (and its thread joined) before the file is unmapped.
     prefetcher: Option<Prefetcher>,
+    /// `(offset, len)` of every tensor this node uses, when they fit in RAM (else empty).
+    resident_ranges: Vec<(usize, usize)>,
     /// Reads layers `first..` into private buffers when they don't fit in RAM.
     streamer: Option<crate::layer_stream::LayerStreamer>,
     /// Explicit in-RAM expert cache for streaming MoE weights from disk.
@@ -1301,6 +1303,8 @@ impl SmolLm2Engine {
         let sharded_needed = (file_len as f64 * sharded_ratio) as u64;
         let avail_ram = crate::mmap_file::available_ram_bytes();
         let fits_in_ram = sharded_needed <= avail_ram.saturating_sub(128 * 1024 * 1024);
+        // Filled when this node's share fits in RAM; `warm_weights` reads them in up front.
+        let mut resident_ranges = Vec::new();
         let prefetched = if force_stream {
             false
         } else if fits_in_ram {
@@ -1313,7 +1317,7 @@ impl SmolLm2Engine {
                 ranges.push((lm_head.offset, lm_head.rows * row_bytes(lm_head.dtype, lm_head.cols).unwrap_or(0)));
                 ranges.push((output_norm, c.dim * 4));
             }
-            raw_bytes.prefetch_ranges(&ranges);
+            resident_ranges = ranges;
             true
         } else {
             raw_bytes.prefetch_if_fits()
@@ -1322,7 +1326,7 @@ impl SmolLm2Engine {
             "[model:mmap] {:.1} MiB mapped (sharded {:.1} MiB: {})",
             raw_bytes.len() as f64 / (1024.0 * 1024.0),
             sharded_needed as f64 / (1024.0 * 1024.0),
-            if prefetched { "prefetching into page cache" } else { "paged on demand: larger than available RAM" }
+            if prefetched { "fits in RAM" } else { "paged on demand: larger than available RAM" }
         );
 
         // Preflight: the KV-cache is the one big private allocation. Size it to what's free
@@ -1395,6 +1399,7 @@ impl SmolLm2Engine {
             (dense && tight).then(|| ext.iter().map(|&(s, e, _)| (s, e - s)).collect())
         };
         let mut engine = Self {
+            resident_ranges,
             prefetcher,
             streamer: None,
             expert_cache: None,
@@ -1515,6 +1520,17 @@ impl SmolLm2Engine {
 
     /// Splits matvecs across `n_threads` (the caller is thread 0). `pin(i)` runs on each
     /// helper `i in 1..n_threads` first, e.g. to lock it to a P-core.
+    /// Bytes `warm_weights` would read (0 when the model is streamed from disk).
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_ranges.iter().map(|&(_, n)| n as u64).sum()
+    }
+
+    /// Reads this node's weights into RAM now, so the first reply doesn't wait on the disk.
+    /// Does nothing for a model that is larger than free RAM (it pages in as needed).
+    pub fn warm_weights(&self, threads: usize, progress: &mut dyn FnMut(u64, u64)) -> u64 {
+        self.raw_bytes.warm_ranges(&self.resident_ranges, threads, progress)
+    }
+
     pub fn enable_threads<P: Fn(usize) + Send + Sync + 'static>(&mut self, n_threads: usize, pin: P) {
         self.pool = (n_threads > 1).then(|| WorkerPool::new(n_threads, pin));
         // Wait for every helper to finish pinning so its log lines don't interleave with the reply.
@@ -2694,12 +2710,25 @@ impl SmolLm2Engine {
 
     /// Pre-warms and feeds the system prompt into the KV-cache so initial turns respond instantly.
     pub unsafe fn prefill_system(&mut self) {
+        self.prefill_system_with(&mut |_, _| {});
+    }
+
+    /// `prefill_system`, calling `progress(done, total)` (in tokens) after every chunk.
+    pub unsafe fn prefill_system_with(&mut self, progress: &mut dyn FnMut(usize, usize)) {
         if self.n_keep == 0 {
             let sys = self.encode_system();
             if !sys.is_empty() {
-                self.feed(&sys);
+                let mut done = 0;
+                progress(0, sys.len());
+                for chunk in sys.chunks(128) {
+                    self.feed(chunk);
+                    if let Some(draft) = self.draft_engine.as_mut() {
+                        draft.feed(chunk);
+                    }
+                    done += chunk.len();
+                    progress(done, sys.len());
+                }
                 if let Some(draft) = self.draft_engine.as_mut() {
-                    draft.feed(&sys);
                     draft.n_keep = self.cur_pos;
                 }
                 self.n_keep = self.cur_pos;

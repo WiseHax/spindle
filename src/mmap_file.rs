@@ -111,7 +111,57 @@ impl MappedFile {
             .map(|&(_, len)| len)
             .sum()
     }
+    /// Reads the `(offset, len)` ranges into RAM now instead of on first use, on `threads`
+    /// threads, in 16 MiB chunks (one large read-ahead per chunk, then one byte per page so
+    /// the pages are really resident). `progress(done, total)` runs on the calling thread
+    /// about ten times a second. Returns the number of bytes read.
+    pub fn warm_ranges(&self, ranges: &[(usize, usize)], threads: usize, progress: &mut dyn FnMut(u64, u64)) -> u64 {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        const CHUNK: usize = 16 << 20;
+        const PAGE: usize = 4096;
+        let mut chunks = Vec::new();
+        for &(off, len) in ranges.iter().filter(|&&(off, len)| len > 0 && off + len <= self.len) {
+            let mut o = off;
+            while o < off + len {
+                let n = CHUNK.min(off + len - o);
+                chunks.push((o, n));
+                o += n;
+            }
+        }
+        let total: u64 = chunks.iter().map(|&(_, n)| n as u64).sum();
+        let next = AtomicUsize::new(0);
+        let done = AtomicU64::new(0);
+        let finished = AtomicUsize::new(0);
+        let (base, file_len) = (self.ptr as usize, self.len);
+        let threads = threads.clamp(1, 16).min(chunks.len().max(1));
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                sc.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(off, n)) = chunks.get(i) else { break };
+                        prefetch_raw(base, file_len, &[(off, n)]);
+                        let mut p = off;
+                        while p < off + n {
+                            // SAFETY: `off + n <= len`, inside the live read-only view.
+                            unsafe { std::ptr::read_volatile((base + p) as *const u8) };
+                            p += PAGE;
+                        }
+                        done.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    finished.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+            while finished.load(Ordering::Relaxed) < threads {
+                progress(done.load(Ordering::Relaxed), total);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        progress(total, total);
+        total
+    }
 }
+
 
 fn prefetch_raw(base: usize, file_len: usize, ranges: &[(usize, usize)]) {
     let entries: Vec<WIN32_MEMORY_RANGE_ENTRY> = ranges

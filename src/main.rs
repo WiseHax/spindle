@@ -1114,6 +1114,33 @@ fn parse_cli() -> CliConfig {
     cfg
 }
 
+/// Reads this node's weights into RAM with a progress bar, so the first reply doesn't stall
+/// on the disk. Models larger than free RAM are left to page in as they're used.
+fn load_weights(loader: &loading::Loader, engine: &smollm_chat::SmolLm2Engine) {
+    let total = engine.resident_bytes();
+    if total == 0 {
+        loader.step("Weights", "").done("larger than free RAM: read from disk as needed");
+        return;
+    }
+    let step = loader.step("Weights", &format!("reading {} into RAM", loading::fmt_bytes(total)));
+    let t0 = Instant::now();
+    let read = engine.warm_weights(4, &mut |done, all| {
+        let secs = t0.elapsed().as_secs_f64().max(1e-3);
+        let rate = done as f64 / secs;
+        let mut detail = format!("{} / {}", loading::fmt_bytes(done), loading::fmt_bytes(all));
+        if done > 0 && secs > 0.5 {
+            detail.push_str(&format!(" · {}/s", loading::fmt_bytes(rate as u64)));
+            let left = (all - done) as f64 / rate;
+            if left >= 1.0 {
+                detail.push_str(&format!(" · {} left", loading::fmt_secs(left)));
+            }
+        }
+        step.progress(done, all, detail);
+    });
+    let secs = t0.elapsed().as_secs_f64().max(1e-3);
+    step.done(&format!("{} in RAM · {}/s", loading::fmt_bytes(read), loading::fmt_bytes((read as f64 / secs) as u64)));
+}
+
 // --------------------------------------------------------------------- main
 
 fn main() -> Result<()> {
@@ -1142,6 +1169,17 @@ fn main() -> Result<()> {
         eprintln!("model file not found: {path}");
         std::process::exit(1);
     }
+    // Real models get the startup progress display; the synthetic benchmark keeps its log.
+    let loader = path.ends_with(".gguf").then(|| {
+        loading::Loader::start(
+            &format!("spindle {}", env!("CARGO_PKG_VERSION")),
+            if cli.node_mode { "worker node" } else { "" },
+        )
+    });
+    let model_step = loader.as_ref().map(|l| {
+        let file = std::path::Path::new(path).file_name().map_or(path.into(), |f| f.to_string_lossy().into_owned());
+        l.step("Model", &format!("reading {file}"))
+    });
     ensure_real_gguf_moe_model(path, cli.create_gib, NUM_LAYERS).expect("failed to build GGUF model");
     // Stamp full spec-compliant GGUF v3 header (KV metadata + BPE vocab + 256 named tensor descriptors)
     // if the file does not already have a full GGUF v3 metadata table.
@@ -1171,22 +1209,36 @@ fn main() -> Result<()> {
             if let Some(core) = topo.compute_core(0) {
                 lock_thread_to_core(core, "chat-pcore")?;
             }
-            let mut engine = match cli.layer_range.clone() {
-                Some(range) => match smollm_chat::SmolLm2Engine::load_with_index_sharded(path, gguf_idx, range) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("{}", ui::warn(&format!("could not load {path}: {e}")));
-                        std::process::exit(1);
-                    }
-                },
-                None => match smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("{}", ui::warn(&format!("could not load {path}: {e}")));
-                        std::process::exit(1);
-                    }
-                },
+            let loaded = match cli.layer_range.clone() {
+                Some(range) => smollm_chat::SmolLm2Engine::load_with_index_sharded(path, gguf_idx, range),
+                None => smollm_chat::SmolLm2Engine::load_with_index(path, gguf_idx),
             };
+            let mut engine = match loaded {
+                Ok(e) => e,
+                Err(e) => {
+                    match model_step {
+                        Some(s) => s.fail(&format!("could not load {path}"), Some(&e.to_string())),
+                        None => eprintln!("{}", ui::warn(&format!("could not load {path}: {e}"))),
+                    }
+                    std::process::exit(1);
+                }
+            };
+            if let Some(s) = model_step {
+                let r = &engine.layer_range;
+                let layers = if r.len() == engine.cfg.n_layers {
+                    format!("{} layers", engine.cfg.n_layers)
+                } else {
+                    format!("layers {}..{} of {}", r.start, r.end, engine.cfg.n_layers)
+                };
+                s.done(&format!(
+                    "{} · {} · {layers}",
+                    engine.idx.model_name,
+                    loading::fmt_bytes(engine.raw_bytes.len() as u64)
+                ));
+            }
+            if let Some(l) = loader.as_ref() {
+                load_weights(l, &engine);
+            }
 
             if cli.node_mode {
                 let n_threads = cli.threads.unwrap_or_else(|| {
@@ -1207,34 +1259,31 @@ fn main() -> Result<()> {
                 if let Some(p) = cli.moe_prune {
                     engine.set_moe_prune(p);
                 }
+                if let Some(l) = loader.as_ref() {
+                    l.step("Threads", "").done(&format!("{n_threads} compute threads"));
+                }
 
                 let bind_addr = cli.bind_addr;
                 let listener = match std::net::TcpListener::bind(bind_addr) {
                     Ok(l) => l,
                     Err(e) => {
-                        eprintln!("{}", ui::warn(&format!("failed to bind worker on {bind_addr}: {e}")));
+                        eprintln!("{}", ui::warn(&format!("could not listen on {bind_addr}: {e}")));
                         std::process::exit(1);
                     }
                 };
                 let actual = listener.local_addr().unwrap();
-                println!("{}  {}", ui::bold("spindle"), ui::accent("worker node"));
-                println!(
-                    "{} · Listening on {} · Layers {}..{} ({}/{} layers resident in RAM) · {} compute threads",
-                    engine.idx.model_name,
-                    actual,
-                    engine.layer_range.start,
-                    engine.layer_range.end,
-                    engine.layer_range.len(),
-                    engine.cfg.n_layers,
-                    n_threads,
-                );
-                println!("{}", ui::dim("Waiting for Master connection... (Press Ctrl+C to stop)"));
+                if let Some(l) = loader {
+                    l.finish("Ready");
+                }
+                println!("  Listening on {actual}. Waiting for the client to connect (Ctrl+C to stop).");
+                println!();
                 for stream in listener.incoming() {
                     match stream {
                         Ok(s) => {
                             let _ = cluster_net::serve_worker_connection(&mut engine, s, cli.wire_format);
+                            println!("  Waiting for the next connection.");
                         }
-                        Err(e) => eprintln!("incoming connection error: {e}"),
+                        Err(e) => eprintln!("{}", ui::warn(&format!("incoming connection failed: {e}"))),
                     }
                 }
                 return Ok(());
@@ -1242,33 +1291,41 @@ fn main() -> Result<()> {
 
             if let Some(peer) = cli.peer_addr {
                 let peer_sock = std::net::SocketAddr::V4(peer);
-                println!("Connecting to Spindle Worker at {peer_sock}...");
-                let client = match cluster_net::ClusterClient::connect(
+                let step = loader.as_ref().map(|l| l.step("Worker", &format!("connecting to {peer_sock}")));
+                let connected = cluster_net::ClusterClient::connect(
                     peer_sock,
                     &engine.idx.model_name,
                     engine.cfg.dim,
                     engine.cfg.n_layers,
                     (engine.layer_range.start, engine.layer_range.end),
                     cli.wire_format,
-                ) {
+                );
+                let client = match connected {
                     Ok(mut c) => {
                         let rtt = c.ping().unwrap_or(Duration::from_millis(1));
-                        println!(
-                            "{} Connected to Worker at {} (RTT: {:.2} ms)",
-                            ui::accent("[OK]"),
-                            peer_sock,
-                            rtt.as_secs_f64() * 1000.0
+                        let ms = rtt.as_secs_f64() * 1000.0;
+                        let msg = format!(
+                            "{peer_sock} · layers {}..{} · {} ms round trip",
+                            c.worker_range.0,
+                            c.worker_range.1,
+                            if ms < 10.0 { format!("{ms:.2}") } else { format!("{ms:.0}") }
                         );
-                        println!(
-                            "  Distributed Pipeline: Worker (layers {}..{}) + Local (layers {}..{}) = {} total layers",
-                            c.worker_range.0, c.worker_range.1,
-                            engine.layer_range.start, engine.layer_range.end,
-                            engine.cfg.n_layers
-                        );
+                        match step {
+                            Some(s) => s.done(&msg),
+                            None => println!("connected to worker {msg}"),
+                        }
                         c
                     }
                     Err(e) => {
-                        eprintln!("{}", ui::warn(&format!("failed to connect to worker {peer_sock}: {e}")));
+                        let hint = format!(
+                            "{e}\nStart the worker on the other PC first:\n  spindle node <model.gguf> --bind 0.0.0.0:{} --layer-range 0..{}\nand allow that port through its firewall (Private network).",
+                            peer_sock.port(),
+                            engine.layer_range.start
+                        );
+                        match step {
+                            Some(s) => s.fail(&format!("could not reach the worker at {peer_sock}"), Some(&hint)),
+                            None => eprintln!("{}", ui::warn(&format!("could not reach the worker at {peer_sock}: {e}"))),
+                        }
                         std::process::exit(1);
                     }
                 };
@@ -1339,8 +1396,10 @@ fn main() -> Result<()> {
             if let Some(draft_path) = &cli.draft_path {
                 match smollm_chat::SmolLm2Engine::load(draft_path) {
                     Ok(mut draft) => {
-                        let mib = draft.raw_bytes.len() >> 20;
-                        vlog!("[draft] loaded draft model '{draft_path}' ({mib} MiB) for speculative decoding");
+                        let bytes = draft.warm_weights(4, &mut |_, _| {});
+                        if let Some(l) = loader.as_ref() {
+                            l.step("Draft", "").done(&format!("{} · {}", draft.idx.model_name, loading::fmt_bytes(bytes)));
+                        }
                         draft.set_sampler(cli.sampler);
                         engine.enable_draft(draft);
                     }
@@ -1420,9 +1479,6 @@ fn main() -> Result<()> {
             });
             if let Some(p) = cli.moe_prune {
                 engine.set_moe_prune(p);
-                if engine.cluster_client.is_some() {
-                    println!("  Dynamic MoE Pruning: threshold {p:.3} synchronized across cluster");
-                }
             }
             if let Some(prompt) = &cli.system_prompt {
                 engine.set_system_prompt(prompt);
@@ -1433,13 +1489,42 @@ fn main() -> Result<()> {
             if let Some(on) = cli.speculate {
                 engine.speculate = on;
             }
-            if engine.speculate && engine.draft_engine.is_none() {
-                println!("  Speculative decoding: prompt-lookup drafts, up to {} tokens per verify (exact output)", engine.draft_len);
-            }
             if cli.tools {
                 engine.set_tools_enabled(true);
             }
             engine.set_sampler(cli.sampler);
+            if let Some(l) = loader.as_ref() {
+                let mut parts = vec![format!("{n_threads} compute threads")];
+                if engine.speculate {
+                    parts.push(if engine.draft_engine.is_some() { "draft-model speculation".into() } else { "prompt-lookup speculation".into() });
+                }
+                if engine.is_moe() && engine.moe_prune() > 0.0 {
+                    let p = engine.moe_prune();
+                    parts.push(if p >= 1.0 { format!("top {} experts", p as usize) } else { format!("expert pruning {p}") });
+                }
+                if engine.enable_tools {
+                    parts.push("tools on".into());
+                }
+                l.step("Engine", "").done(&parts.join(" · "));
+            }
+            // Process the system prompt now, while the progress display is up, rather than
+            // as a silent pause before the first reply.
+            if cli.raw.is_none() {
+                let step = loader.as_ref().map(|l| l.step("Prompt", "processing the system prompt"));
+                let mut total = 0;
+                engine.prefill_system_with(&mut |done, all| {
+                    total = all;
+                    if let Some(s) = step.as_ref() {
+                        s.progress(done as u64, all as u64, format!("{} / {} tokens", loading::fmt_count(done), loading::fmt_count(all)));
+                    }
+                });
+                if let Some(s) = step {
+                    s.done(&format!("system prompt cached ({} tokens) · context {} tokens", loading::fmt_count(total), loading::fmt_count(engine.max_seq)));
+                }
+            }
+            if let Some(l) = loader {
+                l.finish("Ready");
+            }
             let sc = cli.sampler;
             vlog!(
                 "[chat] {n_threads} threads, temp={} top_k={} top_p={} min_p={} repeat_penalty={} seed={}",
