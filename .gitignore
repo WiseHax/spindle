@@ -1,4 +1,10 @@
+# Build artifacts
 /target
+*.exe
+*.dll
+*.pdb
+*.old
+*.obj
 
 # Model weights and generated benchmark data: never commit these
 *.gguf
@@ -7,9 +13,23 @@
 *.pack
 *.spindle.pack
 
+# Test artifacts and scratch files
+test_*.txt
+*.tmp
+*.log
+dump.dmp
+
+# Secrets and environment configs
+.env
+.env.*
+*.pem
+*.key
+
 # Editor / OS noise
 .vscode/
 .idea/
 *.swp
 Thumbs.db
 .DS_Store
+__pycache__/
+*.pyc
