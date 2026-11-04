@@ -1256,11 +1256,12 @@ pub fn run_tui(
 
     let peer_str = engine.cluster_client.as_ref().and_then(|c| c.stream.peer_addr().ok().map(|a| a.to_string()));
     let layers_str = format!("layers {}..{}", engine.layer_range.start, engine.layer_range.end);
+    let prune_val = engine.moe_prune();
     let mut tui = SpindleTui::new(
         &engine.idx.model_name,
         peer_str.as_deref(),
         "fp8",
-        0.03,
+        prune_val,
         &layers_str,
     );
     if let Some(draft) = &engine.draft_engine {

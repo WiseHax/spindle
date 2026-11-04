@@ -347,14 +347,23 @@ fn silu(x: f32) -> f32 {
 /// SwiGLU block. `out` has `ffn.down.rows` entries.
 unsafe fn ffn_forward(pool: Option<&WorkerPool>, base: *const u8, f: &Ffn, x: &[f32], out: &mut [f32]) {
     let n_ff = f.gate.rows;
-    let mut g = vec![0.0f32; n_ff];
-    let mut u = vec![0.0f32; n_ff];
-    matvec(pool, base, &f.gate, x, &mut g);
-    matvec(pool, base, &f.up, x, &mut u);
+    let mut stack_g = [0.0f32; 4096];
+    let mut stack_u = [0.0f32; 4096];
+    let mut heap_g;
+    let mut heap_u;
+    let (g, u): (&mut [f32], &mut [f32]) = if n_ff <= 4096 {
+        (&mut stack_g[..n_ff], &mut stack_u[..n_ff])
+    } else {
+        heap_g = vec![0.0f32; n_ff];
+        heap_u = vec![0.0f32; n_ff];
+        (&mut heap_g[..], &mut heap_u[..])
+    };
+    matvec(pool, base, &f.gate, x, g);
+    matvec(pool, base, &f.up, x, u);
     for i in 0..n_ff {
         g[i] = silu(g[i]) * u[i];
     }
-    matvec(pool, base, &f.down, &g, out);
+    matvec(pool, base, &f.down, g, out);
 }
 
 /// Detailed timing breakdown of MoE operations for a turn.
