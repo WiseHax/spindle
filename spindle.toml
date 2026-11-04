@@ -11,3 +11,6 @@ moe_prune = 4
 tools = true
 think = false
 
+speculate = true
+draft_len = 4
+ctx = 8192

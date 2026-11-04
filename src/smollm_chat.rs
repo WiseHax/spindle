@@ -1327,11 +1327,11 @@ impl SmolLm2Engine {
 
         // Preflight: the KV-cache is the one big private allocation. Size it to what's free
         // (a quarter of available RAM at most) instead of letting a failed allocation abort
-        // the process. 2048 positions is the default.
+        // the process. 4096 positions is the default (`ctx` / `--ctx` / `$CHAT_CTX`).
         let wanted = std::env::var("CHAT_CTX")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2048)
+            .unwrap_or(4096)
             .clamp(64, c.ctx_len);
         let per_pos = 2 * n_local_layers * c.kv_dim * 2;
         let scratch = c.vocab * 8 + 64 * 1024 * 1024;

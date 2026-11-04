@@ -782,6 +782,11 @@ struct CliConfig {
     system_prompt: Option<String>,
     /// `--draft-len <n>`: speculative decoding batch length (1..16).
     draft_len: Option<usize>,
+    /// `--no-spec` / `speculate = false`: disable prompt-lookup speculative decoding.
+    speculate: Option<bool>,
+    /// `--ctx <n>` / `ctx = n`: KV-cache context length (still capped by free RAM). On a
+    /// cluster set it on BOTH nodes: the master uses the smaller of the two.
+    ctx: Option<usize>,
     /// `--tools`: enables agentic tools (file operations, web search, sandboxed execution).
     tools: bool,
     /// `--tui`: launches the full-screen OpenCode-style TUI interface.
@@ -830,6 +835,8 @@ fn load_config_file(cfg: &mut CliConfig) {
                 "think" => cfg.think = val.parse().unwrap_or(false),
                 "draft" => cfg.draft_path = Some(val.to_string()),
                 "draft_len" => cfg.draft_len = val.parse().ok(),
+                "speculate" => cfg.speculate = val.parse().ok(),
+                "ctx" | "context" => cfg.ctx = val.parse().ok(),
                 "system_prompt" => cfg.system_prompt = Some(val.to_string()),
                 _ => {}
             }
@@ -888,6 +895,8 @@ fn parse_cli() -> CliConfig {
         moe_prune: None,
         system_prompt: None,
         draft_len: None,
+        speculate: None,
+        ctx: None,
         tools: false,
         tui: true,
     };
@@ -1030,6 +1039,14 @@ fn parse_cli() -> CliConfig {
                 cfg.draft_len = args[i + 1].parse().ok();
                 i += 2;
             }
+            "--no-spec" => {
+                cfg.speculate = Some(false);
+                i += 1;
+            }
+            "--ctx" if i + 1 < args.len() => {
+                cfg.ctx = args[i + 1].parse().ok();
+                i += 2;
+            }
             "--tools" => {
                 cfg.tools = true;
                 i += 1;
@@ -1065,6 +1082,8 @@ fn parse_cli() -> CliConfig {
                 println!("  --system-prompt <prompt>     Custom assistant system prompt");
                 println!("  --draft <draft.gguf>         Speculative decoding draft model");
                 println!("  --draft-len <n>              Speculative draft batch length (1..16)");
+                println!("  --no-spec                    Disable prompt-lookup speculative decoding");
+                println!("  --ctx <n>                    Context length in tokens (default 4096, capped by free RAM)");
                 println!("  --tools                      Enable agentic tools (files, web search, shell)");
                 println!("  --think                      Enable chain-of-thought reasoning");
                 std::process::exit(0);
@@ -1104,6 +1123,10 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     let cli = parse_cli();
+    if let Some(n) = cli.ctx {
+        // Read by the engine when it sizes the KV-cache (before any worker threads exist).
+        std::env::set_var("CHAT_CTX", n.to_string());
+    }
     let path = cli.path.as_str();
     // Chat is quiet unless asked; the synthetic benchmark keeps its full log.
     ui::init(cli.verbose || !path.ends_with(".gguf"));
@@ -1407,6 +1430,12 @@ fn main() -> Result<()> {
             }
             if let Some(len) = cli.draft_len {
                 engine.set_draft_len(len);
+            }
+            if let Some(on) = cli.speculate {
+                engine.speculate = on;
+            }
+            if engine.speculate && engine.draft_engine.is_none() {
+                println!("  Speculative decoding: prompt-lookup drafts, up to {} tokens per verify (exact output)", engine.draft_len);
             }
             if cli.tools {
                 engine.set_tools_enabled(true);
