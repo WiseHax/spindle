@@ -11,6 +11,7 @@ use windows::Win32::System::Console::{
     CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
     ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    GetNumberOfConsoleInputEvents,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,6 +130,19 @@ pub fn terminal_size() -> (u16, u16) {
         }
     }
     (100, 30)
+}
+
+/// Query Windows console subsystem if there are pending input events.
+pub fn has_console_input() -> bool {
+    unsafe {
+        if let Ok(handle) = GetStdHandle(STD_INPUT_HANDLE) {
+            let mut count = 0u32;
+            if GetNumberOfConsoleInputEvents(handle, &mut count).is_ok() {
+                return count > 0;
+            }
+        }
+    }
+    false
 }
 
 /// High-performance 2D frame buffer with atomic full-screen sync.
@@ -335,11 +349,36 @@ pub enum KeyAction {
     None,
 }
 
-/// Non-blocking raw keyboard and mouse reader using ANSI/VT and SGR 1006 parser.
-pub fn read_key_nonblocking() -> KeyAction {
-    let mut stdin = io::stdin();
-    let mut byte = [0u8; 1];
+/// Dedicated asynchronous background input reader thread.
+/// Completely prevents any blocking calls on the main UI thread!
+pub struct InputReader {
+    rx: std::sync::mpsc::Receiver<KeyAction>,
+}
 
+impl InputReader {
+    pub fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdin = io::stdin();
+            loop {
+                let action = read_one_key_blocking(&mut stdin);
+                if tx.send(action).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { rx }
+    }
+
+    #[inline]
+    pub fn poll(&self) -> KeyAction {
+        self.rx.try_recv().unwrap_or(KeyAction::None)
+    }
+}
+
+/// Blocks on the background input thread until a raw byte arrives, then parses ANSI/VT escape sequences.
+fn read_one_key_blocking(stdin: &mut io::Stdin) -> KeyAction {
+    let mut byte = [0u8; 1];
     if stdin.read(&mut byte).unwrap_or(0) == 0 {
         return KeyAction::None;
     }
@@ -351,6 +390,14 @@ pub fn read_key_nonblocking() -> KeyAction {
         9 => KeyAction::Tab,
         16 => KeyAction::CtrlP,
         27 => {
+            // Check if further escape sequence bytes are available
+            if !has_console_input() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if !has_console_input() {
+                return KeyAction::Escape;
+            }
+
             let mut seq = [0u8; 2];
             if stdin.read(&mut seq[0..1]).unwrap_or(0) == 1 {
                 if seq[0] == b'[' {
@@ -607,6 +654,7 @@ pub struct SpindleTui {
     pub prune_val: f32,
     pub layers_info: String,
     pub git_branch: String,
+    input_reader: InputReader,
 }
 
 impl SpindleTui {
@@ -633,7 +681,13 @@ impl SpindleTui {
             prune_val,
             layers_info: layers_info.to_string(),
             git_branch: branch,
+            input_reader: InputReader::new(),
         }
+    }
+
+    #[inline]
+    pub fn poll_key(&self) -> KeyAction {
+        self.input_reader.poll()
     }
 
     fn detect_git_branch() -> Option<String> {
@@ -964,7 +1018,13 @@ impl SpindleTui {
                 self.render_chat();
             }
 
-            match read_key_nonblocking() {
+            let mut action = self.poll_key();
+            while action == KeyAction::None {
+                std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS idle
+                action = self.poll_key();
+            }
+
+            match action {
                 KeyAction::Char(c) => self.input.insert(c),
                 KeyAction::Backspace => self.input.backspace(),
                 KeyAction::Delete => self.input.delete(),
@@ -1039,9 +1099,6 @@ impl SpindleTui {
                     self.running = false;
                     return None;
                 }
-                KeyAction::None => {
-                    std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS idle
-                }
                 _ => {}
             }
         }
@@ -1109,8 +1166,9 @@ pub fn run_tui(
 }
 
 /// Executes a conversation turn ASYNCHRONOUSLY on a background worker thread.
-/// The UI thread remains fully interactive at 60 FPS: the user can scroll with mouse wheel,
-/// review history with arrow keys, type their next draft into the input card, and cancel with Escape!
+/// The UI thread remains fully interactive at 60 FPS: live tokens update continuously without
+/// needing user input, while the user can scroll with mouse wheel, review history with arrow keys,
+/// type their next draft into the input card, or cancel with Escape!
 fn execute_tui_turn(
     tui: &mut SpindleTui,
     engine: &mut crate::smollm_chat::SmolLm2Engine,
@@ -1243,13 +1301,15 @@ fn execute_tui_turn(
             }
         });
 
-        // Main UI Thread: 60 FPS Event Loop during streaming
+        // Main UI Thread: 60 FPS non-blocking Event Loop during live streaming
         let mut stream_buffer = String::new();
         let mut is_generating = true;
         let mut last_render = std::time::Instant::now();
 
         while is_generating {
-            // Drain incoming worker events
+            let mut updated = false;
+
+            // 1. Drain all pending incoming worker events (live streaming tokens)
             while let Ok(event) = rx.try_recv() {
                 match event {
                     WorkerEvent::Token(piece) => {
@@ -1259,6 +1319,7 @@ fn execute_tui_turn(
                                 last_msg.text = stream_buffer.clone();
                             }
                         }
+                        updated = true;
                     }
                     WorkerEvent::ToolStart(summary) => {
                         if let Some(last_msg) = tui.history.last_mut() {
@@ -1269,6 +1330,7 @@ fn execute_tui_turn(
                         tui.push_message("tool", &summary, None);
                         tui.push_message("assistant", "Thinking...", None);
                         stream_buffer.clear();
+                        updated = true;
                     }
                     WorkerEvent::Done { reply, speed_badge } => {
                         if let Some(last_msg) = tui.history.last_mut() {
@@ -1280,6 +1342,7 @@ fn execute_tui_turn(
                             }
                         }
                         is_generating = false;
+                        updated = true;
                     }
                     WorkerEvent::Stopped => {
                         if let Some(last_msg) = tui.history.last_mut() {
@@ -1293,36 +1356,64 @@ fn execute_tui_turn(
                             }
                         }
                         is_generating = false;
+                        updated = true;
                     }
                 }
             }
 
-            // Non-blocking user keyboard & mouse input handling while streaming!
-            match read_key_nonblocking() {
-                KeyAction::Char(c) => tui.input.insert(c),
-                KeyAction::Backspace => tui.input.backspace(),
-                KeyAction::Delete => tui.input.delete(),
-                KeyAction::Left => tui.input.move_left(),
-                KeyAction::Right => tui.input.move_right(),
-                KeyAction::Home => tui.input.move_home(),
-                KeyAction::End => tui.input.move_end(),
+            // 2. Non-blocking user keyboard & mouse input handling while streaming!
+            match tui.poll_key() {
+                KeyAction::Char(c) => {
+                    tui.input.insert(c);
+                    updated = true;
+                }
+                KeyAction::Backspace => {
+                    tui.input.backspace();
+                    updated = true;
+                }
+                KeyAction::Delete => {
+                    tui.input.delete();
+                    updated = true;
+                }
+                KeyAction::Left => {
+                    tui.input.move_left();
+                    updated = true;
+                }
+                KeyAction::Right => {
+                    tui.input.move_right();
+                    updated = true;
+                }
+                KeyAction::Home => {
+                    tui.input.move_home();
+                    updated = true;
+                }
+                KeyAction::End => {
+                    tui.input.move_end();
+                    updated = true;
+                }
                 KeyAction::ScrollUp(n) => {
                     tui.scroll_offset = tui.scroll_offset.saturating_add(n);
+                    updated = true;
                 }
                 KeyAction::ScrollDown(n) => {
                     tui.scroll_offset = tui.scroll_offset.saturating_sub(n);
+                    updated = true;
                 }
                 KeyAction::PageUp => {
                     tui.scroll_offset = tui.scroll_offset.saturating_add(6);
+                    updated = true;
                 }
                 KeyAction::PageDown => {
                     tui.scroll_offset = tui.scroll_offset.saturating_sub(6);
+                    updated = true;
                 }
                 KeyAction::Up => {
                     tui.scroll_offset = tui.scroll_offset.saturating_add(2);
+                    updated = true;
                 }
                 KeyAction::Down => {
                     tui.scroll_offset = tui.scroll_offset.saturating_sub(2);
+                    updated = true;
                 }
                 KeyAction::Escape => {
                     abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1336,12 +1427,13 @@ fn execute_tui_turn(
                 _ => {}
             }
 
-            if last_render.elapsed().as_millis() >= 25 {
+            // 3. Render frame if updated or throttled to ~28-30 FPS
+            if updated || last_render.elapsed().as_millis() >= 35 {
                 tui.render_chat();
                 last_render = std::time::Instant::now();
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(8));
             }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     });
 
