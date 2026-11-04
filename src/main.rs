@@ -29,6 +29,7 @@ mod layer_stream;
 mod mmap_file;
 mod probe;
 mod quant;
+mod quant_multi;
 mod transformer;
 
 use std::{
