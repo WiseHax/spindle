@@ -16,6 +16,7 @@ mod expert_cache;
 mod expert_pack;
 mod gguf_loader;
 mod guard;
+mod json;
 mod moe_engine;
 mod q4k_gemv;
 mod rio_mesh;
