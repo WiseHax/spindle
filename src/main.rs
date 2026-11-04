@@ -124,6 +124,16 @@ struct HybridTopology {
     p_logical_count: usize,
     e_logical_count: usize,
     distinct_p_cores: usize,
+    /// One logical CPU per physical performance core, core 0 LAST (Windows routes most
+    /// interrupts there). Compute thread `i` is pinned to `compute_cores[i]`; threads beyond
+    /// the core count float, so `--threads` can never index past the topology.
+    compute_cores: Vec<LogicalCpu>,
+}
+
+impl HybridTopology {
+    fn compute_core(&self, i: usize) -> Option<LogicalCpu> {
+        self.compute_cores.get(i).copied()
+    }
 }
 
 /// Discovers both Performance Cores (`EfficiencyClass == 1`) and Efficiency Cores
@@ -197,6 +207,11 @@ unsafe fn detect_hybrid_topology() -> Result<HybridTopology> {
         *distinct_p.get(3).unwrap_or(&producer_pcore),
     ];
     let drafter_ecore = e_cpus.first().copied().unwrap_or(producer_pcore);
+    let mut compute_cores = distinct_p.clone();
+    compute_cores.sort_by_key(|c| c.core_idx);
+    if compute_cores.len() > 1 {
+        compute_cores.rotate_left(1);
+    }
 
     Ok(HybridTopology {
         producer_pcore,
@@ -207,6 +222,7 @@ unsafe fn detect_hybrid_topology() -> Result<HybridTopology> {
         p_logical_count: p_cpus.len(),
         e_logical_count: e_cpus.len(),
         distinct_p_cores: distinct_p.len(),
+        compute_cores,
     })
 }
 
@@ -253,7 +269,9 @@ unsafe fn lock_thread_to_core(target: LogicalCpu, role: &str) -> Result<()> {
 pub fn pin_current_thread_to_pcore() {
     unsafe {
         if let Ok(topo) = detect_hybrid_topology() {
-            let _ = lock_thread_to_core(topo.worker_pcores[0], "tui-worker");
+            if let Some(core) = topo.compute_core(0) {
+                let _ = lock_thread_to_core(core, "tui-worker");
+            }
         }
     }
 }
@@ -1128,7 +1146,9 @@ fn main() -> Result<()> {
         if gguf_idx.tensor_by_name.contains_key("token_embd.weight")
             && gguf_idx.tensor_by_name.contains_key("blk.0.attn_q.weight")
         {
-            lock_thread_to_core(topo.worker_pcores[0], "chat-pcore")?;
+            if let Some(core) = topo.compute_core(0) {
+                lock_thread_to_core(core, "chat-pcore")?;
+            }
             let mut engine = match cli.layer_range.clone() {
                 Some(range) => match smollm_chat::SmolLm2Engine::load_with_index_sharded(path, gguf_idx, range) {
                     Ok(e) => e,
@@ -1156,15 +1176,10 @@ fn main() -> Result<()> {
                         })
                 })
                 .clamp(1, 32);
-                let chat_cores = [
-                    topo.worker_pcores[0],
-                    topo.worker_pcores[1],
-                    topo.worker_pcores[2],
-                    topo.producer_pcore,
-                ];
+                let cores = topo.clone();
                 engine.enable_threads(n_threads, move |i| {
-                    if i < chat_cores.len() {
-                        let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
+                    if let Some(core) = cores.compute_core(i) {
+                        let _ = lock_thread_to_core(core, &format!("matvec-{i}"));
                     }
                 });
                 if let Some(p) = cli.moe_prune {
@@ -1366,23 +1381,20 @@ fn main() -> Result<()> {
                 }
                 None => {}
             }
-            // One thread per physical P-core: main on worker_pcores[0], helpers on the rest.
-            // Override with `$env:CHAT_THREADS = "1"` to benchmark single-threaded.
-            let chat_cores = [
-                topo.worker_pcores[0],
-                topo.worker_pcores[1],
-                topo.worker_pcores[2],
-                topo.producer_pcore,
-            ];
+            // One thread per physical P-core (main on compute_cores[0], helpers on the rest).
+            // Override with `--threads N` or `$env:CHAT_THREADS = "1"`.
             let n_threads = cli.threads.unwrap_or_else(|| {
                 std::env::var("CHAT_THREADS")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(chat_cores.len())
+                    .unwrap_or(topo.compute_cores.len().max(1))
             })
             .clamp(1, 32);
+            let cores = topo.clone();
             engine.enable_threads(n_threads, move |i| {
-                let _ = lock_thread_to_core(chat_cores[i], &format!("matvec-{i}"));
+                if let Some(core) = cores.compute_core(i) {
+                    let _ = lock_thread_to_core(core, &format!("matvec-{i}"));
+                }
             });
             if let Some(p) = cli.moe_prune {
                 engine.set_moe_prune(p);
