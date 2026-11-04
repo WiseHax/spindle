@@ -1989,4 +1989,37 @@ mod tests {
         }).collect();
         assert_eq!(text, "hello world");
     }
+
+    #[test]
+    fn test_slash_command_dispatch() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut engine = crate::smollm_chat::SmolLm2Engine::load(path).expect("load");
+        let mut tui = SpindleTui::new("smollm2", None, "fp8", 0.03, "layers 0..30");
+        let mut allow_think = false;
+        let mut max_tokens = 64;
+
+        // Non-command should return false so it passes to LLM inference
+        assert!(!handle_slash_command(&mut tui, &mut engine, "hi how are you", &mut allow_think, &mut max_tokens));
+
+        // /help command should be intercepted and output system reference table
+        assert!(handle_slash_command(&mut tui, &mut engine, "/help", &mut allow_think, &mut max_tokens));
+        assert!(tui.history.iter().any(|m| m.role == "system" && m.text.contains("Available Slash Commands")));
+
+        // /think toggle
+        assert!(handle_slash_command(&mut tui, &mut engine, "/think on", &mut allow_think, &mut max_tokens));
+        assert!(allow_think);
+        assert!(handle_slash_command(&mut tui, &mut engine, "/think off", &mut allow_think, &mut max_tokens));
+        assert!(!allow_think);
+
+        // /tools toggle
+        assert!(handle_slash_command(&mut tui, &mut engine, "/tools on", &mut allow_think, &mut max_tokens));
+        assert!(engine.enable_tools);
+
+        // /stats
+        assert!(handle_slash_command(&mut tui, &mut engine, "/stats", &mut allow_think, &mut max_tokens));
+        assert!(tui.history.iter().any(|m| m.role == "system" && m.text.contains("Engine Performance")));
+    }
 }
