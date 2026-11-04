@@ -28,6 +28,7 @@ mod ui;
 mod worker_pool;
 mod memory_guard;
 mod layer_stream;
+mod loading;
 mod mmap_file;
 mod probe;
 mod quant;

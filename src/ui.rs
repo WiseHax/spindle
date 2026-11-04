@@ -79,8 +79,13 @@ pub fn warn(s: &str) -> String {
     paint("33", s)
 }
 
+pub fn red(s: &str) -> String {
+    paint("31", s)
+}
+
 /// Something the user should know even without `--verbose` (low memory, fallbacks).
 pub fn note(msg: &str) {
+    crate::loading::clear_active_line();
     eprintln!("{}", warn(msg));
 }
 
