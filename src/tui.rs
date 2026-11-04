@@ -1,7 +1,8 @@
 //! OpenCode-grade Full-Screen Terminal User Interface (TUI) for Spindle.
 //!
 //! Provides an alternate screen canvas, 24-bit TrueColor atomic frame rendering,
-//! floating elevated card layout, chronological conversation view, and an electric blue theme.
+//! floating elevated card layout, responsive word-wrapping, live incremental token streaming,
+//! scroll history (PgUp/PgDn), prompt history (Up/Down), and an electric blue theme.
 
 use std::io::{self, Read, Write};
 use windows::Win32::System::Console::{
@@ -84,8 +85,8 @@ impl TerminalGuard {
             let _ = SetConsoleMode(in_handle, CONSOLE_MODE(new_in));
 
             let mut stdout = io::stdout();
-            // Enter alternate screen buffer and hide hardware cursor
-            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l");
+            // Enter alternate screen buffer (\x1b[?1049h), hide cursor (\x1b[?25l), disable auto-wrap (\x1b[?7l)
+            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?7l");
             let _ = stdout.flush();
 
             Ok(Self {
@@ -102,8 +103,8 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         unsafe {
             let mut stdout = io::stdout();
-            // Show cursor and exit alternate screen buffer
-            let _ = write!(stdout, "\x1b[?25h\x1b[?1049l\x1b[0m");
+            // Enable auto-wrap (\x1b[?7h), show cursor (\x1b[?25h), exit alternate screen buffer (\x1b[?1049l), reset styles
+            let _ = write!(stdout, "\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
             let _ = stdout.flush();
 
             let _ = SetConsoleMode(self.out_handle, self.orig_out_mode);
@@ -199,33 +200,31 @@ impl Canvas {
         }
     }
 
-    /// Renders an OpenCode-style floating card in dark blue tones.
+    /// Renders an OpenCode-style floating card with an electric blue left accent strip.
     pub fn draw_card(&mut self, x: u16, y: u16, w: u16, h: u16, bg: Rgb, accent_bar: Rgb) {
-        // Fill card background
+        // 1. Fill card interior surface
         self.fill_rect(x, y, w, h, ' ', Rgb::WHITE, bg);
 
-        // Draw subtle border around card
-        let border_fg = Rgb::CARD_BORDER;
-        for col in x..x + w {
-            self.set(col, y, '─', border_fg, bg, false, false);
-            self.set(col, y + h - 1, '─', border_fg, bg, false, false);
-        }
+        // 2. Left prominent accent bar (`▌`) running full height of the card
         for row in y..y + h {
-            self.set(x, row, '│', border_fg, bg, false, false);
-            self.set(x + w - 1, row, '│', border_fg, bg, false, false);
-        }
-        self.set(x, y, '╭', border_fg, bg, false, false);
-        self.set(x + w - 1, y, '╮', border_fg, bg, false, false);
-        self.set(x, y + h - 1, '╰', border_fg, bg, false, false);
-        self.set(x + w - 1, y + h - 1, '╯', border_fg, bg, false, false);
-
-        // Left prominent accent bar (`▌`) in electric blue
-        for row in (y + 1)..(y + h - 1) {
             self.set(x, row, '▌', accent_bar, bg, true, false);
         }
+
+        // 3. Subtle borders on top, bottom, and right for refined elevation
+        let border_fg = Rgb::CARD_BORDER;
+        for col in (x + 1)..(x + w.saturating_sub(1)) {
+            self.set(col, y, '─', border_fg, bg, false, false);
+            self.set(col, y + h.saturating_sub(1), '─', border_fg, bg, false, false);
+        }
+        for row in (y + 1)..(y + h.saturating_sub(1)) {
+            self.set(x + w.saturating_sub(1), row, '│', border_fg, bg, false, false);
+        }
+        self.set(x + w.saturating_sub(1), y, '╮', border_fg, bg, false, false);
+        self.set(x + w.saturating_sub(1), y + h.saturating_sub(1), '╯', border_fg, bg, false, false);
     }
 
-    /// Atomic frame flush: emits the whole screen in one buffer write with zero artifacts.
+    /// Atomic frame flush: emits the screen with zero flickering, no trailing space overhead,
+    /// and zero risk of accidental terminal scrolling.
     pub fn flush(&mut self) -> io::Result<()> {
         let mut buf = String::with_capacity((self.width as usize) * (self.height as usize) * 8);
         // Home cursor to (1, 1)
@@ -238,7 +237,18 @@ impl Canvas {
         let mut in_escape = false;
 
         for y in 0..self.height {
-            for x in 0..self.width {
+            // Find rightmost cell on this row that isn't a blank BG_DARK space
+            let mut last_col = 0;
+            for x in (0..self.width).rev() {
+                let idx = (y as usize) * (self.width as usize) + (x as usize);
+                let cell = self.grid[idx];
+                if cell.ch != ' ' || cell.bg != Rgb::BG_DARK {
+                    last_col = x + 1;
+                    break;
+                }
+            }
+
+            for x in 0..last_col {
                 let idx = (y as usize) * (self.width as usize) + (x as usize);
                 let cell = self.grid[idx];
 
@@ -262,12 +272,18 @@ impl Canvas {
                 }
                 buf.push(cell.ch);
             }
-            // Reset color at end of row and clear to end of line
-            buf.push_str("\x1b[0m\x1b[K");
-            if y + 1 < self.height {
-                buf.push('\n');
-            }
+
+            // Set base dark background and clear remainder of row to end of line
+            buf.push_str(&format!(
+                "\x1b[0;48;2;{};{};{}m\x1b[K",
+                Rgb::BG_DARK.0, Rgb::BG_DARK.1, Rgb::BG_DARK.2
+            ));
             in_escape = false;
+
+            // Advance cursor to next line using CRLF only if not on the bottom row
+            if y + 1 < self.height {
+                buf.push_str("\r\n");
+            }
         }
 
         let mut out = io::stdout();
@@ -306,6 +322,8 @@ pub enum KeyAction {
     End,
     Up,
     Down,
+    PageUp,
+    PageDown,
     Tab,
     CtrlP,
     Escape,
@@ -322,6 +340,7 @@ pub fn read_key_nonblocking() -> KeyAction {
     }
 
     match byte[0] {
+        3 => KeyAction::Escape, // Ctrl+C clean exit
         13 | 10 => KeyAction::Enter,
         8 | 127 => KeyAction::Backspace,
         9 => KeyAction::Tab,
@@ -342,6 +361,16 @@ pub fn read_key_nonblocking() -> KeyAction {
                                 let mut tilde = [0u8; 1];
                                 let _ = stdin.read(&mut tilde);
                                 KeyAction::Delete
+                            }
+                            b'5' => {
+                                let mut tilde = [0u8; 1];
+                                let _ = stdin.read(&mut tilde);
+                                KeyAction::PageUp
+                            }
+                            b'6' => {
+                                let mut tilde = [0u8; 1];
+                                let _ = stdin.read(&mut tilde);
+                                KeyAction::PageDown
                             }
                             _ => KeyAction::None,
                         }
@@ -416,6 +445,11 @@ impl InputBuffer {
         self.text.clear();
         self.cursor = 0;
     }
+
+    pub fn set_text(&mut self, s: &str) {
+        self.text = s.to_string();
+        self.cursor = self.text.len();
+    }
 }
 
 /// Message turn stored for rendering conversation history.
@@ -433,7 +467,8 @@ struct ViewportLine {
     dim: bool,
 }
 
-/// Word-wraps text by whitespace into lines no longer than `max_width`.
+/// Responsive word-wrapping algorithm that cleanly partitions paragraphs by whitespace
+/// and breaks excessively long tokens without panicking or exceeding `max_width`.
 pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let max_w = max_width.max(15);
@@ -445,19 +480,24 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
             continue;
         }
 
-        let words = trimmed.split_whitespace();
-        let mut cur = String::new();
+        let words: Vec<&str> = trimmed.split_whitespace().collect();
+        if words.is_empty() {
+            out.push(String::new());
+            continue;
+        }
 
+        let mut cur = String::new();
         for word in words {
+            let w_len = word.chars().count();
             if cur.is_empty() {
-                if word.chars().count() > max_w {
-                    let mut chars = word.chars();
+                if w_len > max_w {
+                    let mut char_iter = word.chars();
                     loop {
-                        let chunk: String = chars.by_ref().take(max_w).collect();
+                        let chunk: String = char_iter.by_ref().take(max_w).collect();
                         if chunk.is_empty() {
                             break;
                         }
-                        if chars.as_str().is_empty() {
+                        if char_iter.clone().next().is_none() {
                             cur = chunk;
                         } else {
                             out.push(chunk);
@@ -466,20 +506,20 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
                 } else {
                     cur.push_str(word);
                 }
-            } else if cur.chars().count() + 1 + word.chars().count() <= max_w {
+            } else if cur.chars().count() + 1 + w_len <= max_w {
                 cur.push(' ');
                 cur.push_str(word);
             } else {
                 out.push(cur);
                 cur = String::new();
-                if word.chars().count() > max_w {
-                    let mut chars = word.chars();
+                if w_len > max_w {
+                    let mut char_iter = word.chars();
                     loop {
-                        let chunk: String = chars.by_ref().take(max_w).collect();
+                        let chunk: String = char_iter.by_ref().take(max_w).collect();
                         if chunk.is_empty() {
                             break;
                         }
-                        if chars.as_str().is_empty() {
+                        if char_iter.clone().next().is_none() {
                             cur = chunk;
                         } else {
                             out.push(chunk);
@@ -490,7 +530,6 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
                 }
             }
         }
-
         if !cur.is_empty() {
             out.push(cur);
         }
@@ -503,6 +542,9 @@ pub struct SpindleTui {
     canvas: Canvas,
     input: InputBuffer,
     history: Vec<ChatMessage>,
+    prompt_history: Vec<String>,
+    history_idx: Option<usize>,
+    pub scroll_offset: usize,
     pub running: bool,
     pub model_name: String,
     pub cluster_peer: Option<String>,
@@ -526,6 +568,9 @@ impl SpindleTui {
             canvas: Canvas::new(w, h),
             input: InputBuffer::default(),
             history: Vec::new(),
+            prompt_history: Vec::new(),
+            history_idx: None,
+            scroll_offset: 0,
             running: true,
             model_name: model_name.to_string(),
             cluster_peer: cluster_peer.map(str::to_string),
@@ -568,53 +613,83 @@ impl SpindleTui {
             self.canvas.print(start_x, row, line, color, Rgb::BG_DARK, true, false);
         }
 
-        // 2. Subtitle Badge
-        let sub = "/help for slash commands · /heal autonomous loop";
-        let sub_x = center_x.saturating_sub((sub.len() as u16) / 2);
-        self.canvas.print(sub_x, logo_y + 5, sub, Rgb::MUTED, Rgb::BG_DARK, false, false);
+        // 2. Subtitle with OpenCode-style colored command tokens
+        let sub_prefix = "/help";
+        let sub_mid = " for slash commands · ";
+        let sub_cmd2 = "/heal";
+        let sub_tail = " autonomous loop";
+        let total_sub_len = (sub_prefix.len() + sub_mid.len() + sub_cmd2.len() + sub_tail.len()) as u16;
+        let mut sub_x = center_x.saturating_sub(total_sub_len / 2);
+        let sub_y = logo_y + 5;
 
-        // 3. Floating Input Card
-        let card_w = (w.saturating_sub(6)).clamp(40, 82);
+        self.canvas.print(sub_x, sub_y, sub_prefix, Rgb::ORANGE, Rgb::BG_DARK, true, false);
+        sub_x += sub_prefix.len() as u16;
+        self.canvas.print(sub_x, sub_y, sub_mid, Rgb::MUTED, Rgb::BG_DARK, false, false);
+        sub_x += sub_mid.len() as u16;
+        self.canvas.print(sub_x, sub_y, sub_cmd2, Rgb::ORANGE, Rgb::BG_DARK, true, false);
+        sub_x += sub_cmd2.len() as u16;
+        self.canvas.print(sub_x, sub_y, sub_tail, Rgb::MUTED, Rgb::BG_DARK, false, false);
+
+        // 3. Floating Elevated Input Card
+        let card_w = (w.saturating_sub(6)).clamp(40, 84);
         let card_h = 5;
         let card_x = center_x.saturating_sub(card_w / 2);
         let card_y = logo_y + 7;
 
         self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
-        // Content Row: Text or Ghost Placeholder
+        // Content Row: Text or Ghost Placeholder with horizontal windowing and non-stomping cursor
         let prompt_x = card_x + 3;
         let prompt_y = card_y + 1;
+        let visible_w = (card_w.saturating_sub(6)) as usize;
+
         if self.input.text.is_empty() {
             let ghost = "Ask anything... \"delete hello.py\", \"/review\", \"/stats\"";
+            let max_ghost_w = visible_w.saturating_sub(2);
+            let clipped_ghost: String = ghost.chars().take(max_ghost_w).collect();
+
             self.canvas.set(prompt_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
-            self.canvas.print(prompt_x + 2, prompt_y, ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
+            self.canvas.print(prompt_x + 2, prompt_y, &clipped_ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
         } else {
-            let visible_w = (card_w.saturating_sub(6)) as usize;
-            let display_text: String = self.input.text.chars().take(visible_w).collect();
-            self.canvas.print(prompt_x, prompt_y, &display_text, Rgb::WHITE, Rgb::CARD_BG, false, false);
-            let cursor_x = prompt_x + (self.input.cursor as u16).min(visible_w as u16);
-            self.canvas.set(cursor_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
+            let total_chars = self.input.text.chars().count();
+            let cursor = self.input.cursor.min(total_chars);
+            let window_start = if cursor >= visible_w { cursor - visible_w + 1 } else { 0 };
+
+            let visible_text: String = self.input.text.chars().skip(window_start).take(visible_w).collect();
+            self.canvas.print(prompt_x, prompt_y, &visible_text, Rgb::WHITE, Rgb::CARD_BG, false, false);
+
+            let cursor_x = prompt_x + (cursor - window_start) as u16;
+            let char_under = self.input.text.chars().nth(cursor).unwrap_or(' ');
+            self.canvas.set(cursor_x, prompt_y, char_under, Rgb::CARD_BG, Rgb::BRIGHT_BLUE, true, false);
         }
 
         // Bottom Meta Badges inside the card
         let meta_y = card_y + 3;
         let mut mx = prompt_x;
+        let max_card_content_x = card_x + card_w - 2;
 
-        // Build Badge (Electric Blue pill)
-        self.canvas.print(mx, meta_y, "Build", Rgb::SKY_BLUE, Rgb::CARD_BG, true, false);
-        mx += 6;
+        if mx + 6 < max_card_content_x {
+            self.canvas.print(mx, meta_y, "Build", Rgb::ICE_CYAN, Rgb::CARD_BG, true, false);
+            mx += 6;
+        }
 
         let model_badge = format!("· {} ({})", self.model_name, self.layers_info);
-        self.canvas.print(mx, meta_y, &model_badge, Rgb::WHITE, Rgb::CARD_BG, false, false);
-        mx += model_badge.len() as u16 + 1;
+        if mx + (model_badge.len() as u16) < max_card_content_x {
+            self.canvas.print(mx, meta_y, &model_badge, Rgb::WHITE, Rgb::CARD_BG, false, false);
+            mx += model_badge.len() as u16 + 1;
+        }
 
         let prune_badge = format!("· {:.2} prune", self.prune_val);
-        self.canvas.print(mx, meta_y, &prune_badge, Rgb::ORANGE, Rgb::CARD_BG, false, false);
-        mx += prune_badge.len() as u16 + 1;
+        if mx + (prune_badge.len() as u16) < max_card_content_x {
+            self.canvas.print(mx, meta_y, &prune_badge, Rgb::ORANGE, Rgb::CARD_BG, false, false);
+            mx += prune_badge.len() as u16 + 1;
+        }
 
         if let Some(peer) = &self.cluster_peer {
             let mesh_badge = format!("· mesh: {peer}");
-            self.canvas.print(mx, meta_y, &mesh_badge, Rgb::GREEN, Rgb::CARD_BG, false, false);
+            if mx + (mesh_badge.len() as u16) < max_card_content_x {
+                self.canvas.print(mx, meta_y, &mesh_badge, Rgb::GREEN, Rgb::CARD_BG, false, false);
+            }
         }
 
         // 4. Hotkey legends below the card
@@ -628,7 +703,7 @@ impl SpindleTui {
         let _ = self.canvas.flush();
     }
 
-    /// Renders the conversation view strictly CHRONOLOGICALLY (oldest on top, newest at bottom).
+    /// Renders the conversation view strictly CHRONOLOGICALLY with word wrapping and scroll support.
     pub fn render_chat(&mut self) {
         let (w, h) = terminal_size();
         self.canvas.resize(w, h);
@@ -638,13 +713,21 @@ impl SpindleTui {
         let header_bg = Rgb::CARD_BG;
         self.canvas.fill_rect(0, 0, w, 1, ' ', Rgb::WHITE, header_bg);
         self.canvas.print(2, 0, "SPINDLE v0.1.0", Rgb::BRIGHT_BLUE, header_bg, true, false);
-        let status = format!("· {} · {} · 9.0 tok/s record", self.model_name, self.layers_info);
-        self.canvas.print(18, 0, &status, Rgb::MUTED, header_bg, false, false);
 
+        let status = format!("· {} · {} · 9.0 tok/s record", self.model_name, self.layers_info);
         if let Some(p) = &self.cluster_peer {
             let mesh_str = format!("mesh: {p}");
             let mx = w.saturating_sub(mesh_str.len() as u16 + 4);
+            if 18 + (status.len() as u16) < mx {
+                self.canvas.print(18, 0, &status, Rgb::MUTED, header_bg, false, false);
+            } else {
+                let max_stat = (mx.saturating_sub(20)) as usize;
+                let clip: String = status.chars().take(max_stat).collect();
+                self.canvas.print(18, 0, &clip, Rgb::MUTED, header_bg, false, false);
+            }
             self.canvas.print(mx, 0, &mesh_str, Rgb::GREEN, header_bg, true, false);
+        } else {
+            self.canvas.print(18, 0, &status, Rgb::MUTED, header_bg, false, false);
         }
 
         // Horizontal divider below header
@@ -652,13 +735,13 @@ impl SpindleTui {
             self.canvas.set(col, 1, '─', Rgb::CARD_BORDER, Rgb::BG_DARK, false, false);
         }
 
-        // 2. Format conversation history chronologically with WORD WRAPPING (Oldest -> Newest)
-        let max_text_w = (w.saturating_sub(6)) as usize;
+        // 2. Format conversation history chronologically with RESPONSIVE WORD WRAPPING
         let mut lines: Vec<ViewportLine> = Vec::new();
 
         for msg in &self.history {
             if msg.role == "user" {
-                let wrapped_user = wrap_text(&msg.text, max_text_w.saturating_sub(10));
+                let user_max_w = (w.saturating_sub(16)) as usize;
+                let wrapped_user = wrap_text(&msg.text, user_max_w);
                 for (idx, u_line) in wrapped_user.into_iter().enumerate() {
                     let prefix = if idx == 0 { "> You: " } else { "       " };
                     lines.push(ViewportLine {
@@ -669,7 +752,8 @@ impl SpindleTui {
                     });
                 }
             } else if msg.role == "tool" {
-                let wrapped_tool = wrap_text(&msg.text, max_text_w.saturating_sub(8));
+                let tool_max_w = (w.saturating_sub(14)) as usize;
+                let wrapped_tool = wrap_text(&msg.text, tool_max_w);
                 for (idx, t_line) in wrapped_tool.into_iter().enumerate() {
                     let prefix = if idx == 0 { "  [*] " } else { "      " };
                     lines.push(ViewportLine {
@@ -692,7 +776,8 @@ impl SpindleTui {
                     bold: true,
                     dim: false,
                 });
-                let wrapped_body = wrap_text(&msg.text, max_text_w.saturating_sub(4));
+                let assistant_max_w = (w.saturating_sub(12)) as usize;
+                let wrapped_body = wrap_text(&msg.text, assistant_max_w);
                 for b_line in wrapped_body {
                     lines.push(ViewportLine {
                         text: format!("  {b_line}"),
@@ -702,7 +787,7 @@ impl SpindleTui {
                     });
                 }
             }
-            // Empty blank line between turns
+            // Empty blank line between turns for clean visual rhythm
             lines.push(ViewportLine {
                 text: String::new(),
                 fg: Rgb::WHITE,
@@ -711,48 +796,70 @@ impl SpindleTui {
             });
         }
 
-        // 3. Render visible viewport lines above the bottom input card
+        // 3. Render visible viewport lines above the bottom input card with scroll offset
         let top_y = 2u16;
         let card_h = 5u16;
         let card_y = h.saturating_sub(7);
         let viewport_h = card_y.saturating_sub(top_y) as usize;
 
-        let start_idx = if lines.len() > viewport_h {
-            lines.len() - viewport_h
-        } else {
-            0
-        };
+        let total_lines = lines.len();
+        let max_scroll = total_lines.saturating_sub(viewport_h);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
 
-        for (i, line) in lines[start_idx..].iter().enumerate() {
+        let end_idx = total_lines.saturating_sub(self.scroll_offset);
+        let start_idx = end_idx.saturating_sub(viewport_h);
+
+        for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
             let y = top_y + (i as u16);
             if y >= card_y {
                 break;
             }
-            self.canvas.print(2, y, &line.text, line.fg, Rgb::BG_DARK, line.bold, line.dim);
+            self.canvas.print(3, y, &line.text, line.fg, Rgb::BG_DARK, line.bold, line.dim);
+        }
+
+        // Render scroll indicator if scrolled up into history
+        if self.scroll_offset > 0 {
+            let scroll_indicator = format!("[▲ Scroll: +{} lines | PgDn to bottom]", self.scroll_offset);
+            let sx = w.saturating_sub(scroll_indicator.len() as u16 + 4);
+            self.canvas.print(sx, 1, &scroll_indicator, Rgb::SKY_BLUE, Rgb::BG_DARK, true, false);
         }
 
         // 4. Floating Input Card docked at the bottom
-        let card_w = (w.saturating_sub(6)).clamp(40, 82);
+        let card_w = (w.saturating_sub(6)).clamp(40, 84);
         let card_x = (w / 2).saturating_sub(card_w / 2);
 
         self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
         let prompt_x = card_x + 3;
         let prompt_y = card_y + 1;
+        let visible_w = (card_w.saturating_sub(6)) as usize;
+
         if self.input.text.is_empty() {
+            let ghost = "Ask anything... \"delete hello.py\", \"/review\"";
+            let max_ghost_w = visible_w.saturating_sub(2);
+            let clipped_ghost: String = ghost.chars().take(max_ghost_w).collect();
+
             self.canvas.set(prompt_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
-            self.canvas.print(prompt_x + 2, prompt_y, "Ask anything...", Rgb::DIM, Rgb::CARD_BG, false, false);
+            self.canvas.print(prompt_x + 2, prompt_y, &clipped_ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
         } else {
-            let visible_w = (card_w.saturating_sub(6)) as usize;
-            let display: String = self.input.text.chars().take(visible_w).collect();
-            self.canvas.print(prompt_x, prompt_y, &display, Rgb::WHITE, Rgb::CARD_BG, false, false);
-            let cursor_x = prompt_x + (self.input.cursor as u16).min(visible_w as u16);
-            self.canvas.set(cursor_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
+            let total_chars = self.input.text.chars().count();
+            let cursor = self.input.cursor.min(total_chars);
+            let window_start = if cursor >= visible_w { cursor - visible_w + 1 } else { 0 };
+
+            let visible_text: String = self.input.text.chars().skip(window_start).take(visible_w).collect();
+            self.canvas.print(prompt_x, prompt_y, &visible_text, Rgb::WHITE, Rgb::CARD_BG, false, false);
+
+            let cursor_x = prompt_x + (cursor - window_start) as u16;
+            let char_under = self.input.text.chars().nth(cursor).unwrap_or(' ');
+            self.canvas.set(cursor_x, prompt_y, char_under, Rgb::CARD_BG, Rgb::BRIGHT_BLUE, true, false);
         }
 
-        // Card meta line inside input box
-        let meta_str = format!("Build · {} · {:.2} prune · low-mem", self.model_name, self.prune_val);
-        self.canvas.print(prompt_x, card_y + 3, &meta_str, Rgb::MUTED, Rgb::CARD_BG, false, false);
+        // Card meta line inside input box with color tokens
+        self.canvas.print(prompt_x, card_y + 3, "Build", Rgb::ICE_CYAN, Rgb::CARD_BG, true, false);
+        let chat_meta = format!("· {} · {:.2} prune · low-mem", self.model_name, self.prune_val);
+        let max_meta_w = (card_w.saturating_sub(14)) as usize;
+        let clipped_meta: String = chat_meta.chars().take(max_meta_w).collect();
+        self.canvas.print(prompt_x + 6, card_y + 3, &clipped_meta, Rgb::MUTED, Rgb::CARD_BG, false, false);
 
         // 5. Docked Global Footer
         self.render_docked_footer(w, h);
@@ -762,11 +869,22 @@ impl SpindleTui {
 
     fn render_docked_footer(&mut self, w: u16, h: u16) {
         let footer_y = h.saturating_sub(1);
-        let cwd = std::env::current_dir()
+        let raw_cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
-        let footer_left = format!("{}:{}", cwd, self.git_branch);
-        self.canvas.print(2, footer_y, &footer_left, Rgb::MUTED, Rgb::BG_DARK, false, false);
+        let short_cwd = if let Ok(home) = std::env::var("USERPROFILE") {
+            if raw_cwd.starts_with(&home) {
+                format!("~{}", &raw_cwd[home.len()..])
+            } else {
+                raw_cwd
+            }
+        } else {
+            raw_cwd
+        };
+        let max_left_w = (w.saturating_sub(20)) as usize;
+        let footer_left = format!("{}:{}", short_cwd, self.git_branch);
+        let clipped_left: String = footer_left.chars().take(max_left_w).collect();
+        self.canvas.print(2, footer_y, &clipped_left, Rgb::MUTED, Rgb::BG_DARK, false, false);
 
         let footer_right = "spindle v0.1.0";
         let right_x = w.saturating_sub(footer_right.len() as u16 + 2);
@@ -799,9 +917,45 @@ impl SpindleTui {
                 KeyAction::Right => self.input.move_right(),
                 KeyAction::Home => self.input.move_home(),
                 KeyAction::End => self.input.move_end(),
+                KeyAction::Up => {
+                    // Up arrow: recall previous prompt if input is empty
+                    if self.input.text.is_empty() && !self.prompt_history.is_empty() {
+                        let idx = self.history_idx.map_or(self.prompt_history.len() - 1, |i| i.saturating_sub(1));
+                        self.history_idx = Some(idx);
+                        self.input.set_text(&self.prompt_history[idx]);
+                    } else if let Some(idx) = self.history_idx {
+                        if idx > 0 {
+                            let new_idx = idx - 1;
+                            self.history_idx = Some(new_idx);
+                            self.input.set_text(&self.prompt_history[new_idx]);
+                        }
+                    }
+                }
+                KeyAction::Down => {
+                    // Down arrow: forward prompt recall
+                    if let Some(idx) = self.history_idx {
+                        if idx + 1 < self.prompt_history.len() {
+                            let new_idx = idx + 1;
+                            self.history_idx = Some(new_idx);
+                            self.input.set_text(&self.prompt_history[new_idx]);
+                        } else {
+                            self.history_idx = None;
+                            self.input.clear();
+                        }
+                    }
+                }
+                KeyAction::PageUp => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(4);
+                }
+                KeyAction::PageDown => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(4);
+                }
                 KeyAction::Enter => {
                     let text = self.input.text.trim().to_string();
                     if !text.is_empty() {
+                        self.prompt_history.push(text.clone());
+                        self.history_idx = None;
+                        self.scroll_offset = 0;
                         self.input.clear();
                         return Some(text);
                     }
@@ -858,6 +1012,7 @@ pub fn run_tui(
             }
             if user_prompt == "/clear" {
                 tui.history.clear();
+                tui.scroll_offset = 0;
                 continue;
             }
             execute_tui_turn(&mut tui, engine, governor, &user_prompt, opts.allow_think, max_tokens);
@@ -877,6 +1032,7 @@ fn execute_tui_turn(
 ) {
     // 1. Record user turn first
     tui.push_message("user", prompt, None);
+    tui.scroll_offset = 0;
     tui.render_chat();
 
     let mut current_input = prompt.to_string();
@@ -885,8 +1041,25 @@ fn execute_tui_turn(
     const MAX_STEPS: usize = 5;
 
     loop {
+        // Push initial live assistant slot
+        tui.push_message("assistant", "Thinking...", None);
+        tui.render_chat();
+
+        let mut stream_buffer = String::new();
+        let mut last_render = std::time::Instant::now();
+
         let (out_text, secs, tokens) = unsafe {
-            engine.generate_reply(&current_input, max_tokens, allow_think, &mut |_token_piece| {})
+            engine.generate_reply(&current_input, max_tokens, allow_think, &mut |token_piece| {
+                stream_buffer.push_str(token_piece);
+                if let Some(last_msg) = tui.history.last_mut() {
+                    last_msg.text = stream_buffer.clone();
+                }
+                // Throttle live stream updates to ~35ms (~28 FPS) to prevent compute starvation
+                if last_render.elapsed().as_millis() >= 35 {
+                    tui.render_chat();
+                    last_render = std::time::Instant::now();
+                }
+            })
         };
 
         let tok_per_sec = tokens as f64 / secs.max(0.001);
@@ -895,6 +1068,9 @@ fn execute_tui_turn(
         // Check if model emitted a tool call
         if engine.enable_tools && steps < MAX_STEPS {
             if let Some(call) = crate::tools::parse_tool_call(&out_text) {
+                // Remove temporary streaming slot before processing tool call
+                tui.history.pop();
+
                 let call_sig = format!("{}:{:?}:{:?}", call.name, call.path, call.command);
                 if last_call_sig.as_ref() == Some(&call_sig) {
                     tui.push_message("tool", &format!("Action: {} (duplicate skipped)", call.name), None);
@@ -906,7 +1082,12 @@ fn execute_tui_turn(
                 last_call_sig = Some(call_sig);
                 steps += 1;
 
-                tui.push_message("tool", &format!("Action: {}", call.name), None);
+                let action_summary = match (&call.path, &call.command) {
+                    (Some(p), _) => format!("Action: {} (path: {p})", call.name),
+                    (_, Some(c)) => format!("Action: {} (cmd: {c})", call.name),
+                    _ => format!("Action: {}", call.name),
+                };
+                tui.push_message("tool", &action_summary, None);
                 tui.render_chat();
 
                 let tool_result = match call.name.as_str() {
@@ -963,9 +1144,19 @@ fn execute_tui_turn(
             }
         }
 
-        // Clean out any raw tool call tags for final assistant display
+        // Finalize assistant message with telemetry badge
         let display_reply = out_text.trim();
-        tui.push_message("assistant", display_reply, Some(&speed_badge));
+        if let Some(last_msg) = tui.history.last_mut() {
+            if last_msg.role == "assistant" {
+                last_msg.text = display_reply.to_string();
+                last_msg.speed_badge = Some(speed_badge);
+            } else {
+                tui.push_message("assistant", display_reply, Some(&speed_badge));
+            }
+        } else {
+            tui.push_message("assistant", display_reply, Some(&speed_badge));
+        }
+
         tui.render_chat();
         break;
     }
@@ -996,12 +1187,12 @@ mod tests {
         let mut canvas = Canvas::new(80, 24);
         canvas.draw_card(10, 5, 40, 6, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
-        let tl_idx = 5 * 80 + 10;
-        assert_eq!(canvas.grid[tl_idx].ch, '╭');
-
-        let bar_idx = 6 * 80 + 10;
+        let bar_idx = 5 * 80 + 10;
         assert_eq!(canvas.grid[bar_idx].ch, '▌');
         assert_eq!(canvas.grid[bar_idx].fg, Rgb::BRIGHT_BLUE);
+
+        let tr_idx = 5 * 80 + 49;
+        assert_eq!(canvas.grid[tr_idx].ch, '╮');
     }
 
     #[test]
@@ -1050,7 +1241,7 @@ mod tests {
         let wrapped = wrap_text(long_text, 40);
         assert!(wrapped.len() >= 3);
         for line in &wrapped {
-            assert!(line.len() <= 40, "Line exceeds max width 40: '{}'", line);
+            assert!(line.chars().count() <= 40, "Line exceeds max width 40: '{}'", line);
         }
     }
 }
