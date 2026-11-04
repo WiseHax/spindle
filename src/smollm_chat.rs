@@ -938,6 +938,86 @@ impl Rope {
 
 /// GPT-2's byte <-> printable-char table: printable bytes map to themselves, the rest to
 /// chars from U+0100 up (space -> `Ġ`, newline -> `Ċ`). Vocab strings are in this alphabet.
+/// Splits `text` exactly like the Qwen2 (`tokenizer.ggml.pre = "qwen2"`) pre-tokenizer regex
+///   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// hand-matched (no regex crate). Matching the model's own split matters: BPE merges never
+/// cross these boundaries, so a different split gives token sequences the model never saw
+/// in training (e.g. `;` `\n` instead of `;\n`), which hurts quality and lookup drafting.
+fn pretokenize_qwen2(text: &str) -> Vec<&str> {
+    let cs: Vec<(usize, char)> = text.char_indices().collect();
+    let n = cs.len();
+    let at = |i: usize| if i < n { cs[i].0 } else { text.len() };
+    let ch = |i: usize| cs[i].1;
+    let is_l = |c: char| c.is_alphabetic();
+    let is_n = |c: char| c.is_numeric();
+    let is_s = |c: char| c.is_whitespace();
+    let is_nl = |c: char| c == '\r' || c == '\n';
+    let is_p = |c: char| !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = ch(i);
+        let mut end = 0;
+        // 'contractions (case-insensitive)
+        if c == '\'' && i + 1 < n {
+            let c1 = ch(i + 1).to_ascii_lowercase();
+            let c2 = if i + 2 < n { ch(i + 2).to_ascii_lowercase() } else { '\0' };
+            if matches!(c1, 's' | 't' | 'm' | 'd') {
+                end = i + 2;
+            } else if matches!((c1, c2), ('r', 'e') | ('v', 'e') | ('l', 'l')) {
+                end = i + 3;
+            }
+        }
+        // [^\r\n\p{L}\p{N}]?\p{L}+
+        if end == 0 {
+            let j = if is_l(c) { Some(i) } else if !is_nl(c) && !is_n(c) { Some(i + 1) } else { None };
+            if let Some(j) = j.filter(|&j| j < n && is_l(ch(j))) {
+                let mut k = j;
+                while k < n && is_l(ch(k)) {
+                    k += 1;
+                }
+                end = k;
+            }
+        }
+        // \p{N} (one digit at a time)
+        if end == 0 && is_n(c) {
+            end = i + 1;
+        }
+        //  ?[^\s\p{L}\p{N}]+[\r\n]*
+        if end == 0 {
+            let j = if c == ' ' { i + 1 } else { i };
+            if j < n && is_p(ch(j)) {
+                let mut k = j;
+                while k < n && is_p(ch(k)) {
+                    k += 1;
+                }
+                while k < n && is_nl(ch(k)) {
+                    k += 1;
+                }
+                end = k;
+            }
+        }
+        // \s*[\r\n]+ | \s+(?!\S) | \s+
+        if end == 0 && is_s(c) {
+            let mut k = i;
+            while k < n && is_s(ch(k)) {
+                k += 1;
+            }
+            end = match (i..k).rev().find(|&t| is_nl(ch(t))) {
+                Some(last_nl) => last_nl + 1,
+                None if k < n && k - i >= 2 => k - 1,
+                None => k,
+            };
+        }
+        if end == 0 {
+            end = i + 1;
+        }
+        out.push(&text[at(i)..at(end)]);
+        i = end;
+    }
+    out
+}
+
 fn byte_to_char_table() -> [char; 256] {
     let mut keep: Vec<u32> = (b'!' as u32..=b'~' as u32).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
     let mut chars: Vec<u32> = keep.clone();
@@ -2488,10 +2568,17 @@ impl SmolLm2Engine {
             }
         }
 
+        let qwen2 = matches!(self.idx.metadata.get("tokenizer.ggml.pre"), Some(GgufValue::String(p)) if p == "qwen2");
         // Pre-split into chunks: each newline is its own chunk; spaces attach to the following word
         let mut chunks: Vec<String> = Vec::new();
         let mut cur = String::new();
-        for ch in clean.chars() {
+        if qwen2 {
+            chunks = pretokenize_qwen2(&clean)
+                .into_iter()
+                .map(|w| w.bytes().map(|b| self.byte_enc[b as usize]).collect())
+                .collect();
+        }
+        for ch in clean.chars().filter(|_| !qwen2) {
             if ch == '\n' {
                 if !cur.is_empty() {
                     chunks.push(std::mem::take(&mut cur));
