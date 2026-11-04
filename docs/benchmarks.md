@@ -46,7 +46,8 @@ Speed (Tokens / Second)
 | **Stage 3: Layer Balance** | PC: 0..35, Laptop: 35..48 | `3.5` | 17.1 s | Relieved PC RAM from 97% to 80% (no Win32 paging) |
 | **Stage 4: FP8 Tensor Wire** | Adaptive 8-bit quantization | `5.1 – 6.0` | 10.0 s | Halved Wi-Fi packet payload (8 KB -> 4 KB) |
 | **Stage 5: Dual-Row Q6_K + Zero-Heap** | Port 0/1 FMA unroll + L1 stack router | `6.3 – 7.2` | 8.3 s | Saturated dual FMA ports & removed heap lock contention |
-| **Stage 6: MoE Pruning + KV Pre-Warm** | Dynamic 0.03 cutoff + in-RAM KV caching | **`8.0 – 8.3`** | **48.3 s (402 tokens)** | All-time speed record across distributed Wi-Fi mesh |
+| **Stage 6: MoE Pruning + KV Pre-Warm** | Dynamic 0.03 cutoff + in-RAM KV caching | `8.0 – 8.3` | 48.3 s (402 tokens) | All-time speed record across distributed Wi-Fi mesh |
+| **Stage 7: Dynamic Cluster Pruning** | Mesh synchronized MoE pruning (`FRAME_SET_PRUNE`) | **`8.3 – 9.0`** | **46.2 s (417 tokens)** | Sustained 9.0 tok/s record on consumer Wi-Fi |
 
 ---
 
@@ -73,6 +74,12 @@ Captured live on November 4, 2026:
 - **Prompt:** `"can you even write hello word on basic python script?"`
 - **Response:** Python code snippet and formatted Markdown explanation.
 - **Performance:** **5.7 tok/s** · 86 tokens · 15.1 s · LAN RTT: 1.40 ms
+
+### Turn 5: Autonomous ReAct File Deletion & Verification
+- **Prompt:** `"i mean the hello.py file in the directory?"`
+- **Action 1:** `list_dir(".")` -> Verified workspace files.
+- **Action 2:** `delete_file("hello.py")` -> Atomically removed `hello.py` with shadow undo backup.
+- **Performance:** **9.0 tok/s** (Peak) · 417 tokens · 46.2 s · LAN RTT: 1.25 ms
 
 ### Turn 5: Multi-Paradigm Variations
 - **Prompt:** `"can you even write hello world in a different way?"`
