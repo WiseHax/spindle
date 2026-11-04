@@ -1,60 +1,65 @@
-//! OpenCode-grade Full-Screen Terminal User Interface (TUI) for Spindle.
+//! Full-screen terminal UI, laid out like opencode's TUI (github.com/anomalyco/opencode,
+//! `packages/tui`): its dark theme palette, `┃`-bordered user messages and prompt, inline
+//! tool rows (`→ Read`, `✱ Grep`, ...), block tools for shell/edit output with diffs, an
+//! assistant footer (`▣ Agent · model · 3.2s · 12 tok/s`), a status row under the prompt and
+//! a session sidebar on wide terminals.
 //!
-//! Provides an alternate screen canvas, 24-bit TrueColor atomic frame rendering,
-//! floating elevated card layout, responsive word-wrapping, non-blocking asynchronous
-//! token streaming (user can type and scroll during generation), SGR 1006 mouse wheel scrolling,
-//! arrow key scroll navigation, prompt history, and an electric blue theme.
+//! Rendering is a cell canvas flushed in one write per frame (no flicker). Generation runs
+//! on a worker thread so the UI keeps scrolling/typing at ~60 FPS; tool permission prompts
+//! come back to the UI thread over a channel.
 
-use std::io::{self, Read, Write};
-use windows::Win32::System::Console::{
-    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, SetConsoleMode,
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    GetNumberOfConsoleInputEvents,
+use std::{
+    io::{self, Read, Write},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::{Duration, Instant},
 };
+
+use windows::Win32::System::Console::{
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents, GetStdHandle, SetConsoleMode, CONSOLE_MODE,
+    CONSOLE_SCREEN_BUFFER_INFO, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+
+use crate::{
+    agent::{self, AgentEvent, AgentOpts, TurnStats},
+    smollm_chat::SmolLm2Engine,
+};
+
+// ------------------------------------------------------------------------------ theme
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
-impl Rgb {
-    pub const BG_DARK: Rgb = Rgb(10, 14, 23);           // Deep midnight navy
-    pub const CARD_BG: Rgb = Rgb(17, 24, 39);          // Elevated dark sapphire slate
-    pub const CARD_BORDER: Rgb = Rgb(30, 58, 110);      // Muted cobalt border
-    pub const PRIMARY_BLUE: Rgb = Rgb(37, 99, 235);     // Signature Royal Blue
-    pub const BRIGHT_BLUE: Rgb = Rgb(59, 130, 246);     // Electric Blue
-    pub const SKY_BLUE: Rgb = Rgb(96, 165, 250);        // Sky Blue highlight
-    pub const ICE_CYAN: Rgb = Rgb(56, 189, 248);        // Ice Cyan
-    pub const WHITE: Rgb = Rgb(248, 250, 252);         // Crisp White
-    pub const MUTED: Rgb = Rgb(148, 163, 184);         // Slate Gray
-    pub const DIM: Rgb = Rgb(71, 85, 105);             // Subtle Dark Gray
-    pub const GREEN: Rgb = Rgb(52, 211, 153);          // Emerald (mesh/success)
-    pub const ORANGE: Rgb = Rgb(251, 146, 60);         // Warm Orange (prune/stats)
-    pub const GOLD: Rgb = Rgb(251, 191, 36);           // Tool action gold
+/// opencode's default dark theme (`theme/assets/opencode.json`).
+pub mod theme {
+    use super::Rgb;
+    pub const BG: Rgb = Rgb(0x0a, 0x0a, 0x0a);
+    pub const PANEL: Rgb = Rgb(0x14, 0x14, 0x14);
+    pub const ELEMENT: Rgb = Rgb(0x1e, 0x1e, 0x1e);
+    pub const BORDER: Rgb = Rgb(0x48, 0x48, 0x48);
+    pub const BORDER_SUBTLE: Rgb = Rgb(0x3c, 0x3c, 0x3c);
+    pub const PRIMARY: Rgb = Rgb(0xfa, 0xb2, 0x83);
+    pub const SECONDARY: Rgb = Rgb(0x5c, 0x9c, 0xf5);
+    pub const ACCENT: Rgb = Rgb(0x9d, 0x7c, 0xd8);
+    pub const TEXT: Rgb = Rgb(0xee, 0xee, 0xee);
+    pub const MUTED: Rgb = Rgb(0x80, 0x80, 0x80);
+    pub const ERROR: Rgb = Rgb(0xe0, 0x6c, 0x75);
+    pub const WARNING: Rgb = Rgb(0xf5, 0xa7, 0x42);
+    pub const SUCCESS: Rgb = Rgb(0x7f, 0xd8, 0x8f);
+    pub const INFO: Rgb = Rgb(0x56, 0xb6, 0xc2);
+    pub const DIFF_ADD: Rgb = Rgb(0x4f, 0xd6, 0xbe);
+    pub const DIFF_DEL: Rgb = Rgb(0xc5, 0x3b, 0x53);
+    pub const DIFF_ADD_BG: Rgb = Rgb(0x20, 0x30, 0x3b);
+    pub const DIFF_DEL_BG: Rgb = Rgb(0x37, 0x22, 0x2c);
 }
+use theme::*;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Cell {
-    pub ch: char,
-    pub fg: Rgb,
-    pub bg: Rgb,
-    pub bold: bool,
-    pub dim: bool,
-}
+// --------------------------------------------------------------------------- terminal
 
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            fg: Rgb::WHITE,
-            bg: Rgb::BG_DARK,
-            bold: false,
-            dim: false,
-        }
-    }
-}
-
-/// RAII Terminal protector that restores original terminal modes upon drop.
+/// Restores the console modes and screen when dropped (also on early return).
 pub struct TerminalGuard {
     in_handle: windows::Win32::Foundation::HANDLE,
     out_handle: windows::Win32::Foundation::HANDLE,
@@ -64,41 +69,23 @@ pub struct TerminalGuard {
 
 impl TerminalGuard {
     pub fn enter() -> io::Result<Self> {
+        let e = |e: windows::core::Error| io::Error::other(e.to_string());
         unsafe {
-            let in_handle = GetStdHandle(STD_INPUT_HANDLE)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            let out_handle = GetStdHandle(STD_OUTPUT_HANDLE)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
+            let in_handle = GetStdHandle(STD_INPUT_HANDLE).map_err(e)?;
+            let out_handle = GetStdHandle(STD_OUTPUT_HANDLE).map_err(e)?;
             let mut orig_in_mode = CONSOLE_MODE(0);
             let mut orig_out_mode = CONSOLE_MODE(0);
-            GetConsoleMode(in_handle, &mut orig_in_mode)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            GetConsoleMode(out_handle, &mut orig_out_mode)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-            // Enable virtual terminal processing for output
-            let new_out = orig_out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0;
-            let _ = SetConsoleMode(out_handle, CONSOLE_MODE(new_out));
-
-            // Set raw mode for input: disable line buffering and echo, enable VT input
-            let new_in = (orig_in_mode.0 | ENABLE_VIRTUAL_TERMINAL_INPUT.0)
-                & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0);
+            GetConsoleMode(in_handle, &mut orig_in_mode).map_err(e)?;
+            GetConsoleMode(out_handle, &mut orig_out_mode).map_err(e)?;
+            let _ = SetConsoleMode(out_handle, CONSOLE_MODE(orig_out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0));
+            // Raw VT input: no line buffering/echo, and Ctrl+C arrives as a key (byte 3).
+            let new_in = (orig_in_mode.0 | ENABLE_VIRTUAL_TERMINAL_INPUT.0) & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0);
             let _ = SetConsoleMode(in_handle, CONSOLE_MODE(new_in));
-
-            let mut stdout = io::stdout();
-            // Enter alternate buffer (\x1b[?1049h), hide cursor (\x1b[?25l), disable auto-wrap (\x1b[?7l),
-            // enable SGR extended mouse mode (\x1b[?1006h), enable alternate scroll mode (\x1b[?1007h).
-            // NOTE: \x1b[?1000h (normal click tracking) is omitted so mouse clicks/taps never emit raw escape bytes!
-            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1006h\x1b[?1007h");
-            let _ = stdout.flush();
-
-            Ok(Self {
-                in_handle,
-                out_handle,
-                orig_in_mode,
-                orig_out_mode,
-            })
+            let mut out = io::stdout();
+            // Alternate screen, hidden cursor, no autowrap, SGR mouse wheel, bracketed paste.
+            let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1006h\x1b[?1007h\x1b[?2004h");
+            let _ = out.flush();
+            Ok(Self { in_handle, out_handle, orig_in_mode, orig_out_mode })
         }
     }
 }
@@ -106,47 +93,60 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         unsafe {
-            let mut stdout = io::stdout();
-            // Disable mouse modes, enable auto-wrap (\x1b[?7h), show cursor (\x1b[?25h),
-            // exit alternate screen buffer (\x1b[?1049l), reset styles
-            let _ = write!(stdout, "\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
-            let _ = stdout.flush();
-
+            let mut out = io::stdout();
+            let _ = write!(out, "\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
+            let _ = out.flush();
             let _ = SetConsoleMode(self.out_handle, self.orig_out_mode);
             let _ = SetConsoleMode(self.in_handle, self.orig_in_mode);
         }
     }
 }
 
-/// Query current console dimensions (columns, rows).
+/// Console size in cells (columns, rows).
 pub fn terminal_size() -> (u16, u16) {
     unsafe {
-        if let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
+        if let Ok(h) = GetStdHandle(STD_OUTPUT_HANDLE) {
             let mut csbi = CONSOLE_SCREEN_BUFFER_INFO::default();
-            if GetConsoleScreenBufferInfo(handle, &mut csbi).is_ok() {
-                let width = (csbi.srWindow.Right - csbi.srWindow.Left + 1).max(20) as u16;
-                let height = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1).max(10) as u16;
-                return (width, height);
+            if GetConsoleScreenBufferInfo(h, &mut csbi).is_ok() {
+                let w = (csbi.srWindow.Right - csbi.srWindow.Left + 1).max(20) as u16;
+                let h = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1).max(10) as u16;
+                return (w, h);
             }
         }
     }
     (100, 30)
 }
 
-/// Query Windows console subsystem if there are pending input events.
-pub fn has_console_input() -> bool {
+fn has_console_input() -> bool {
     unsafe {
-        if let Ok(handle) = GetStdHandle(STD_INPUT_HANDLE) {
-            let mut count = 0u32;
-            if GetNumberOfConsoleInputEvents(handle, &mut count).is_ok() {
-                return count > 0;
+        if let Ok(h) = GetStdHandle(STD_INPUT_HANDLE) {
+            let mut n = 0u32;
+            if GetNumberOfConsoleInputEvents(h, &mut n).is_ok() {
+                return n > 0;
             }
         }
     }
     false
 }
 
-/// High-performance 2D frame buffer with atomic full-screen sync.
+// ----------------------------------------------------------------------------- canvas
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cell {
+    pub ch: char,
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self { ch: ' ', fg: TEXT, bg: BG, bold: false, italic: false }
+    }
+}
+
+/// Cell grid flushed to the terminal in a single write.
 pub struct Canvas {
     pub width: u16,
     pub height: u16,
@@ -156,193 +156,98 @@ pub struct Canvas {
 
 impl Canvas {
     pub fn new(width: u16, height: u16) -> Self {
-        let size = (width as usize) * (height as usize);
-        Self {
-            width,
-            height,
-            needs_clear: false,
-            grid: vec![Cell::default(); size],
-        }
+        Self { width, height, needs_clear: true, grid: vec![Cell::default(); width as usize * height as usize] }
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
-        if self.width == width && self.height == height {
-            return;
+        if (self.width, self.height) != (width, height) {
+            *self = Self::new(width, height);
         }
-        self.width = width;
-        self.height = height;
-        self.needs_clear = true;
-        let size = (width as usize) * (height as usize);
-        self.grid = vec![Cell::default(); size];
     }
 
-    pub fn clear(&mut self, bg: Rgb) {
-        for c in self.grid.iter_mut() {
-            c.ch = ' ';
-            c.fg = Rgb::WHITE;
-            c.bg = bg;
-            c.bold = false;
-            c.dim = false;
-        }
+    pub fn clear(&mut self) {
+        self.grid.iter_mut().for_each(|c| *c = Cell::default());
     }
 
     #[inline]
-    pub fn set(&mut self, x: u16, y: u16, ch: char, fg: Rgb, bg: Rgb, bold: bool, dim: bool) {
+    pub fn cell(&self, x: u16, y: u16) -> Option<&Cell> {
+        (x < self.width && y < self.height).then(|| &self.grid[y as usize * self.width as usize + x as usize])
+    }
+
+    #[inline]
+    pub fn put(&mut self, x: u16, y: u16, ch: char, fg: Rgb, bg: Rgb, bold: bool) {
         if x < self.width && y < self.height {
-            let idx = (y as usize) * (self.width as usize) + (x as usize);
-            self.grid[idx] = Cell { ch, fg, bg, bold, dim };
+            self.grid[y as usize * self.width as usize + x as usize] = Cell { ch, fg, bg, bold, italic: false };
         }
     }
 
-    pub fn print(&mut self, mut x: u16, y: u16, text: &str, fg: Rgb, bg: Rgb, bold: bool, dim: bool) {
-        if y >= self.height {
-            return;
-        }
+    /// Prints `text` from `x`, clipped at `max_x` (exclusive). Returns the next column.
+    pub fn text(&mut self, mut x: u16, y: u16, max_x: u16, text: &str, fg: Rgb, bg: Rgb, bold: bool) -> u16 {
         for ch in text.chars() {
-            if x >= self.width {
+            if x >= max_x.min(self.width) {
                 break;
             }
-            self.set(x, y, ch, fg, bg, bold, dim);
+            let ch = if ch == '\t' || ch.is_control() { ' ' } else { ch };
+            self.put(x, y, ch, fg, bg, bold);
             x += 1;
         }
+        x
     }
 
-    pub fn fill_rect(&mut self, x: u16, y: u16, w: u16, h: u16, ch: char, fg: Rgb, bg: Rgb) {
-        for row in y..y + h {
-            if row >= self.height {
-                break;
-            }
-            for col in x..x + w {
-                if col >= self.width {
-                    break;
-                }
-                self.set(col, row, ch, fg, bg, false, false);
+    pub fn fill(&mut self, x: u16, y: u16, w: u16, h: u16, bg: Rgb) {
+        for row in y..y.saturating_add(h).min(self.height) {
+            for col in x..x.saturating_add(w).min(self.width) {
+                self.put(col, row, ' ', TEXT, bg, false);
             }
         }
     }
 
-    /// Renders an OpenCode-style floating card with an electric blue left accent strip.
-    pub fn draw_card(&mut self, x: u16, y: u16, w: u16, h: u16, bg: Rgb, accent_bar: Rgb) {
-        // 1. Fill card interior surface
-        self.fill_rect(x, y, w, h, ' ', Rgb::WHITE, bg);
-
-        // 2. Left prominent accent bar (`▌`) running full height of the card
-        for row in y..y + h {
-            self.set(x, row, '▌', accent_bar, bg, true, false);
-        }
-
-        // 3. Subtle borders on top, bottom, and right for refined elevation
-        let border_fg = Rgb::CARD_BORDER;
-        for col in (x + 1)..(x + w.saturating_sub(1)) {
-            self.set(col, y, '─', border_fg, bg, false, false);
-            self.set(col, y + h.saturating_sub(1), '─', border_fg, bg, false, false);
-        }
-        for row in (y + 1)..(y + h.saturating_sub(1)) {
-            self.set(x + w.saturating_sub(1), row, '│', border_fg, bg, false, false);
-        }
-        self.set(x + w.saturating_sub(1), y, '╮', border_fg, bg, false, false);
-        self.set(x + w.saturating_sub(1), y + h.saturating_sub(1), '╯', border_fg, bg, false, false);
-    }
-
-    /// Atomic frame flush: emits the screen with zero flickering, no trailing space overhead,
-    /// and zero risk of accidental terminal scrolling.
     pub fn flush(&mut self) -> io::Result<()> {
-        let mut buf = String::with_capacity((self.width as usize) * (self.height as usize) * 8);
-        if self.needs_clear {
-            // Screen dimensions changed: clear entire screen to eliminate stale artifacts outside new viewport
-            buf.push_str("\x1b[2J\x1b[H");
-            self.needs_clear = false;
-        } else {
-            // Home cursor to (1, 1)
-            buf.push_str("\x1b[H");
-        }
-
-        let mut cur_fg = Rgb(0, 0, 0);
-        let mut cur_bg = Rgb(0, 0, 0);
-        let mut cur_bold = false;
-        let mut cur_dim = false;
-        let mut in_escape = false;
-
+        use std::fmt::Write as _;
+        let mut buf = String::with_capacity(self.grid.len() * 4);
+        buf.push_str(if self.needs_clear { "\x1b[2J\x1b[H" } else { "\x1b[H" });
+        self.needs_clear = false;
+        let mut cur: Option<(Rgb, Rgb, bool, bool)> = None;
         for y in 0..self.height {
-            // Find rightmost cell on this row that isn't a blank BG_DARK space
-            let mut last_col = 0;
-            for x in (0..self.width).rev() {
-                let idx = (y as usize) * (self.width as usize) + (x as usize);
-                let cell = self.grid[idx];
-                if cell.ch != ' ' || cell.bg != Rgb::BG_DARK {
-                    last_col = x + 1;
-                    break;
-                }
-            }
-
-            for x in 0..last_col {
-                let idx = (y as usize) * (self.width as usize) + (x as usize);
-                let cell = self.grid[idx];
-
-                if !in_escape || cell.fg != cur_fg || cell.bg != cur_bg || cell.bold != cur_bold || cell.dim != cur_dim {
-                    buf.push_str(&format!(
-                        "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
-                        cell.fg.0, cell.fg.1, cell.fg.2,
-                        cell.bg.0, cell.bg.1, cell.bg.2
-                    ));
-                    if cell.bold {
+            let row = &self.grid[y as usize * self.width as usize..(y as usize + 1) * self.width as usize];
+            let last = row.iter().rposition(|c| c.ch != ' ' || c.bg != BG).map_or(0, |i| i + 1);
+            for c in &row[..last] {
+                let style = (c.fg, c.bg, c.bold, c.italic);
+                if cur != Some(style) {
+                    let _ = write!(buf, "\x1b[0;38;2;{};{};{};48;2;{};{};{}m", c.fg.0, c.fg.1, c.fg.2, c.bg.0, c.bg.1, c.bg.2);
+                    if c.bold {
                         buf.push_str("\x1b[1m");
                     }
-                    if cell.dim {
-                        buf.push_str("\x1b[2m");
+                    if c.italic {
+                        buf.push_str("\x1b[3m");
                     }
-                    cur_fg = cell.fg;
-                    cur_bg = cell.bg;
-                    cur_bold = cell.bold;
-                    cur_dim = cell.dim;
-                    in_escape = true;
+                    cur = Some(style);
                 }
-                buf.push(cell.ch);
+                buf.push(c.ch);
             }
-
-            // Set base dark background and clear remainder of row to end of line
-            buf.push_str(&format!(
-                "\x1b[0;48;2;{};{};{}m\x1b[K",
-                Rgb::BG_DARK.0, Rgb::BG_DARK.1, Rgb::BG_DARK.2
-            ));
-            in_escape = false;
-
-            // Advance cursor to next line using CRLF only if not on the bottom row
+            let _ = write!(buf, "\x1b[0;48;2;{};{};{}m\x1b[K", BG.0, BG.1, BG.2);
+            cur = None;
             if y + 1 < self.height {
                 buf.push_str("\r\n");
             }
         }
-
         let mut out = io::stdout();
         out.write_all(buf.as_bytes())?;
-        out.flush()?;
-        Ok(())
+        out.flush()
     }
 }
 
-/// Shaded Unicode block logo for Spindle.
-pub const SPINDLE_LOGO: [&str; 4] = [
-    "  ▄█████  ██████  ██  ███  ██  ██████   ██       ███████",
-    "  ▀█▄     ██▄▄██  ██  ████ ██  ██   ██  ██       ██▄▄▄  ",
-    "    ▀▀██  ██      ██  ██ ▀███  ██   ██  ██       ██     ",
-    "  █████▀  ██      ██  ██   ██  ██████   ███████  ███████",
-];
+// ------------------------------------------------------------------------------ input
 
-/// Gradient colors for each line of the Spindle logo (Ice White -> Royal Blue).
-pub const LOGO_GRADIENT: [Rgb; 4] = [
-    Rgb(240, 249, 255), // Ice White
-    Rgb(147, 197, 253), // Soft Sky Blue
-    Rgb(59, 130, 246),  // Electric Blue
-    Rgb(29, 78, 216),   // Deep Cobalt Blue
-];
-
-/// Keys and mouse actions captured during the non-blocking event loop.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum KeyAction {
     Char(char),
+    Paste(String),
     Backspace,
     Delete,
     Enter,
+    /// Ctrl+J / pasted LF: insert a newline instead of sending.
+    Newline,
     Left,
     Right,
     Home,
@@ -354,47 +259,43 @@ pub enum KeyAction {
     ScrollUp(usize),
     ScrollDown(usize),
     Tab,
+    CtrlC,
+    CtrlD,
     CtrlP,
+    CtrlU,
     Escape,
     None,
 }
 
-/// Dedicated asynchronous background input reader thread.
-/// Completely prevents any blocking calls on the main UI thread!
+/// Reads stdin on its own thread so the UI loop never blocks.
 pub struct InputReader {
-    rx: std::sync::mpsc::Receiver<KeyAction>,
+    rx: mpsc::Receiver<KeyAction>,
 }
 
 impl InputReader {
     pub fn new() -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut stdin = io::stdin();
-            let mut chunk = [0u8; 512];
+            let mut chunk = [0u8; 4096];
             let mut pending: Vec<u8> = Vec::new();
             loop {
-                // Read whatever bytes are available as one chunk
                 let n = match stdin.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
                 };
                 pending.extend_from_slice(&chunk[..n]);
-
-                // If pending buffer ends with solitary ESC (0x1b), wait a brief 25ms window
-                // to see if subsequent escape sequence bytes arrive together
+                // A lone ESC may be the start of a sequence split across reads.
                 if pending.ends_with(&[27]) {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    std::thread::sleep(Duration::from_millis(25));
                     if has_console_input() {
-                        if let Ok(more) = stdin.read(&mut chunk) {
-                            if more > 0 {
-                                pending.extend_from_slice(&chunk[..more]);
-                            }
+                        if let Ok(m) = stdin.read(&mut chunk) {
+                            pending.extend_from_slice(&chunk[..m]);
                         }
                     }
                 }
-
-                let (actions, consumed) = parse_input_bytes(&pending);
-                pending.drain(..consumed);
+                let (actions, used) = parse_input_bytes(&pending);
+                pending.drain(..used);
                 for a in actions {
                     if a != KeyAction::None && tx.send(a).is_err() {
                         return;
@@ -405,28 +306,49 @@ impl InputReader {
         Self { rx }
     }
 
-    #[inline]
     pub fn poll(&self) -> KeyAction {
         self.rx.try_recv().unwrap_or(KeyAction::None)
     }
 }
 
-/// Parses a raw input byte buffer into key/mouse actions.
-/// Returns `(actions, bytes_consumed)`. Incomplete trailing escape sequences are left
-/// unconsumed so the next read can complete them. Unknown sequences and mouse tracking clicks
-/// are swallowed whole and never leaked into the input box as text.
+impl Default for InputReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parses raw VT input into actions. Returns `(actions, bytes_consumed)`; an incomplete
+/// trailing escape sequence (or unfinished bracketed paste) is left for the next read.
+/// Mouse clicks and unknown sequences are swallowed, never typed into the prompt.
 pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
+    const PASTE_START: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
     let mut out = Vec::new();
     let mut i = 0;
     while i < buf.len() {
         let b = buf[i];
         match b {
+            27 if buf[i..].starts_with(PASTE_START) => {
+                let body = i + PASTE_START.len();
+                let Some(end) = buf[body..].windows(PASTE_END.len()).position(|w| w == PASTE_END) else { break };
+                let text = String::from_utf8_lossy(&buf[body..body + end]).replace("\r\n", "\n").replace('\r', "\n");
+                out.push(KeyAction::Paste(text));
+                i = body + end + PASTE_END.len();
+            }
             3 => {
-                out.push(KeyAction::Escape);
+                out.push(KeyAction::CtrlC);
                 i += 1;
             }
-            13 | 10 => {
+            4 => {
+                out.push(KeyAction::CtrlD);
+                i += 1;
+            }
+            13 => {
                 out.push(KeyAction::Enter);
+                i += 1;
+            }
+            10 => {
+                out.push(KeyAction::Newline);
                 i += 1;
             }
             8 | 127 => {
@@ -441,8 +363,11 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 out.push(KeyAction::CtrlP);
                 i += 1;
             }
+            21 => {
+                out.push(KeyAction::CtrlU);
+                i += 1;
+            }
             27 => {
-                // Lone ESC at end of chunk: treated as Escape key
                 if i + 1 >= buf.len() {
                     out.push(KeyAction::Escape);
                     i += 1;
@@ -450,34 +375,29 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 }
                 let next = buf[i + 1];
                 if next != b'[' && next != b'O' {
-                    // ESC followed by something else (Alt+key / double ESC): treat as Escape
                     out.push(KeyAction::Escape);
                     i += 1;
                     continue;
                 }
-                // CSI / SS3: params are bytes 0x20..=0x3F, final byte 0x40..=0x7E
                 let mut j = i + 2;
                 while j < buf.len() && (0x20..=0x3F).contains(&buf[j]) {
                     j += 1;
                 }
                 if j >= buf.len() {
-                    // Incomplete sequence: leave in pending buffer to wait for next chunk
                     break;
                 }
                 let fin = buf[j];
                 let params = std::str::from_utf8(&buf[i + 2..j]).unwrap_or("");
                 let action = if let Some(sgr) = params.strip_prefix('<') {
-                    // SGR extended mouse mode: \x1b[<btn;col;rowM or m
                     let btn = sgr.split(';').next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
                     match btn & !(4 | 8 | 16) {
                         64 => KeyAction::ScrollUp(3),
                         65 => KeyAction::ScrollDown(3),
-                        _ => KeyAction::None, // clicks, releases, drags silently swallowed
+                        _ => KeyAction::None,
                     }
                 } else if fin == b'M' && params.is_empty() {
-                    // Legacy X10 mouse: 3 raw bytes follow
                     if j + 3 >= buf.len() {
-                        break; // wait for the 3 payload bytes
+                        break;
                     }
                     let btn = buf[j + 1].saturating_sub(32);
                     j += 3;
@@ -512,7 +432,7 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 i = j + 1;
             }
             b'[' if i + 1 < buf.len() && (buf[i + 1] == b'<' || buf[i + 1] == b'?') => {
-                // Safeguard against orphaned CSI sequences missing leading ESC
+                // Orphaned CSI body (its ESC was eaten): swallow it.
                 let mut j = i + 2;
                 while j < buf.len() && (0x20..=0x3F).contains(&buf[j]) {
                     j += 1;
@@ -523,7 +443,7 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 i = j + 1;
             }
             b';' if i + 1 < buf.len() && buf[i + 1].is_ascii_digit() => {
-                // Safeguard against orphaned SGR coordinate fragments like ";77;27M"
+                // Orphaned SGR mouse coordinates like ";77;27M".
                 let mut j = i + 1;
                 while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
                     j += 1;
@@ -536,9 +456,7 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 }
             }
             b if b >= 32 => {
-                // UTF-8 decode one character
                 let len = match b {
-                    0x00..=0x7F => 1,
                     0xC0..=0xDF => 2,
                     0xE0..=0xEF => 3,
                     0xF0..=0xF7 => 4,
@@ -547,22 +465,18 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 if i + len > buf.len() {
                     break;
                 }
-                if let Ok(s) = std::str::from_utf8(&buf[i..i + len]) {
-                    if let Some(c) = s.chars().next() {
-                        out.push(KeyAction::Char(c));
-                    }
+                if let Some(c) = std::str::from_utf8(&buf[i..i + len]).ok().and_then(|s| s.chars().next()) {
+                    out.push(KeyAction::Char(c));
                 }
                 i += len;
             }
-            _ => {
-                i += 1;
-            }
+            _ => i += 1,
         }
     }
     (out, i)
 }
 
-/// Text input line editor state.
+/// Prompt text with a cursor (in chars). May hold newlines.
 #[derive(Default)]
 pub struct InputBuffer {
     pub text: String,
@@ -570,1416 +484,1553 @@ pub struct InputBuffer {
 }
 
 impl InputBuffer {
+    fn byte_at(&self, char_idx: usize) -> usize {
+        self.text.char_indices().nth(char_idx).map_or(self.text.len(), |(i, _)| i)
+    }
     pub fn insert(&mut self, ch: char) {
-        let byte_pos = self.text.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.text.len());
-        self.text.insert(byte_pos, ch);
+        let b = self.byte_at(self.cursor);
+        self.text.insert(b, ch);
         self.cursor += 1;
     }
-
+    pub fn insert_str(&mut self, s: &str) {
+        let b = self.byte_at(self.cursor);
+        self.text.insert_str(b, s);
+        self.cursor += s.chars().count();
+    }
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1;
-            let byte_pos = self.text.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.text.len());
-            self.text.remove(byte_pos);
+            let b = self.byte_at(self.cursor);
+            self.text.remove(b);
         }
     }
-
     pub fn delete(&mut self) {
-        let char_count = self.text.chars().count();
-        if self.cursor < char_count {
-            let byte_pos = self.text.char_indices().nth(self.cursor).map(|(i, _)| i).unwrap_or(self.text.len());
-            self.text.remove(byte_pos);
-        }
-    }
-
-    pub fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
-    }
-
-    pub fn move_right(&mut self) {
         if self.cursor < self.text.chars().count() {
-            self.cursor += 1;
+            let b = self.byte_at(self.cursor);
+            self.text.remove(b);
         }
     }
-
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+    }
     pub fn move_home(&mut self) {
         self.cursor = 0;
     }
-
     pub fn move_end(&mut self) {
         self.cursor = self.text.chars().count();
     }
-
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
     }
-
     pub fn set_text(&mut self, s: &str) {
         self.text = s.to_string();
         self.cursor = self.text.chars().count();
     }
 }
 
-/// Message turn stored for rendering conversation history.
-pub struct ChatMessage {
-    pub role: String,
-    pub text: String,
-    pub speed_badge: Option<String>,
-}
+// ------------------------------------------------------------------------- text utils
 
-/// Formatted line to be rendered inside the chat viewport.
-struct ViewportLine {
-    text: String,
-    fg: Rgb,
-    bold: bool,
-    dim: bool,
-}
-
-/// Responsive word-wrapping algorithm that cleanly partitions paragraphs by whitespace
-/// and breaks excessively long tokens without panicking or exceeding `max_width`.
+/// Word-wraps prose to `max_width` columns (long words are split).
 pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let w = max_width.max(8);
     let mut out = Vec::new();
-    let max_w = max_width.max(15);
-
-    for raw_line in text.lines() {
-        let trimmed = raw_line.trim_end();
-        if trimmed.is_empty() {
+    for raw in text.lines() {
+        let line = raw.trim_end().replace('\t', "    ");
+        if line.trim().is_empty() {
             out.push(String::new());
             continue;
         }
-
-        let words: Vec<&str> = trimmed.split_whitespace().collect();
-        if words.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-
-        let mut cur = String::new();
-        for word in words {
-            let w_len = word.chars().count();
-            if cur.is_empty() {
-                if w_len > max_w {
-                    let mut char_iter = word.chars();
-                    loop {
-                        let chunk: String = char_iter.by_ref().take(max_w).collect();
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        if char_iter.clone().next().is_none() {
-                            cur = chunk;
-                        } else {
-                            out.push(chunk);
-                        }
-                    }
-                } else {
-                    cur.push_str(word);
-                }
-            } else if cur.chars().count() + 1 + w_len <= max_w {
+        let indent: String = line.chars().take_while(|c| *c == ' ').collect();
+        let mut cur = indent.clone();
+        let mut cur_len = indent.chars().count();
+        for word in line.split_whitespace() {
+            let wl = word.chars().count();
+            if cur_len > indent.len() && cur_len + 1 + wl > w {
+                out.push(std::mem::take(&mut cur));
+                cur = indent.clone();
+                cur_len = indent.chars().count();
+            }
+            if cur_len > indent.len() {
                 cur.push(' ');
-                cur.push_str(word);
-            } else {
-                out.push(cur);
-                cur = String::new();
-                if w_len > max_w {
-                    let mut char_iter = word.chars();
-                    loop {
-                        let chunk: String = char_iter.by_ref().take(max_w).collect();
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        if char_iter.clone().next().is_none() {
-                            cur = chunk;
-                        } else {
-                            out.push(chunk);
-                        }
+                cur_len += 1;
+            }
+            if wl > w.saturating_sub(cur_len) && wl > w / 2 {
+                for ch in word.chars() {
+                    if cur_len >= w {
+                        out.push(std::mem::take(&mut cur));
+                        cur_len = 0;
                     }
-                } else {
-                    cur.push_str(word);
+                    cur.push(ch);
+                    cur_len += 1;
                 }
+            } else {
+                cur.push_str(word);
+                cur_len += wl;
             }
         }
-        if !cur.is_empty() {
+        if !cur.trim().is_empty() {
             out.push(cur);
         }
     }
     out
 }
 
-/// The Full-Screen TUI Orchestrator.
+/// Hard-wraps one line at exactly `w` columns, keeping spaces (for code and command output).
+fn hard_wrap(line: &str, w: usize) -> Vec<String> {
+    let line = line.replace('\t', "    ");
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars.chunks(w.max(1)).map(|c| c.iter().collect()).collect()
+}
+
+fn fmt_tokens(n: usize) -> String {
+    if n >= 10_000 {
+        format!("{:.0}K", n as f64 / 1000.0)
+    } else if n >= 1000 {
+        format!("{:.1}K", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn spinner_frame(t0: Instant) -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    FRAMES[(t0.elapsed().as_millis() / 80) as usize % FRAMES.len()]
+}
+
+/// Splits a raw (streaming) reply into `(thinking, visible)` and drops tool-call markup;
+/// `pending_tool` is true while a `<tool_call>` block is still being written.
+fn split_reply(raw: &str) -> (String, String, bool) {
+    let mut thinking = String::new();
+    let mut visible = String::new();
+    let mut rest = raw;
+    if let Some(s) = rest.find("<think>") {
+        visible.push_str(&rest[..s]);
+        let after = &rest[s + 7..];
+        match after.find("</think>") {
+            Some(e) => {
+                thinking.push_str(&after[..e]);
+                rest = &after[e + 8..];
+            }
+            None => {
+                thinking.push_str(after);
+                rest = "";
+            }
+        }
+    }
+    let mut pending = false;
+    let mut r = rest;
+    while let Some(s) = r.find("<tool_call>") {
+        visible.push_str(&r[..s]);
+        match r[s..].find("</tool_call>") {
+            Some(e) => r = &r[s + e + 12..],
+            None => {
+                pending = true;
+                r = "";
+            }
+        }
+    }
+    visible.push_str(r);
+    // A tag still being streamed token by token ("<tool_c…") is not shown yet.
+    let partial = crate::tools::partial_tag_suffix(&visible, "<tool_call>");
+    if partial >= 2 {
+        visible.truncate(visible.len() - partial);
+        pending = true;
+    }
+    (thinking.trim().to_string(), visible.trim().to_string(), pending)
+}
+
+// ------------------------------------------------------------------- conversation model
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolState {
+    Running,
+    Ok,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+enum Entry {
+    User(String),
+    /// Raw reply text (with think / tool-call markup; filtered at render time).
+    Assistant { raw: String, streaming: bool },
+    Tool { icon: &'static str, title: String, state: ToolState, error: Option<String>, preview: Option<String>, block: bool },
+    /// `▣ Agent · model · 3.2s · 11.4 tok/s · ...`
+    Footer { agent: String, detail: String },
+    Notice { text: String, error: bool },
+}
+
+/// One styled run of text.
+#[derive(Clone, Debug)]
+struct Span {
+    text: String,
+    fg: Rgb,
+    bold: bool,
+    italic: bool,
+}
+
+fn span(text: impl Into<String>, fg: Rgb) -> Span {
+    Span { text: text.into(), fg, bold: false, italic: false }
+}
+
+/// One rendered row of the transcript.
+#[derive(Clone, Debug, Default)]
+struct Line {
+    spans: Vec<Span>,
+    /// Background for the whole row (panels: user messages, tool blocks, code).
+    bg: Option<Rgb>,
+    /// `┃` drawn in the first column in this color.
+    bar: Option<Rgb>,
+}
+
+impl Line {
+    fn blank() -> Self {
+        Self::default()
+    }
+    fn of(spans: Vec<Span>) -> Self {
+        Self { spans, ..Default::default() }
+    }
+}
+
+/// Minimal markdown: fenced code, headings, bullets, `inline code` and **bold**.
+fn markdown_lines(text: &str, width: usize, out: &mut Vec<Line>) {
+    let mut in_code = false;
+    for raw in text.lines() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            in_code = !in_code;
+            let lang = trimmed.trim_start_matches('`').trim();
+            if in_code && !lang.is_empty() {
+                out.push(Line { spans: vec![span(format!(" {lang}"), MUTED)], bg: Some(PANEL), bar: None });
+            }
+            continue;
+        }
+        if in_code {
+            for part in hard_wrap(raw, width.saturating_sub(2)) {
+                out.push(Line { spans: vec![span(format!(" {part}"), TEXT)], bg: Some(PANEL), bar: None });
+            }
+            continue;
+        }
+        if let Some(h) = trimmed.strip_prefix('#') {
+            let title = h.trim_start_matches('#').trim();
+            for part in wrap_text(title, width) {
+                out.push(Line::of(vec![Span { text: part, fg: ACCENT, bold: true, italic: false }]));
+            }
+            continue;
+        }
+        let (lead, body) = match trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            Some(b) => (format!("{}• ", " ".repeat(raw.len() - trimmed.len())), b),
+            None => (String::new(), raw),
+        };
+        let lead_w = lead.chars().count();
+        for (i, part) in wrap_text(body, width.saturating_sub(lead_w)).into_iter().enumerate() {
+            let mut spans = vec![span(if i == 0 { lead.clone() } else { " ".repeat(lead_w) }, MUTED)];
+            spans.extend(inline_markdown(&part));
+            out.push(Line::of(spans));
+        }
+        if body.trim().is_empty() {
+            out.push(Line::blank());
+        }
+    }
+}
+
+/// `inline code` in green, **bold** in bold (opencode's markdown colors).
+fn inline_markdown(s: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    let mut code = false;
+    let mut bold = false;
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    let flush = |cur: &mut String, out: &mut Vec<Span>, code: bool, bold: bool| {
+        if !cur.is_empty() {
+            out.push(Span { text: std::mem::take(cur), fg: if code { SUCCESS } else { TEXT }, bold, italic: false });
+        }
+    };
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            flush(&mut cur, &mut out, code, bold);
+            code = !code;
+        } else if c == '*' && chars.peek() == Some(&'*') && !code {
+            chars.next();
+            flush(&mut cur, &mut out, code, bold);
+            bold = !bold;
+        } else {
+            cur.push(c);
+        }
+    }
+    flush(&mut cur, &mut out, code, bold);
+    out
+}
+
+impl Entry {
+    fn layout(&self, width: usize, show_think: bool, t0: Instant, out: &mut Vec<Line>) {
+        let w = width.max(10);
+        match self {
+            Entry::User(text) => {
+                out.push(Line::blank());
+                let pad = Line { spans: vec![], bg: Some(PANEL), bar: Some(PRIMARY) };
+                out.push(pad.clone());
+                for l in wrap_text(text, w.saturating_sub(4)) {
+                    out.push(Line { spans: vec![span(format!("  {l}"), TEXT)], bg: Some(PANEL), bar: Some(PRIMARY) });
+                }
+                out.push(pad);
+            }
+            Entry::Assistant { raw, streaming } => {
+                let (thinking, visible, pending_tool) = split_reply(raw);
+                let ind = 3;
+                let mut body = Vec::new();
+                if !thinking.is_empty() {
+                    body.push(Line::blank());
+                    let lines = wrap_text(&thinking, w - ind - 10);
+                    let keep = if show_think { lines.len() } else { 3.min(lines.len()) };
+                    for (i, l) in lines.iter().take(keep).enumerate() {
+                        let lead = if i == 0 { "Thinking: " } else { "          " };
+                        body.push(Line::of(vec![span(lead, MUTED), Span { text: l.clone(), fg: MUTED, bold: false, italic: true }]));
+                    }
+                    if lines.len() > keep {
+                        body.push(Line::of(vec![span(format!("          … {} more lines (/think show)", lines.len() - keep), MUTED)]));
+                    }
+                }
+                if !visible.is_empty() {
+                    body.push(Line::blank());
+                    markdown_lines(&visible, w - ind, &mut body);
+                } else if *streaming && thinking.is_empty() && !pending_tool {
+                    body.push(Line::blank());
+                    body.push(Line::of(vec![span(format!("{} ", spinner_frame(t0)), PRIMARY), span("Thinking…", MUTED)]));
+                }
+                if pending_tool && *streaming {
+                    body.push(Line::blank());
+                    body.push(Line::of(vec![span(format!("{} ", spinner_frame(t0)), MUTED), span("Preparing tool call…", MUTED)]));
+                }
+                for mut l in body {
+                    if l.bg.is_some() {
+                        // Code panel: indent by padding inside the panel area.
+                        l.spans.insert(0, span("", TEXT));
+                    }
+                    l.spans.insert(0, span(" ".repeat(ind), TEXT));
+                    out.push(l);
+                }
+            }
+            Entry::Tool { icon, title, state, error, preview, block } => {
+                let color = match state {
+                    ToolState::Failed => ERROR,
+                    _ => MUTED,
+                };
+                let glyph = if *state == ToolState::Running { spinner_frame(t0).to_string() } else { icon.to_string() };
+                if *block {
+                    out.push(Line::blank());
+                    let row = |spans: Vec<Span>| Line { spans, bg: Some(PANEL), bar: Some(BG) };
+                    out.push(row(vec![]));
+                    let head = if *icon == "$" {
+                        vec![span(format!("  {glyph} "), if *state == ToolState::Running { MUTED } else { TEXT }), span(title.clone(), TEXT)]
+                    } else {
+                        vec![span(format!("  {glyph} "), color), span(title.clone(), color)]
+                    };
+                    let head_text: String = head.iter().map(|s| s.text.as_str()).collect();
+                    for (i, l) in hard_wrap(&head_text, w.saturating_sub(4)).into_iter().take(3).enumerate() {
+                        out.push(row(if i == 0 { head.clone() } else { vec![span(format!("    {l}"), TEXT)] }));
+                    }
+                    if let Some(p) = preview {
+                        out.push(row(vec![]));
+                        for pl in p.lines().take(24) {
+                            let (fg, bg) = match pl.chars().next() {
+                                Some('+') if *icon != "$" => (DIFF_ADD, Some(DIFF_ADD_BG)),
+                                Some('-') if *icon != "$" => (DIFF_DEL, Some(DIFF_DEL_BG)),
+                                _ => (MUTED, None),
+                            };
+                            for part in hard_wrap(pl, w.saturating_sub(6)) {
+                                out.push(Line { spans: vec![span("  ", TEXT), span(part, fg)], bg: bg.or(Some(PANEL)), bar: Some(BG) });
+                            }
+                        }
+                    }
+                    if let Some(e) = error {
+                        for l in wrap_text(e, w.saturating_sub(6)).into_iter().take(4) {
+                            out.push(row(vec![span(format!("  {l}"), ERROR)]));
+                        }
+                    }
+                    out.push(row(vec![]));
+                } else {
+                    out.push(Line::of(vec![span(format!("   {glyph} "), color), span(title.clone(), color)]));
+                    if let Some(e) = error {
+                        for l in wrap_text(e, w.saturating_sub(8)).into_iter().take(3) {
+                            out.push(Line::of(vec![span(format!("     {l}"), ERROR)]));
+                        }
+                    }
+                }
+            }
+            Entry::Footer { agent, detail } => {
+                out.push(Line::blank());
+                out.push(Line::of(vec![span("   ▣ ", PRIMARY), span(agent.clone(), PRIMARY), span(format!(" · {detail}"), MUTED)]));
+            }
+            Entry::Notice { text, error } => {
+                out.push(Line::blank());
+                for l in text.lines() {
+                    for part in hard_wrap(l, w.saturating_sub(4)) {
+                        out.push(Line::of(vec![span(format!("   {part}"), if *error { ERROR } else { MUTED })]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------- slash commands
+
+/// `(command, description)`, shown in `/help` and the autocomplete popup.
+const COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show commands and keys"),
+    ("/new", "start a new conversation (clears the KV-cache)"),
+    ("/tools", "toggle agent tools: /tools on|off"),
+    ("/think", "reasoning: /think on|off|show|hide"),
+    ("/undo", "revert the last file the agent changed"),
+    ("/diff", "git diff --stat of the working tree"),
+    ("/review", "ask the model to review the uncommitted diff"),
+    ("/compact", "summarize the conversation and restart from the summary"),
+    ("/init", "create an AGENTS.md / SPINDLE.md with project instructions"),
+    ("/model", "model, memory and KV-cache details"),
+    ("/cluster", "cluster status and round-trip latency"),
+    ("/spec", "speculative decoding: /spec on|off|<draft len>"),
+    ("/moe-prune", "MoE expert pruning: /moe-prune <n experts | fraction>"),
+    ("/system", "show or set the system prompt"),
+    ("/max", "max tokens per reply: /max <n>"),
+    ("/bench", "measure decode speed: /bench [tokens]"),
+    ("/exit", "quit (also ctrl+c on an empty prompt)"),
+];
+
+fn command_matches(input: &str) -> Vec<(&'static str, &'static str)> {
+    if !input.starts_with('/') || input.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let q = input.to_ascii_lowercase();
+    COMMANDS.iter().copied().filter(|(c, _)| c.starts_with(&q)).collect()
+}
+
+// ---------------------------------------------------------------------------------- UI
+
+/// Facts about the session shown in the prompt metadata, status row and sidebar.
+struct SessionInfo {
+    model: String,
+    cluster: Option<String>,
+    local_layers: String,
+    worker_layers: Option<String>,
+    wire: Option<String>,
+    ctx_max: usize,
+    ctx_used: usize,
+    tools: bool,
+    think: bool,
+    speculate: bool,
+    last_tps: Option<f64>,
+    spec: (usize, usize),
+    branch: Option<String>,
+}
+
+enum UiEvent {
+    Agent(AgentEvent),
+    Confirm(String, mpsc::Sender<bool>),
+    Done(TurnStats, usize),
+}
+
 pub struct SpindleTui {
     canvas: Canvas,
     input: InputBuffer,
-    history: Vec<ChatMessage>,
+    entries: Vec<Entry>,
     prompt_history: Vec<String>,
     history_idx: Option<usize>,
     pub scroll_offset: usize,
     pub running: bool,
-    pub model_name: String,
-    pub cluster_peer: Option<String>,
-    pub wire_format: String,
-    pub prune_val: f32,
-    pub layers_info: String,
-    pub git_branch: String,
-    pub draft_name: Option<String>,
-    input_reader: InputReader,
+    info: SessionInfo,
+    show_think: bool,
+    reader: InputReader,
+    t0: Instant,
+    /// Highlighted row in the slash-command popup.
+    popup_sel: usize,
+    /// Pending permission request from the agent: (description, reply channel).
+    confirm: Option<(String, mpsc::Sender<bool>)>,
+    generating: bool,
+    /// A prompt typed while the model was busy; sent when the turn ends.
+    queued: Option<String>,
 }
 
 impl SpindleTui {
-    pub fn new(
-        model_name: &str,
-        cluster_peer: Option<&str>,
-        wire_format: &str,
-        prune_val: f32,
-        layers_info: &str,
-    ) -> Self {
+    fn new(info: SessionInfo) -> Self {
         let (w, h) = terminal_size();
-        let branch = Self::detect_git_branch().unwrap_or_else(|| "main".to_string());
         Self {
             canvas: Canvas::new(w, h),
             input: InputBuffer::default(),
-            history: Vec::new(),
+            entries: Vec::new(),
             prompt_history: Vec::new(),
             history_idx: None,
             scroll_offset: 0,
             running: true,
-            model_name: model_name.to_string(),
-            cluster_peer: cluster_peer.map(str::to_string),
-            wire_format: wire_format.to_string(),
-            prune_val,
-            layers_info: layers_info.to_string(),
-            git_branch: branch,
-            draft_name: None,
-            input_reader: InputReader::new(),
+            info,
+            show_think: false,
+            reader: InputReader::new(),
+            t0: Instant::now(),
+            popup_sel: 0,
+            confirm: None,
+            generating: false,
+            queued: None,
         }
     }
 
-    #[inline]
-    pub fn poll_key(&self) -> KeyAction {
-        self.input_reader.poll()
+    fn notice(&mut self, text: &str) {
+        self.entries.push(Entry::Notice { text: text.to_string(), error: false });
+        self.scroll_offset = 0;
     }
 
-    fn detect_git_branch() -> Option<String> {
-        let output = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let b = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !b.is_empty() {
-                return Some(b);
+    fn error(&mut self, text: &str) {
+        self.entries.push(Entry::Notice { text: text.to_string(), error: true });
+        self.scroll_offset = 0;
+    }
+
+    fn git_branch() -> Option<String> {
+        let out = std::process::Command::new("git").args(["rev-parse", "--abbrev-ref", "HEAD"]).output().ok()?;
+        let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !b.is_empty()).then_some(b)
+    }
+
+    fn cwd_label(&self) -> String {
+        let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into());
+        let cwd = match std::env::var("USERPROFILE") {
+            Ok(home) if cwd.starts_with(&home) => format!("~{}", &cwd[home.len()..]),
+            _ => cwd,
+        };
+        match &self.info.branch {
+            Some(b) => format!("{cwd}:{b}"),
+            None => cwd,
+        }
+    }
+
+    // ------------------------------------------------------------------- rendering
+
+    fn draw_line(&mut self, x0: u16, y: u16, width: u16, line: &Line) {
+        let max_x = x0 + width;
+        if let Some(bg) = line.bg {
+            self.canvas.fill(x0, y, width, 1, bg);
+        }
+        let bg = line.bg.unwrap_or(BG);
+        let mut x = x0;
+        if let Some(bar) = line.bar {
+            self.canvas.put(x0, y, '┃', bar, BG, false);
+            x += 1;
+        }
+        for s in &line.spans {
+            let start = x;
+            x = self.canvas.text(x, y, max_x, &s.text, s.fg, bg, s.bold);
+            if s.italic {
+                for cx in start..x {
+                    if let Some(i) = (cx < self.canvas.width).then(|| y as usize * self.canvas.width as usize + cx as usize) {
+                        self.canvas.grid[i].italic = true;
+                    }
+                }
             }
+        }
+    }
+
+    /// Prompt box (opencode `component/prompt`): `┃` bar, panel background, input rows,
+    /// a metadata row, then a `▀` bottom edge. Returns its height. `y` is its top row.
+    fn draw_prompt(&mut self, x0: u16, y: u16, w: u16, rows: &[String], cursor: (usize, usize)) -> u16 {
+        let bar = if self.confirm.is_some() { WARNING } else { PRIMARY };
+        let h = rows.len() as u16 + 4;
+        self.canvas.fill(x0 + 1, y, w.saturating_sub(1), h - 1, PANEL);
+        for r in 0..h - 1 {
+            self.canvas.put(x0, y + r, '┃', bar, BG, false);
+        }
+        let tx = x0 + 3;
+        let max_x = x0 + w.saturating_sub(2);
+        if let Some((what, _)) = self.confirm.clone() {
+            self.canvas.text(tx, y + 1, max_x, "△ Permission required", WARNING, PANEL, true);
+            let line: String = what.chars().take((max_x - tx) as usize).collect();
+            self.canvas.text(tx, y + 2, max_x, &line, TEXT, PANEL, false);
+            let mut x = self.canvas.text(tx, y + h - 2, max_x, "enter", TEXT, PANEL, true);
+            x = self.canvas.text(x, y + h - 2, max_x, " allow   ", MUTED, PANEL, false);
+            x = self.canvas.text(x, y + h - 2, max_x, "esc", TEXT, PANEL, true);
+            self.canvas.text(x, y + h - 2, max_x, " deny", MUTED, PANEL, false);
+        } else if self.input.text.is_empty() {
+            self.canvas.put(tx, y + 1, ' ', PANEL, TEXT, false);
+            let ph = if self.entries.is_empty() { "Ask anything… \"What does this project do?\"" } else { "Ask anything…" };
+            self.canvas.text(tx + 1, y + 1, max_x, ph, MUTED, PANEL, false);
+        } else {
+            for (i, r) in rows.iter().enumerate() {
+                self.canvas.text(tx, y + 1 + i as u16, max_x, r, TEXT, PANEL, false);
+            }
+            let (cr, cc) = cursor;
+            let cx = tx + cc as u16;
+            let cy = y + 1 + cr as u16;
+            let under = self.canvas.cell(cx, cy).map_or(' ', |c| c.ch);
+            self.canvas.put(cx, cy, under, PANEL, TEXT, false);
+        }
+        if self.confirm.is_none() {
+            // Metadata row: agent mode, model, where it runs.
+            let my = y + h - 2;
+            let mode = if self.info.tools { "Agent" } else { "Chat" };
+            let mut x = self.canvas.text(tx, my, max_x, mode, PRIMARY, PANEL, true);
+            x = self.canvas.text(x, my, max_x, "  ", MUTED, PANEL, false);
+            x = self.canvas.text(x, my, max_x, &self.info.model.clone(), TEXT, PANEL, false);
+            let where_ = match &self.info.cluster {
+                Some(peer) => format!("  cluster {peer}"),
+                None => "  local".to_string(),
+            };
+            x = self.canvas.text(x, my, max_x, &where_, MUTED, PANEL, false);
+            if self.info.think {
+                self.canvas.text(x, my, max_x, "  think", ACCENT, PANEL, false);
+            }
+        }
+        // Bottom edge: `╹` under the bar and a half-block strip in the panel color.
+        let ey = y + h - 1;
+        self.canvas.put(x0, ey, '╹', bar, BG, false);
+        for cx in x0 + 1..x0 + w {
+            self.canvas.put(cx, ey, '▀', PANEL, BG, false);
+        }
+        h
+    }
+
+    /// Wraps the prompt text to `w` columns; returns the visible rows (max 6) and the
+    /// cursor's (row, col) within them.
+    fn prompt_rows(&self, w: usize) -> (Vec<String>, (usize, usize)) {
+        let w = w.max(4);
+        let mut rows: Vec<String> = Vec::new();
+        let mut cursor = (0, 0);
+        let mut idx = 0;
+        for line in self.input.text.split('\n') {
+            let chars: Vec<char> = line.chars().collect();
+            let chunks: Vec<&[char]> = if chars.is_empty() { vec![&[][..]] } else { chars.chunks(w).collect() };
+            for (ci, chunk) in chunks.iter().enumerate() {
+                let start = idx + ci * w;
+                let end = start + chunk.len();
+                let last_chunk = ci + 1 == chunks.len();
+                if self.input.cursor >= start && (self.input.cursor < end || (last_chunk && self.input.cursor == end)) {
+                    cursor = (rows.len(), self.input.cursor - start);
+                    if cursor.1 >= w {
+                        cursor = (rows.len() + 1, 0);
+                    }
+                }
+                rows.push(chunk.iter().collect());
+            }
+            idx += chars.len() + 1;
+        }
+        if cursor.0 >= rows.len() {
+            rows.push(String::new());
+        }
+        let max_rows = 6;
+        let first = cursor.0.saturating_sub(max_rows - 1);
+        let visible: Vec<String> = rows.into_iter().skip(first).take(max_rows).collect();
+        (visible, (cursor.0 - first, cursor.1))
+    }
+
+    /// Row under the prompt: spinner + `esc interrupt` while busy, else the directory;
+    /// context usage on the right.
+    fn draw_status(&mut self, x0: u16, y: u16, w: u16) {
+        let max_x = x0 + w;
+        if self.generating {
+            let mut x = self.canvas.text(x0 + 1, y, max_x, &format!("{} ", spinner_frame(self.t0)), PRIMARY, BG, false);
+            x = self.canvas.text(x, y, max_x, "esc", TEXT, BG, true);
+            x = self.canvas.text(x, y, max_x, " interrupt", MUTED, BG, false);
+            if self.queued.is_some() {
+                self.canvas.text(x, y, max_x, "   1 message queued", ACCENT, BG, false);
+            }
+        } else {
+            let cwd = self.cwd_label();
+            self.canvas.text(x0 + 1, y, max_x.saturating_sub(24), &cwd, MUTED, BG, false);
+        }
+        let used = self.info.ctx_used;
+        let pct = used * 100 / self.info.ctx_max.max(1);
+        let right = match self.info.last_tps {
+            Some(t) => format!("{} ({pct}%) · {t:.1} tok/s", fmt_tokens(used)),
+            None => format!("{} ({pct}%)", fmt_tokens(used)),
+        };
+        let rx = (x0 + w).saturating_sub(right.chars().count() as u16 + 1);
+        self.canvas.text(rx, y, max_x, &right, MUTED, BG, false);
+    }
+
+    /// Slash-command popup drawn just above the prompt.
+    fn draw_popup(&mut self, x0: u16, bottom: u16, w: u16) {
+        let matches = command_matches(&self.input.text);
+        if matches.is_empty() || self.confirm.is_some() {
+            return;
+        }
+        self.popup_sel = self.popup_sel.min(matches.len() - 1);
+        let n = matches.len().min(8) as u16;
+        let top = bottom.saturating_sub(n);
+        let first = self.popup_sel.saturating_sub(7);
+        for (i, (cmd, desc)) in matches.iter().skip(first).take(8).enumerate() {
+            let y = top + i as u16;
+            let sel = first + i == self.popup_sel;
+            let bg = if sel { PRIMARY } else { ELEMENT };
+            self.canvas.fill(x0, y, w, 1, bg);
+            let x = self.canvas.text(x0 + 2, y, x0 + w, cmd, if sel { BG } else { TEXT }, bg, true);
+            self.canvas.text(x.max(x0 + 16), y, x0 + w - 1, desc, if sel { BG } else { MUTED }, bg, false);
+        }
+    }
+
+    fn draw_sidebar(&mut self, x0: u16, w: u16, h: u16) {
+        self.canvas.fill(x0, 0, w, h, PANEL);
+        let tx = x0 + 2;
+        let max_x = x0 + w - 2;
+        let mut y = 1;
+        let title = self.entries.iter().find_map(|e| if let Entry::User(t) = e { Some(t.clone()) } else { None }).unwrap_or_else(|| "New session".into());
+        for l in wrap_text(&title, (w - 4) as usize).into_iter().take(2) {
+            self.canvas.text(tx, y, max_x, &l, TEXT, PANEL, true);
+            y += 1;
+        }
+        y += 1;
+        let section = |c: &mut Canvas, y: &mut u16, head: &str, rows: Vec<(String, Rgb)>| {
+            if *y + 2 >= h {
+                return;
+            }
+            c.text(tx, *y, max_x, head, TEXT, PANEL, true);
+            *y += 1;
+            for (r, fg) in rows {
+                if *y + 2 >= h {
+                    break;
+                }
+                c.text(tx, *y, max_x, &r, fg, PANEL, false);
+                *y += 1;
+            }
+            *y += 1;
+        };
+        let used = self.info.ctx_used;
+        let pct = used * 100 / self.info.ctx_max.max(1);
+        section(&mut self.canvas, &mut y, "Context", vec![
+            (format!("{} / {} tokens", fmt_tokens(used), fmt_tokens(self.info.ctx_max)), MUTED),
+            (format!("{pct}% used"), if pct > 85 { WARNING } else { MUTED }),
+        ]);
+        let mut speed = vec![(self.info.last_tps.map_or("—".into(), |t| format!("{t:.1} tok/s")), MUTED)];
+        if self.info.speculate {
+            let (a, d) = self.info.spec;
+            speed.push((if d > 0 { format!("spec {a}/{d} ({}%)", a * 100 / d) } else { "spec on".into() }, MUTED));
+        }
+        section(&mut self.canvas, &mut y, "Speed", speed);
+        let mut node = vec![(format!("local {}", self.info.local_layers), MUTED)];
+        if let Some(peer) = &self.info.cluster {
+            node.insert(0, (peer.clone(), SUCCESS));
+            if let Some(wl) = &self.info.worker_layers {
+                node.push((format!("worker {wl}"), MUTED));
+            }
+            if let Some(wire) = &self.info.wire {
+                node.push((format!("wire {wire}"), MUTED));
+            }
+        }
+        section(&mut self.canvas, &mut y, if self.info.cluster.is_some() { "Cluster" } else { "Node" }, node);
+        let files = crate::tools::modified_files();
+        if !files.is_empty() {
+            let rows = files.into_iter().take(8).map(|f| (f, MUTED)).collect();
+            section(&mut self.canvas, &mut y, "Modified Files", rows);
+        }
+        let ver = format!("spindle v{}", env!("CARGO_PKG_VERSION"));
+        self.canvas.text(tx, h - 2, max_x, "• ", SUCCESS, PANEL, false);
+        self.canvas.text(tx + 2, h - 2, max_x, &ver, MUTED, PANEL, false);
+    }
+
+    fn transcript(&self, width: usize) -> Vec<Line> {
+        let mut lines = Vec::new();
+        for e in &self.entries {
+            e.layout(width, self.show_think, self.t0, &mut lines);
+        }
+        lines
+    }
+
+    fn render(&mut self) {
+        let (w, h) = terminal_size();
+        self.canvas.resize(w, h);
+        self.canvas.clear();
+        if self.entries.is_empty() {
+            self.render_home(w, h);
+        } else {
+            self.render_session(w, h);
+        }
+        let _ = self.canvas.flush();
+    }
+
+    fn render_home(&mut self, w: u16, h: u16) {
+        // "spin" muted + "dle" bright, like opencode's two-tone wordmark.
+        const GLYPHS: [(char, [&str; 3]); 7] = [
+            ('s', ["█▀▀▀", "▀▀▀█", "▀▀▀▀"]),
+            ('p', ["█▀▀█", "█▀▀▀", "▀   "]),
+            ('i', ["▀█▀", " █ ", "▀▀▀"]),
+            ('n', ["█▀▀▄", "█  █", "▀  ▀"]),
+            ('d', ["█▀▀▄", "█  █", "▀▀▀ "]),
+            ('l', ["█   ", "█   ", "▀▀▀▀"]),
+            ('e', ["█▀▀▀", "█▀▀ ", "▀▀▀▀"]),
+        ];
+        let logo_w: u16 = GLYPHS.iter().map(|(_, g)| g[0].chars().count() as u16 + 1).sum::<u16>() - 1;
+        let box_w = w.saturating_sub(4).min(75);
+        let (rows, cursor) = self.prompt_rows(box_w.saturating_sub(6) as usize);
+        let prompt_h = rows.len() as u16 + 4;
+        let block_h = 3 + 2 + prompt_h;
+        let top = h.saturating_sub(block_h + 2) / 2;
+        let lx = w.saturating_sub(logo_w) / 2;
+        for row in 0..3 {
+            let mut x = lx;
+            for (i, (_, g)) in GLYPHS.iter().enumerate() {
+                let fg = if i < 4 { MUTED } else { TEXT };
+                x = self.canvas.text(x, top + row, w, g[row as usize], fg, BG, false) + 1;
+            }
+        }
+        let bx = w.saturating_sub(box_w) / 2;
+        let py = top + 5;
+        self.draw_popup(bx, py, box_w);
+        let ph = self.draw_prompt(bx, py, box_w, &rows, cursor);
+        let hint_y = py + ph + 1;
+        if hint_y + 2 < h {
+            let hint = "enter send · ctrl+j newline · /help commands · ctrl+c quit";
+            let hx = w.saturating_sub(hint.chars().count() as u16) / 2;
+            self.canvas.text(hx, hint_y, w, hint, MUTED, BG, false);
+        }
+        // Footer: directory left, version right.
+        let fy = h - 1;
+        let cwd = self.cwd_label();
+        self.canvas.text(2, fy, w.saturating_sub(20), &cwd, MUTED, BG, false);
+        let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
+        self.canvas.text(w.saturating_sub(ver.len() as u16 + 2), fy, w, &ver, MUTED, BG, false);
+    }
+
+    fn render_session(&mut self, w: u16, h: u16) {
+        let sidebar_w: u16 = if w >= 110 { 42 } else { 0 };
+        if sidebar_w > 0 {
+            self.draw_sidebar(w - sidebar_w, sidebar_w, h);
+        }
+        let main_w = w - sidebar_w;
+        let x0 = 2u16;
+        let col_w = main_w.saturating_sub(4);
+        let (rows, cursor) = self.prompt_rows(col_w.saturating_sub(6) as usize);
+        let prompt_h = rows.len() as u16 + 4;
+        let status_y = h - 1;
+        let prompt_y = status_y.saturating_sub(prompt_h);
+        let view_h = prompt_y.saturating_sub(1) as usize;
+
+        let lines = self.transcript(col_w as usize);
+        let max_scroll = lines.len().saturating_sub(view_h);
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+        let end = lines.len() - self.scroll_offset;
+        let start = end.saturating_sub(view_h);
+        for (i, line) in lines[start..end].iter().enumerate() {
+            self.draw_line(x0, i as u16, col_w, line);
+        }
+        if self.scroll_offset > 0 {
+            let s = format!(" ↓ {} more · pgdn ", self.scroll_offset);
+            let sx = (x0 + col_w).saturating_sub(s.chars().count() as u16);
+            self.canvas.text(sx, 0, x0 + col_w, &s, BG, MUTED, false);
+        }
+        self.draw_popup(x0, prompt_y, col_w);
+        self.draw_prompt(x0, prompt_y, col_w, &rows, cursor);
+        self.draw_status(x0, status_y, col_w);
+    }
+
+    // ------------------------------------------------------------------------ input
+
+    /// Applies a key to the prompt editor. Returns `Some(text)` when the user submits.
+    fn handle_key(&mut self, key: KeyAction) -> Option<String> {
+        let popup = command_matches(&self.input.text);
+        match key {
+            KeyAction::Char(c) => {
+                self.input.insert(c);
+                self.popup_sel = 0;
+            }
+            KeyAction::Paste(s) => self.input.insert_str(&s),
+            KeyAction::Newline => self.input.insert('\n'),
+            KeyAction::Backspace => self.input.backspace(),
+            KeyAction::Delete => self.input.delete(),
+            KeyAction::Left => self.input.move_left(),
+            KeyAction::Right => self.input.move_right(),
+            KeyAction::Home => self.input.move_home(),
+            KeyAction::End => self.input.move_end(),
+            KeyAction::CtrlU => self.input.clear(),
+            KeyAction::ScrollUp(n) => self.scroll_offset += n,
+            KeyAction::ScrollDown(n) => self.scroll_offset = self.scroll_offset.saturating_sub(n),
+            KeyAction::PageUp => self.scroll_offset += 10,
+            KeyAction::PageDown => self.scroll_offset = self.scroll_offset.saturating_sub(10),
+            KeyAction::Tab => {
+                if let Some((cmd, _)) = popup.get(self.popup_sel) {
+                    self.input.set_text(&format!("{cmd} "));
+                }
+            }
+            KeyAction::CtrlP => {
+                if self.input.text.is_empty() {
+                    self.input.set_text("/");
+                }
+            }
+            KeyAction::Up if !popup.is_empty() => self.popup_sel = self.popup_sel.saturating_sub(1),
+            KeyAction::Down if !popup.is_empty() => self.popup_sel = (self.popup_sel + 1).min(popup.len() - 1),
+            KeyAction::Up => {
+                if self.prompt_history.is_empty() || (!self.input.text.is_empty() && self.history_idx.is_none()) {
+                    self.scroll_offset += 2;
+                } else {
+                    let i = self.history_idx.map_or(self.prompt_history.len() - 1, |i| i.saturating_sub(1));
+                    self.history_idx = Some(i);
+                    let t = self.prompt_history[i].clone();
+                    self.input.set_text(&t);
+                }
+            }
+            KeyAction::Down => match self.history_idx {
+                Some(i) if i + 1 < self.prompt_history.len() => {
+                    self.history_idx = Some(i + 1);
+                    let t = self.prompt_history[i + 1].clone();
+                    self.input.set_text(&t);
+                }
+                Some(_) => {
+                    self.history_idx = None;
+                    self.input.clear();
+                }
+                None => self.scroll_offset = self.scroll_offset.saturating_sub(2),
+            },
+            KeyAction::Escape => {
+                self.input.clear();
+                self.history_idx = None;
+            }
+            KeyAction::Enter => {
+                if let Some((cmd, _)) = popup.get(self.popup_sel) {
+                    // Picking a command from the popup completes it; a complete one runs.
+                    if self.input.text.trim() != *cmd {
+                        self.input.set_text(cmd);
+                        return None;
+                    }
+                }
+                let text = self.input.text.trim().to_string();
+                if !text.is_empty() {
+                    if self.prompt_history.last() != Some(&text) {
+                        self.prompt_history.push(text.clone());
+                    }
+                    self.history_idx = None;
+                    self.input.clear();
+                    self.scroll_offset = 0;
+                    return Some(text);
+                }
+            }
+            KeyAction::CtrlC | KeyAction::CtrlD => {
+                if self.input.text.is_empty() {
+                    self.running = false;
+                } else {
+                    self.input.clear();
+                }
+            }
+            KeyAction::None => {}
         }
         None
     }
 
-    /// Renders the signature OpenCode-style hero screen in electric blue when starting.
-    pub fn render_welcome(&mut self) {
-        let (w, h) = terminal_size();
-        self.canvas.resize(w, h);
-        self.canvas.clear(Rgb::BG_DARK);
-
-        let center_x = w / 2;
-        let card_w = (w.saturating_sub(6)).clamp(40, 84);
-        let card_h = 5u16;
-        let card_x = center_x.saturating_sub(card_w / 2);
-
-        if h >= 22 {
-            // Full height terminal: display stylish block logo and centered hero card
-            let logo_y = ((h.saturating_sub(18)) / 2).max(2);
-            for (i, line) in SPINDLE_LOGO.iter().enumerate() {
-                let row = logo_y + (i as u16);
-                let len = line.chars().count() as u16;
-                let start_x = center_x.saturating_sub(len / 2);
-                let color = LOGO_GRADIENT[i % LOGO_GRADIENT.len()];
-                self.canvas.print(start_x, row, line, color, Rgb::BG_DARK, true, false);
+    /// Idle loop: renders and edits the prompt until the user submits (or quits).
+    fn read_prompt(&mut self) -> Option<String> {
+        if let Some(q) = self.queued.take() {
+            return Some(q);
+        }
+        let mut last = Instant::now() - Duration::from_secs(1);
+        loop {
+            let key = self.reader.poll();
+            let changed = key != KeyAction::None;
+            if let Some(text) = self.handle_key(key) {
+                return Some(text);
             }
-
-            // Subtitle
-            let sub_prefix = "/help";
-            let sub_mid = " for slash commands · ";
-            let sub_cmd2 = "/heal";
-            let sub_tail = " autonomous loop";
-            let total_sub_len = (sub_prefix.len() + sub_mid.len() + sub_cmd2.len() + sub_tail.len()) as u16;
-            let mut sub_x = center_x.saturating_sub(total_sub_len / 2);
-            let sub_y = logo_y + 4;
-
-            self.canvas.print(sub_x, sub_y, sub_prefix, Rgb::ORANGE, Rgb::BG_DARK, true, false);
-            sub_x += sub_prefix.len() as u16;
-            self.canvas.print(sub_x, sub_y, sub_mid, Rgb::MUTED, Rgb::BG_DARK, false, false);
-            sub_x += sub_mid.len() as u16;
-            self.canvas.print(sub_x, sub_y, sub_cmd2, Rgb::ORANGE, Rgb::BG_DARK, true, false);
-            sub_x += sub_cmd2.len() as u16;
-            self.canvas.print(sub_x, sub_y, sub_tail, Rgb::MUTED, Rgb::BG_DARK, false, false);
-
-            let card_y = logo_y + 6;
-            self.render_card_content(card_x, card_y, card_w, card_h, true);
-
-            let hotkeys = "tab tools    ctrl+p commands    /help slash commands    esc quit";
-            let hk_x = center_x.saturating_sub((hotkeys.len() as u16) / 2);
-            self.canvas.print(hk_x, card_y + card_h + 1, hotkeys, Rgb::MUTED, Rgb::BG_DARK, false, false);
-        } else {
-            // Compact terminal: sleek single-line header with no overlapping rows
-            let banner = "SPINDLE · Autonomous Distributed MoE Engine";
-            let bx = center_x.saturating_sub(banner.len() as u16 / 2);
-            self.canvas.print(bx, 1, banner, Rgb::BRIGHT_BLUE, Rgb::BG_DARK, true, false);
-
-            let sub_prefix = "/help for slash commands · /heal loop";
-            let sx = center_x.saturating_sub(sub_prefix.len() as u16 / 2);
-            self.canvas.print(sx, 2, sub_prefix, Rgb::MUTED, Rgb::BG_DARK, false, false);
-
-            let card_y = 4u16;
-            self.render_card_content(card_x, card_y, card_w, card_h, true);
-
-            if h >= 14 {
-                let hotkeys = "tab tools   ctrl+p commands   esc quit";
-                let hk_x = center_x.saturating_sub((hotkeys.len() as u16) / 2);
-                self.canvas.print(hk_x, card_y + card_h + 1, hotkeys, Rgb::MUTED, Rgb::BG_DARK, false, false);
+            if !self.running {
+                return None;
+            }
+            if changed || last.elapsed() >= Duration::from_millis(250) {
+                self.render();
+                last = Instant::now();
+            } else {
+                std::thread::sleep(Duration::from_millis(12));
             }
         }
-
-        self.render_docked_footer(w, h);
-        let _ = self.canvas.flush();
     }
+}
 
-    /// Renders an input card with prompt editor, ghost text, and meta pills.
-    fn render_card_content(&mut self, card_x: u16, card_y: u16, card_w: u16, card_h: u16, is_welcome: bool) {
-        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
+// ------------------------------------------------------------------------- turn driver
 
-        let prompt_x = card_x + 3;
-        let prompt_y = card_y + 1;
-        let visible_w = (card_w.saturating_sub(6)) as usize;
+/// Runs one agent turn on a worker thread while the UI stays live.
+fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts: AgentOpts) {
+    tui.entries.push(Entry::User(prompt.to_string()));
+    tui.entries.push(Entry::Assistant { raw: String::new(), streaming: true });
+    tui.scroll_offset = 0;
+    tui.generating = true;
+    let abort = Arc::new(AtomicBool::new(false));
+    engine.abort_signal = Some(abort.clone());
+    let (tx, rx) = mpsc::channel::<UiEvent>();
 
-        if self.input.text.is_empty() {
-            let ghost = if is_welcome {
-                "Ask anything... \"delete hello.py\", \"/review\", \"/stats\""
-            } else {
-                "Ask anything... \"delete hello.py\", \"/review\""
+    std::thread::scope(|s| {
+        let worker_abort = abort.clone();
+        let eng = &mut *engine;
+        let prompt = prompt.to_string();
+        s.spawn(move || {
+            crate::pin_current_thread_to_pcore();
+            let tx_ev = tx.clone();
+            let tx_cf = tx.clone();
+            let mut confirm = move |what: &str| -> bool {
+                let (rtx, rrx) = mpsc::channel();
+                if tx_cf.send(UiEvent::Confirm(what.to_string(), rtx)).is_err() {
+                    return false;
+                }
+                rrx.recv().unwrap_or(false)
             };
-            let max_ghost_w = visible_w.saturating_sub(2);
-            let clipped_ghost: String = ghost.chars().take(max_ghost_w).collect();
+            let stats = agent::run_turn(eng, &prompt, opts, Some(&worker_abort), &mut |ev| {
+                let _ = tx_ev.send(UiEvent::Agent(ev));
+            }, &mut confirm);
+            let _ = tx.send(UiEvent::Done(stats, eng.cur_pos));
+        });
 
-            self.canvas.set(prompt_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
-            self.canvas.print(prompt_x + 2, prompt_y, &clipped_ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
-        } else {
-            let total_chars = self.input.text.chars().count();
-            let cursor = self.input.cursor.min(total_chars);
-            let window_start = if cursor >= visible_w { cursor - visible_w + 1 } else { 0 };
-
-            let visible_text: String = self.input.text.chars().skip(window_start).take(visible_w).collect();
-            self.canvas.print(prompt_x, prompt_y, &visible_text, Rgb::WHITE, Rgb::CARD_BG, false, false);
-
-            let cursor_x = prompt_x + (cursor - window_start) as u16;
-            let char_under = self.input.text.chars().nth(cursor).unwrap_or(' ');
-            self.canvas.set(cursor_x, prompt_y, char_under, Rgb::CARD_BG, Rgb::BRIGHT_BLUE, true, false);
-        }
-
-        let meta_y = card_y + 3;
-        let mut mx = prompt_x;
-        let max_card_content_x = card_x + card_w - 2;
-
-        if mx + 6 < max_card_content_x {
-            self.canvas.print(mx, meta_y, "Build", Rgb::ICE_CYAN, Rgb::CARD_BG, true, false);
-            mx += 6;
-        }
-
-        let model_badge = if is_welcome {
-            format!("· {} ({})", self.model_name, self.layers_info)
-        } else {
-            format!("· {}", self.model_name)
-        };
-        if mx + (model_badge.len() as u16) < max_card_content_x {
-            self.canvas.print(mx, meta_y, &model_badge, Rgb::WHITE, Rgb::CARD_BG, false, false);
-            mx += model_badge.len() as u16 + 1;
-        }
-
-        let prune_badge = format!("· {:.2} prune", self.prune_val);
-        if mx + (prune_badge.len() as u16) < max_card_content_x {
-            self.canvas.print(mx, meta_y, &prune_badge, Rgb::ORANGE, Rgb::CARD_BG, false, false);
-            mx += prune_badge.len() as u16 + 1;
-        }
-
-        if is_welcome {
-            if let Some(peer) = &self.cluster_peer {
-                let mesh_badge = format!("· mesh: {peer}");
-                if mx + (mesh_badge.len() as u16) < max_card_content_x {
-                    self.canvas.print(mx, meta_y, &mesh_badge, Rgb::GREEN, Rgb::CARD_BG, false, false);
+        let mut last = Instant::now();
+        loop {
+            let mut changed = false;
+            let mut finished = None;
+            while let Ok(ev) = rx.try_recv() {
+                changed = true;
+                match ev {
+                    UiEvent::Agent(AgentEvent::Token(p)) => {
+                        tui.info.ctx_used += 1;
+                        if let Some(Entry::Assistant { raw, .. }) = tui.entries.last_mut() {
+                            raw.push_str(&p);
+                        }
+                    }
+                    UiEvent::Agent(AgentEvent::ReplyDone { .. }) => {
+                        match tui.entries.last_mut() {
+                            Some(Entry::Assistant { raw, streaming }) => {
+                                *streaming = false;
+                                let (t, v, _) = split_reply(raw);
+                                if t.is_empty() && v.is_empty() {
+                                    tui.entries.pop();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    UiEvent::Agent(AgentEvent::ToolStart { icon, title }) => {
+                        let block = matches!(icon, "$");
+                        tui.entries.push(Entry::Tool { icon, title, state: ToolState::Running, error: None, preview: None, block });
+                    }
+                    UiEvent::Agent(AgentEvent::ToolEnd(o)) => {
+                        let block = o.icon == "$" || (o.ok && o.preview.is_some());
+                        let error = (!o.ok).then(|| o.output.lines().next().unwrap_or("").trim_start_matches("Error: ").to_string());
+                        let entry = Entry::Tool {
+                            icon: o.icon,
+                            title: o.title.clone(),
+                            state: if o.ok { ToolState::Ok } else { ToolState::Failed },
+                            error: if o.icon == "$" { None } else { error },
+                            preview: o.preview.clone(),
+                            block,
+                        };
+                        match tui.entries.last_mut() {
+                            Some(e @ Entry::Tool { state: ToolState::Running, .. }) => *e = entry,
+                            _ => tui.entries.push(entry),
+                        }
+                        // The model replies again after the tool results.
+                        tui.entries.push(Entry::Assistant { raw: String::new(), streaming: true });
+                    }
+                    UiEvent::Confirm(what, reply) => tui.confirm = Some((what, reply)),
+                    UiEvent::Done(stats, cur_pos) => finished = Some((stats, cur_pos)),
                 }
             }
-        } else {
-            let low_mem = "· low-mem";
-            if mx + (low_mem.len() as u16) < max_card_content_x {
-                self.canvas.print(mx, meta_y, low_mem, Rgb::MUTED, Rgb::CARD_BG, false, false);
-                mx += low_mem.len() as u16 + 1;
-            }
-        }
-
-        if let Some(draft) = &self.draft_name {
-            let draft_badge = format!("· spec: {draft}");
-            if mx + (draft_badge.len() as u16) < max_card_content_x {
-                self.canvas.print(mx, meta_y, &draft_badge, Rgb::ICE_CYAN, Rgb::CARD_BG, false, false);
-            }
-        }
-    }
-
-    /// Renders a pre-warming notification while system prompt and KV-cache are initialized.
-    pub fn render_warming(&mut self, text: &str) {
-        let (w, h) = terminal_size();
-        self.canvas.resize(w, h);
-        self.canvas.clear(Rgb::BG_DARK);
-
-        let center_x = w / 2;
-        let card_w = 68.min(w.saturating_sub(6));
-        let card_h = 5u16;
-        let card_x = center_x.saturating_sub(card_w / 2);
-        let card_y = (h / 2).saturating_sub(3);
-
-        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::ICE_CYAN);
-        let title = "INITIALIZING KV-CACHE & PRE-WARMING SYSTEM PROMPT";
-        self.canvas.print(card_x + 3, card_y + 1, title, Rgb::ICE_CYAN, Rgb::CARD_BG, true, false);
-        self.canvas.print(card_x + 3, card_y + 3, text, Rgb::MUTED, Rgb::CARD_BG, false, false);
-
-        self.render_docked_footer(w, h);
-        let _ = self.canvas.flush();
-    }
-
-    /// Renders the conversation view strictly CHRONOLOGICALLY with word wrapping and scroll support.
-    pub fn render_chat(&mut self) {
-        let (w, h) = terminal_size();
-        self.canvas.resize(w, h);
-        self.canvas.clear(Rgb::BG_DARK);
-
-        // 1. Persistent Top Header Bar (Row 0)
-        let header_bg = Rgb::CARD_BG;
-        self.canvas.fill_rect(0, 0, w, 1, ' ', Rgb::WHITE, header_bg);
-        self.canvas.print(2, 0, "SPINDLE v0.1.0", Rgb::BRIGHT_BLUE, header_bg, true, false);
-
-        let status = if let Some(d) = &self.draft_name {
-            format!("· {} · {} · spec: {d}", self.model_name, self.layers_info)
-        } else {
-            format!("· {} · {}", self.model_name, self.layers_info)
-        };
-        if let Some(p) = &self.cluster_peer {
-            let mesh_str = format!("mesh: {p}");
-            let mx = w.saturating_sub(mesh_str.len() as u16 + 4);
-            if 18 + (status.len() as u16) < mx {
-                self.canvas.print(18, 0, &status, Rgb::MUTED, header_bg, false, false);
-            } else {
-                let max_stat = (mx.saturating_sub(20)) as usize;
-                let clip: String = status.chars().take(max_stat).collect();
-                self.canvas.print(18, 0, &clip, Rgb::MUTED, header_bg, false, false);
-            }
-            self.canvas.print(mx, 0, &mesh_str, Rgb::GREEN, header_bg, true, false);
-        } else {
-            self.canvas.print(18, 0, &status, Rgb::MUTED, header_bg, false, false);
-        }
-
-        // Horizontal divider below header
-        for col in 0..w {
-            self.canvas.set(col, 1, '─', Rgb::CARD_BORDER, Rgb::BG_DARK, false, false);
-        }
-
-        // 2. Format conversation history chronologically with RESPONSIVE WORD WRAPPING
-        let mut lines: Vec<ViewportLine> = Vec::new();
-
-        for msg in &self.history {
-            if msg.role == "user" {
-                let user_max_w = (w.saturating_sub(14)).max(20) as usize;
-                let wrapped_user = wrap_text(&msg.text, user_max_w);
-                for (idx, u_line) in wrapped_user.into_iter().enumerate() {
-                    let prefix = if idx == 0 { "> You: " } else { "       " };
-                    lines.push(ViewportLine {
-                        text: format!("{prefix}{u_line}"),
-                        fg: Rgb::SKY_BLUE,
-                        bold: true,
-                        dim: false,
-                    });
-                }
-            } else if msg.role == "tool" {
-                let tool_max_w = (w.saturating_sub(14)).max(20) as usize;
-                let wrapped_tool = wrap_text(&msg.text, tool_max_w);
-                for (idx, t_line) in wrapped_tool.into_iter().enumerate() {
-                    let prefix = if idx == 0 { "  [*] " } else { "      " };
-                    lines.push(ViewportLine {
-                        text: format!("{prefix}{t_line}"),
-                        fg: Rgb::GOLD,
-                        bold: false,
-                        dim: false,
-                    });
-                }
-            } else if msg.role == "system" {
-                let sys_max_w = (w.saturating_sub(10)).max(20) as usize;
-                for raw_line in msg.text.lines() {
-                    let wrapped = wrap_text(raw_line, sys_max_w);
-                    for s_line in wrapped {
-                        lines.push(ViewportLine {
-                            text: format!("  {s_line}"),
-                            fg: Rgb::ICE_CYAN,
-                            bold: false,
-                            dim: false,
-                        });
+            if let Some((stats, cur_pos)) = finished {
+                // Drop an empty trailing placeholder.
+                if let Some(Entry::Assistant { raw, .. }) = tui.entries.last() {
+                    let (t, v, _) = split_reply(raw);
+                    if t.is_empty() && v.is_empty() {
+                        tui.entries.pop();
                     }
                 }
-            } else {
-                // Assistant message
-                let header = if let Some(speed) = &msg.speed_badge {
-                    format!("Spindle · {speed}")
-                } else {
-                    "Spindle".to_string()
-                };
-                lines.push(ViewportLine {
-                    text: header,
-                    fg: Rgb::PRIMARY_BLUE,
-                    bold: true,
-                    dim: false,
-                });
-                let assistant_max_w = (w.saturating_sub(12)).max(20) as usize;
-                let wrapped_body = wrap_text(&msg.text, assistant_max_w);
-                for b_line in wrapped_body {
-                    lines.push(ViewportLine {
-                        text: format!("  {b_line}"),
-                        fg: Rgb::WHITE,
-                        bold: false,
-                        dim: false,
-                    });
+                if let Some(Entry::Assistant { streaming, .. }) = tui.entries.last_mut() {
+                    *streaming = false;
                 }
-            }
-            // Empty blank line between turns for clean visual rhythm
-            lines.push(ViewportLine {
-                text: String::new(),
-                fg: Rgb::WHITE,
-                bold: false,
-                dim: false,
-            });
-        }
-
-        // 3. Render visible viewport lines above the bottom input card with scroll offset
-        let top_y = 2u16;
-        let card_h = 5u16;
-        let card_y = if h >= 12 { h.saturating_sub(7) } else { (h.saturating_sub(card_h + 1)).max(top_y) };
-        let viewport_h = card_y.saturating_sub(top_y) as usize;
-
-        let total_lines = lines.len();
-        let max_scroll = total_lines.saturating_sub(viewport_h);
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
-
-        let end_idx = total_lines.saturating_sub(self.scroll_offset);
-        let start_idx = end_idx.saturating_sub(viewport_h);
-
-        for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
-            let y = top_y + (i as u16);
-            if y >= card_y {
+                tui.info.ctx_used = cur_pos;
+                tui.info.last_tps = (stats.tokens > 0).then(|| stats.tok_per_sec());
+                tui.info.spec = (tui.info.spec.0 + stats.spec_accepted, tui.info.spec.1 + stats.spec_drafted);
+                let mut detail = vec![tui.info.model.clone(), format!("{:.1}s", stats.wall_secs)];
+                if stats.tokens > 0 {
+                    detail.push(format!("{:.1} tok/s", stats.tok_per_sec()));
+                }
+                if stats.spec_drafted > 0 {
+                    detail.push(format!("spec {}/{}", stats.spec_accepted, stats.spec_drafted));
+                }
+                if stats.round_trips > 0 {
+                    detail.push(format!("w {:.0}ms · l {:.0}ms", stats.worker_ms, stats.local_ms));
+                }
+                if stats.aborted {
+                    detail.push("interrupted".into());
+                }
+                let agent = if tui.info.tools { "Agent" } else { "Chat" }.to_string();
+                tui.entries.push(Entry::Footer { agent, detail: detail.join(" · ") });
                 break;
             }
-            self.canvas.print(3, y, &line.text, line.fg, Rgb::BG_DARK, line.bold, line.dim);
-        }
 
-        // Render scroll indicator if scrolled up into history
-        if self.scroll_offset > 0 {
-            let scroll_indicator = format!("▲ Scrolled +{} lines · Mouse wheel or PgDn to return to bottom", self.scroll_offset);
-            let sx = w.saturating_sub(scroll_indicator.len() as u16 + 4);
-            self.canvas.print(sx, 1, &scroll_indicator, Rgb::ICE_CYAN, Rgb::BG_DARK, true, false);
-        }
-
-        // 4. Floating Input Card docked at the bottom
-        let card_w = (w.saturating_sub(6)).clamp(40, 84);
-        let card_x = (w / 2).saturating_sub(card_w / 2);
-
-        self.render_card_content(card_x, card_y, card_w, card_h, false);
-
-        // 5. Docked Global Footer
-        self.render_docked_footer(w, h);
-
-        let _ = self.canvas.flush();
-    }
-
-    fn render_docked_footer(&mut self, w: u16, h: u16) {
-        let footer_y = h.saturating_sub(1);
-        let raw_cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-        let short_cwd = if let Ok(home) = std::env::var("USERPROFILE") {
-            if raw_cwd.starts_with(&home) {
-                format!("~{}", &raw_cwd[home.len()..])
+            let key = tui.reader.poll();
+            if key != KeyAction::None {
+                changed = true;
+            }
+            if let Some((_, reply)) = tui.confirm.as_ref() {
+                match key {
+                    KeyAction::Enter | KeyAction::Char('y') | KeyAction::Char('Y') => {
+                        let _ = reply.send(true);
+                        tui.confirm = None;
+                    }
+                    KeyAction::Escape | KeyAction::CtrlC | KeyAction::Char('n') | KeyAction::Char('N') => {
+                        let _ = reply.send(false);
+                        tui.confirm = None;
+                    }
+                    KeyAction::ScrollUp(_) | KeyAction::ScrollDown(_) | KeyAction::PageUp | KeyAction::PageDown => {
+                        tui.handle_key(key);
+                    }
+                    _ => {}
+                }
             } else {
-                raw_cwd
+                match key {
+                    KeyAction::Escape | KeyAction::CtrlC => abort.store(true, Ordering::SeqCst),
+                    other => {
+                        if let Some(text) = tui.handle_key(other) {
+                            tui.queued = Some(text);
+                        }
+                        tui.running = true; // ctrl+d during a turn does not quit
+                    }
+                }
             }
-        } else {
-            raw_cwd
-        };
-        let max_left_w = (w.saturating_sub(20)) as usize;
-        let footer_left = format!("{}:{}", short_cwd, self.git_branch);
-        let clipped_left: String = footer_left.chars().take(max_left_w).collect();
-        self.canvas.print(2, footer_y, &clipped_left, Rgb::MUTED, Rgb::BG_DARK, false, false);
-
-        let footer_right = "spindle v0.1.0";
-        let right_x = w.saturating_sub(footer_right.len() as u16 + 2);
-        self.canvas.print(right_x, footer_y, footer_right, Rgb::MUTED, Rgb::BG_DARK, false, false);
-    }
-
-    /// Appends a completed message turn to conversation history.
-    pub fn push_message(&mut self, role: &str, text: &str, speed_badge: Option<&str>) {
-        self.history.push(ChatMessage {
-            role: role.to_string(),
-            text: text.to_string(),
-            speed_badge: speed_badge.map(str::to_string),
-        });
-    }
-
-    /// Runs an idle prompt turn through the TUI loop, rendering frames and collecting keyboard input.
-    pub fn poll_input(&mut self) -> Option<String> {
-        loop {
-            if self.history.is_empty() {
-                self.render_welcome();
+            if changed || last.elapsed() >= Duration::from_millis(80) {
+                tui.render();
+                last = Instant::now();
             } else {
-                self.render_chat();
-            }
-
-            let mut action = self.poll_key();
-            while action == KeyAction::None {
-                std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 FPS idle
-                action = self.poll_key();
-            }
-
-            match action {
-                KeyAction::Char(c) => self.input.insert(c),
-                KeyAction::Backspace => self.input.backspace(),
-                KeyAction::Delete => self.input.delete(),
-                KeyAction::Left => self.input.move_left(),
-                KeyAction::Right => self.input.move_right(),
-                KeyAction::Home => self.input.move_home(),
-                KeyAction::End => self.input.move_end(),
-                KeyAction::ScrollUp(n) => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(n);
-                }
-                KeyAction::ScrollDown(n) => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(n);
-                }
-                KeyAction::PageUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(6);
-                }
-                KeyAction::PageDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(6);
-                }
-                KeyAction::Up => {
-                    if self.scroll_offset > 0 {
-                        self.scroll_offset = self.scroll_offset.saturating_add(2);
-                    } else if !self.history.is_empty() && self.input.text.is_empty() {
-                        // Empty input in chat view: Up arrow scrolls conversation history!
-                        self.scroll_offset = self.scroll_offset.saturating_add(2);
-                    } else if self.input.text.is_empty() && !self.prompt_history.is_empty() && self.history_idx.is_none() {
-                        let idx = self.prompt_history.len() - 1;
-                        self.history_idx = Some(idx);
-                        self.input.set_text(&self.prompt_history[idx]);
-                    } else if let Some(idx) = self.history_idx {
-                        if idx > 0 {
-                            let new_idx = idx - 1;
-                            self.history_idx = Some(new_idx);
-                            self.input.set_text(&self.prompt_history[new_idx]);
-                        } else {
-                            self.history_idx = None;
-                            self.input.clear();
-                        }
-                    }
-                }
-                KeyAction::Down => {
-                    if self.scroll_offset > 0 {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(2);
-                    } else if let Some(idx) = self.history_idx {
-                        if idx + 1 < self.prompt_history.len() {
-                            let new_idx = idx + 1;
-                            self.history_idx = Some(new_idx);
-                            self.input.set_text(&self.prompt_history[new_idx]);
-                        } else {
-                            self.history_idx = None;
-                            self.input.clear();
-                        }
-                    }
-                }
-                KeyAction::CtrlP => {
-                    if !self.prompt_history.is_empty() {
-                        let idx = match self.history_idx {
-                            None => self.prompt_history.len() - 1,
-                            Some(0) => 0,
-                            Some(i) => i - 1,
-                        };
-                        self.history_idx = Some(idx);
-                        self.input.set_text(&self.prompt_history[idx]);
-                    }
-                }
-                KeyAction::Enter => {
-                    let text = self.input.text.trim().to_string();
-                    if !text.is_empty() {
-                        self.prompt_history.push(text.clone());
-                        self.history_idx = None;
-                        self.scroll_offset = 0;
-                        self.input.clear();
-                        return Some(text);
-                    }
-                }
-                KeyAction::Escape => {
-                    self.running = false;
-                    return None;
-                }
-                _ => {}
+                std::thread::sleep(Duration::from_millis(8));
             }
         }
-    }
+    });
+    engine.abort_signal = None;
+    tui.generating = false;
+    tui.render();
 }
 
-/// Message events transmitted from background generation worker to UI thread.
-enum WorkerEvent {
-    Token(String),
-    ToolStart(String),
-    Done {
-        reply: String,
-        speed_badge: String,
-    },
-    Stopped,
-}
+// ------------------------------------------------------------------------- entry point
 
-/// Launches the full-screen OpenCode TUI interactive session.
-pub fn run_tui(
-    engine: &mut crate::smollm_chat::SmolLm2Engine,
-    governor: Option<&crate::memory_guard::Governor>,
-    opts: crate::chat_cli::ChatOptions,
-) {
+pub fn run_tui(engine: &mut SmolLm2Engine, _governor: Option<&crate::memory_guard::Governor>, opts: crate::chat_cli::ChatOptions) {
     let guard = match TerminalGuard::enter() {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("[FAIL] Could not initialize full-screen TUI terminal: {e}");
+            eprintln!("could not start the full-screen UI: {e}");
             return;
         }
     };
-
-    let peer_str = engine.cluster_client.as_ref().and_then(|c| c.stream.peer_addr().ok().map(|a| a.to_string()));
-    let layers_str = format!("layers {}..{}", engine.layer_range.start, engine.layer_range.end);
-    let prune_val = engine.moe_prune();
-    let mut tui = SpindleTui::new(
-        &engine.idx.model_name,
-        peer_str.as_deref(),
-        "fp8",
-        prune_val,
-        &layers_str,
-    );
-    if let Some(draft) = &engine.draft_engine {
-        tui.draft_name = Some(draft.idx.model_name.clone());
-    }
-
-    let mut allow_think = opts.allow_think;
-    let mut max_tokens = if opts.max_tokens > 0 { opts.max_tokens.min(engine.max_seq) } else { 2048.min(engine.max_seq) };
+    let client = engine.cluster_client.as_ref();
+    let info = SessionInfo {
+        model: engine.idx.model_name.clone(),
+        cluster: client.and_then(|c| c.stream.peer_addr().ok()).map(|a| a.to_string()),
+        local_layers: format!("layers {}..{}", engine.layer_range.start, engine.layer_range.end),
+        worker_layers: client.map(|c| format!("layers {}..{}", c.worker_range.0, c.worker_range.1)),
+        wire: client.map(|c| format!("{:?}", c.wire_format).to_lowercase()),
+        ctx_max: engine.max_seq,
+        ctx_used: engine.cur_pos,
+        tools: engine.enable_tools,
+        think: opts.allow_think,
+        speculate: engine.speculate,
+        last_tps: None,
+        spec: (0, 0),
+        branch: SpindleTui::git_branch(),
+    };
+    let mut tui = SpindleTui::new(info);
+    let mut agent_opts = AgentOpts {
+        max_tokens: if opts.max_tokens > 0 { opts.max_tokens } else { (engine.max_seq / 2).clamp(256, 4096) },
+        allow_think: opts.allow_think,
+        ..Default::default()
+    };
 
     if engine.n_keep == 0 {
-        tui.render_warming("Prefilling system prompt and tools across cluster mesh...");
-        unsafe {
-            engine.prefill_system();
-        }
+        tui.render();
+        unsafe { engine.prefill_system() };
+        tui.info.ctx_used = engine.cur_pos;
     }
-
-    // If an initial prompt was provided, execute it immediately
-    if let Some(first_p) = opts.first_prompt {
-        execute_tui_turn(&mut tui, engine, governor, &first_p, allow_think, max_tokens);
+    if let Some(p) = opts.first_prompt.clone() {
+        run_turn(&mut tui, engine, &p, agent_opts);
     }
-
-    // Main TUI interactive event loop
     while tui.running {
-        if let Some(user_prompt) = tui.poll_input() {
-            if user_prompt == "/exit" || user_prompt == "/quit" || user_prompt == "exit" || user_prompt == "quit" {
-                break;
-            }
-            if handle_slash_command(&mut tui, engine, &user_prompt, &mut allow_think, &mut max_tokens) {
-                continue;
-            }
-            execute_tui_turn(&mut tui, engine, governor, &user_prompt, allow_think, max_tokens);
+        let Some(text) = tui.read_prompt() else { break };
+        if matches!(text.as_str(), "/exit" | "/quit" | "/q") {
+            break;
         }
+        if text.starts_with('/') {
+            if let Some(prompt) = handle_slash_command(&mut tui, engine, &text, &mut agent_opts) {
+                run_turn(&mut tui, engine, &prompt, agent_opts);
+            }
+            continue;
+        }
+        run_turn(&mut tui, engine, &text, agent_opts);
     }
-
     drop(guard);
 }
 
-/// Dispatches interactive slash commands within the TUI without sending them as LLM prompts.
-fn handle_slash_command(
-    tui: &mut SpindleTui,
-    engine: &mut crate::smollm_chat::SmolLm2Engine,
-    cmd_line: &str,
-    allow_think: &mut bool,
-    max_tokens: &mut usize,
-) -> bool {
-    let trimmed = cmd_line.trim();
-    if !trimmed.starts_with('/') {
-        return false;
-    }
-
-    tui.push_message("user", trimmed, None);
-    tui.scroll_offset = 0;
-
-    let lower = trimmed.to_ascii_lowercase();
-    match lower.as_str() {
+/// Runs a slash command. Returns a prompt to send to the model, if the command produces one.
+fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: &str, opts: &mut AgentOpts) -> Option<String> {
+    let (head, rest) = match line.split_once(char::is_whitespace) {
+        Some((h, r)) => (h.to_ascii_lowercase(), r.trim().to_string()),
+        None => (line.to_ascii_lowercase(), String::new()),
+    };
+    let restart_context = |tui: &mut SpindleTui, engine: &mut SmolLm2Engine| {
+        engine.reset_kv();
+        unsafe { engine.prefill_system() };
+        tui.info.ctx_used = engine.cur_pos;
+    };
+    match head.as_str() {
         "/help" | "/?" => {
-            let help_text = "\
-╭─ Available Slash Commands ─────────────────────────────────────────────╮
-│  /help                       show this command reference               │
-│  /clear                      reset KV-cache & start fresh conversation │
-│  /cluster                    view distributed mesh status & ping RTT   │
-│  /model                      inspect model tensors, layers & RAM       │
-│  /tools [on|off]             toggle agentic tools (files, search, cmd) │
-│  /moe-prune [threshold]      inspect or dynamically tune expert cutoff │
-│  /think [on|off]             toggle reasoning mode                     │
-│  /system [prompt|reset]      inspect or dynamically set system prompt  │
-│  /review                     semantic AI review of uncommitted git diff│
-│  /diff                       view uncommitted git diff of current edits│
-│  /undo                       revert the last file change made by agent │
-│  /bench [n]                  run on-demand speed benchmark (default 32)│
-│  /stats                      view memory residency & KV cache stats    │
-│  /exit                       quit interactive session                  │
-╰────────────────────────────────────────────────────────────────────────╯";
-            tui.push_message("system", help_text, None);
-        }
-        "/clear" | "/reset" => {
-            engine.reset_kv();
-            tui.history.clear();
-            tui.scroll_offset = 0;
-            unsafe {
-                engine.prefill_system();
+            let mut s = String::from("Commands\n");
+            for (c, d) in COMMANDS {
+                s.push_str(&format!("  {c:<12} {d}\n"));
             }
-            return true;
+            s.push_str("\nKeys\n  enter send · ctrl+j newline · tab complete · ↑/↓ history\n  pgup/pgdn or wheel scroll · esc interrupt / clear · ctrl+c quit");
+            tui.notice(&s);
+        }
+        "/new" | "/clear" | "/reset" => {
+            tui.entries.clear();
+            restart_context(tui, engine);
+        }
+        "/tools" => {
+            let on = match rest.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => !engine.enable_tools,
+            };
+            engine.set_tools_enabled(on);
+            tui.info.tools = on;
+            restart_context(tui, engine);
+            tui.notice(if on { "Agent tools on (files, search, shell, web). Context restarted." } else { "Agent tools off. Context restarted." });
+        }
+        "/think" => match rest.as_str() {
+            "show" => {
+                tui.show_think = true;
+                tui.notice("Reasoning shown in full.");
+            }
+            "hide" => {
+                tui.show_think = false;
+                tui.notice("Reasoning collapsed to 3 lines.");
+            }
+            r => {
+                opts.allow_think = match r {
+                    "on" => true,
+                    "off" => false,
+                    _ => !opts.allow_think,
+                };
+                tui.info.think = opts.allow_think;
+                tui.notice(if opts.allow_think { "Reasoning on (<think> before answering)." } else { "Reasoning off (direct answers)." });
+            }
+        },
+        "/undo" => match crate::tools::pop_undo() {
+            Some(Ok(m)) => tui.notice(&m),
+            Some(Err(e)) => tui.error(&e),
+            None => tui.notice("Nothing to undo."),
+        },
+        "/diff" => match std::process::Command::new("git").args(["diff", "--stat"]).output() {
+            Ok(o) if !o.stdout.is_empty() => tui.notice(String::from_utf8_lossy(&o.stdout).trim_end()),
+            Ok(_) => tui.notice("Working tree clean."),
+            Err(e) => tui.error(&format!("git: {e}")),
+        },
+        "/review" => match std::process::Command::new("git").args(["diff", "HEAD"]).output() {
+            Ok(o) => {
+                let diff = String::from_utf8_lossy(&o.stdout);
+                if diff.trim().is_empty() {
+                    tui.notice("No uncommitted changes to review.");
+                } else {
+                    return Some(format!(
+                        "Review this uncommitted diff. List concrete bugs, regressions and risky changes first, then smaller suggestions.\n\n```diff\n{}\n```",
+                        crate::tools::truncate_middle(diff.trim(), (engine.max_seq.saturating_sub(engine.cur_pos) * 2).clamp(2000, 12000))
+                    ));
+                }
+            }
+            Err(e) => tui.error(&format!("git: {e}")),
+        },
+        "/compact" => {
+            tui.notice("Summarizing the conversation…");
+            tui.render();
+            let (summary, _, _) = unsafe {
+                engine.generate_reply("Summarize our conversation so far in at most 8 short bullet points: goals, files touched, decisions, open tasks.", 400, false, &mut |_| {})
+            };
+            let base = engine.system_prompt.clone();
+            engine.set_system_prompt(&format!("{base}\n\n# Summary of the earlier conversation\n{}", summary.trim()));
+            restart_context(tui, engine);
+            engine.set_system_prompt(&base);
+            tui.entries.clear();
+            tui.notice(&format!("Conversation compacted to {} tokens.\n\n{}", engine.cur_pos, summary.trim()));
+        }
+        "/init" => {
+            let target = if std::path::Path::new("SPINDLE.md").exists() { "SPINDLE.md" } else { "AGENTS.md" };
+            return Some(format!(
+                "Look at this project (list_dir, read the build files and main sources), then write {target} with: what the project is, how to build/test/run it, the code layout, and conventions to follow. Keep it under 60 lines. If {target} exists, improve it instead of replacing useful content."
+            ));
         }
         "/model" | "/info" => {
-            let mib = engine.raw_bytes.len() >> 20;
             let c = engine.cfg;
             let (ws, private, _) = crate::memory_guard::process_counters();
-            let free_ram = crate::mmap_file::available_ram_bytes() >> 20;
-            let info = format!(
-                "Model: {}\nArchitecture: {} (dim: {}, layers: {}/{}, heads: {}/{})\nMemory: {} MiB file · {} MiB resident · {} MiB private · {} MiB free RAM\nKV-Cache: {}/{} tokens ({:.1} MiB allocated)",
+            tui.notice(&format!(
+                "{}\n{} · dim {} · layers {}..{} of {} · heads {}/{}\nRAM: {} MiB file · {} MiB resident · {} MiB private · {} MiB free\nKV-cache: {}/{} tokens · {}",
                 engine.idx.model_name,
-                engine.idx.architecture, c.dim,
-                engine.layer_range.len(), c.n_layers,
-                c.n_heads, c.n_kv_heads,
-                mib, ws >> 20, private >> 20, free_ram,
-                engine.cur_pos, engine.max_seq,
-                ((engine.k_cache.len() + engine.v_cache.len()) * 2) as f64 / (1024.0 * 1024.0)
-            );
-            tui.push_message("system", &info, None);
+                engine.idx.architecture,
+                c.dim,
+                engine.layer_range.start,
+                engine.layer_range.end,
+                c.n_layers,
+                c.n_heads,
+                c.n_kv_heads,
+                engine.raw_bytes.len() >> 20,
+                ws >> 20,
+                private >> 20,
+                crate::mmap_file::available_ram_bytes() >> 20,
+                engine.cur_pos,
+                engine.max_seq,
+                crate::chat_cli::describe_prune(engine.moe_prune()),
+            ));
         }
-        "/cluster" | "/nodes" => {
-            if let Some(client) = engine.cluster_client.as_mut() {
-                let rtt = client.ping().unwrap_or(std::time::Duration::from_millis(1));
-                let info = format!(
-                    "Cluster Mesh: ONLINE\nPartition: Worker (layers {}..{}) + Local (layers {}..{}) = {} total layers\nTransport: Wire {:?} · Network Ping RTT: {:.2} ms ({:.1} µs)",
-                    client.worker_range.0, client.worker_range.1,
-                    engine.layer_range.start, engine.layer_range.end,
-                    engine.cfg.n_layers,
-                    client.wire_format,
-                    rtt.as_secs_f64() * 1e3,
-                    rtt.as_secs_f64() * 1e6
-                );
-                tui.push_message("system", &info, None);
-            } else {
-                tui.push_message("system", "Cluster Mesh: standalone (no peer connected)", None);
+        "/cluster" | "/nodes" => match engine.cluster_client.as_mut() {
+            Some(c) => {
+                let rtt = c.ping().map(|d| format!("{:.2} ms", d.as_secs_f64() * 1e3)).unwrap_or_else(|e| format!("ping failed: {e}"));
+                tui.notice(&format!(
+                    "Worker layers {}..{} · local layers {}..{} · wire {:?}\nRound trip: {rtt} · context {} tokens (min of both nodes)",
+                    c.worker_range.0, c.worker_range.1, engine.layer_range.start, engine.layer_range.end, c.wire_format, engine.max_seq
+                ));
             }
-        }
-        "/tools" | "/tools toggle" => {
-            let now = !engine.enable_tools;
-            engine.set_tools_enabled(now);
-            let msg = if now { "Agentic tools: ON (files, web search, shell enabled)" } else { "Agentic tools: OFF (pure chat mode)" };
-            tui.push_message("system", msg, None);
-        }
-        "/tools on" => {
-            engine.set_tools_enabled(true);
-            tui.push_message("system", "Agentic tools: ON (files, web search, shell enabled)", None);
-        }
-        "/tools off" => {
-            engine.set_tools_enabled(false);
-            tui.push_message("system", "Agentic tools: OFF (pure chat mode)", None);
-        }
-        "/think" | "/think toggle" => {
-            *allow_think = !*allow_think;
-            let msg = if *allow_think { "Reasoning mode (<think>): ON" } else { "Reasoning mode (<think>): OFF (fast direct reply)" };
-            tui.push_message("system", msg, None);
-        }
-        "/think on" => {
-            *allow_think = true;
-            tui.push_message("system", "Reasoning mode (<think>): ON", None);
-        }
-        "/think off" => {
-            *allow_think = false;
-            tui.push_message("system", "Reasoning mode (<think>): OFF (fast direct reply)", None);
+            None => tui.notice("Standalone (no cluster peer). Set `peer` and `layer_range` in spindle.toml to use a worker."),
+        },
+        "/spec" => {
+            match rest.as_str() {
+                "on" => engine.speculate = true,
+                "off" => engine.speculate = false,
+                n => {
+                    if let Ok(k) = n.parse::<usize>() {
+                        engine.set_draft_len(k);
+                        engine.speculate = true;
+                    }
+                }
+            }
+            tui.info.speculate = engine.speculate;
+            tui.notice(&format!(
+                "Speculative decoding (prompt lookup): {} · up to {} draft tokens per verify. Output is identical either way.",
+                if engine.speculate { "on" } else { "off" },
+                engine.draft_len
+            ));
         }
         "/moe-prune" => {
-            let p = engine.moe_prune();
-            let status = if p > 0.0 { format!("active (threshold {p:.3})") } else { "disabled (all 8 experts active)".to_string() };
-            let msg = format!("MoE Pruning Cutoff: {status}\nUse '/moe-prune <threshold>' (e.g. 0.05) to tune");
-            tui.push_message("system", &msg, None);
-        }
-        cmd if cmd.starts_with("/moe-prune ") => {
-            if let Ok(p) = cmd[11..].trim().parse::<f32>() {
+            if let Ok(p) = rest.parse::<f32>() {
                 engine.set_moe_prune(p);
-                tui.prune_val = p;
-                let msg = if p > 0.0 {
-                    format!("Dynamic MoE pruning set to {:.3} ({:.1}% energy cutoff)", p, p * 100.0)
-                } else {
-                    "Dynamic MoE pruning disabled (all 8 experts active)".to_string()
-                };
-                tui.push_message("system", &msg, None);
+            }
+            tui.notice(&crate::chat_cli::describe_prune(engine.moe_prune()));
+        }
+        "/system" => {
+            if rest.is_empty() {
+                let shown = crate::tools::truncate_middle(&engine.system_prompt, 1500);
+                tui.notice(&format!("System prompt:\n{shown}\n\n/system <text> to replace, /system reset for the default"));
             } else {
-                tui.push_message("system", "Usage: /moe-prune <threshold, e.g. 0.05>", None);
+                let base = if rest == "reset" { engine.default_system_prompt() } else { rest.clone() };
+                engine.set_system_prompt(&base);
+                engine.set_tools_enabled(engine.enable_tools);
+                restart_context(tui, engine);
+                tui.notice("System prompt updated. Context restarted.");
             }
         }
-        "/review" => {
-            let output = std::process::Command::new("git").args(["diff", "HEAD"]).output();
-            match output {
-                Ok(out) => {
-                    let diff_str = String::from_utf8_lossy(&out.stdout);
-                    let trimmed = diff_str.trim();
-                    if trimmed.is_empty() {
-                        tui.push_message("system", "No uncommitted git changes found to review.", None);
-                    } else {
-                        let max_diff = if trimmed.len() > 8000 { &trimmed[..8000] } else { trimmed };
-                        let prompt = format!(
-                            "Please perform a thorough code review of the following uncommitted git diff:\n\n\
-                            ```diff\n{max_diff}\n```\n\n\
-                            Identify any potential bugs, regressions, performance issues, or architectural improvements."
-                        );
-                        execute_tui_turn(tui, engine, None, &prompt, *allow_think, *max_tokens);
-                        return true;
-                    }
-                }
-                Err(e) => {
-                    tui.push_message("system", &format!("Could not execute git diff: {e}"), None);
-                }
+        "/max" => match rest.parse::<usize>() {
+            Ok(n) => {
+                opts.max_tokens = n.clamp(16, engine.max_seq);
+                tui.notice(&format!("Replies capped at {} tokens.", opts.max_tokens));
             }
+            Err(_) => tui.notice(&format!("Replies capped at {} tokens. Usage: /max <n>", opts.max_tokens)),
+        },
+        "/bench" => {
+            let n = rest.parse::<usize>().unwrap_or(64).clamp(8, 512);
+            tui.notice(&format!("Generating {n} tokens…"));
+            tui.render();
+            let (_, secs, toks) = unsafe { engine.generate_reply("Write a short paragraph about how rivers shape valleys.", n, false, &mut |_| {}) };
+            tui.info.ctx_used = engine.cur_pos;
+            tui.notice(&format!("{:.1} tok/s ({toks} tokens in {secs:.2}s)", toks as f64 / secs.max(1e-3)));
         }
-        "/diff" => {
-            let output = std::process::Command::new("git").args(["diff", "--stat"]).output();
-            match output {
-                Ok(out) => {
-                    let stat_str = String::from_utf8_lossy(&out.stdout);
-                    if stat_str.trim().is_empty() {
-                        tui.push_message("system", "Working tree clean. No uncommitted modifications.", None);
-                    } else {
-                        tui.push_message("system", stat_str.trim(), None);
-                    }
-                }
-                Err(e) => {
-                    tui.push_message("system", &format!("Could not run git diff: {e}"), None);
-                }
-            }
-        }
-        "/undo" => {
-            match crate::tools::pop_undo() {
-                Some(Ok(msg)) => tui.push_message("system", &msg, None),
-                Some(Err(e)) => tui.push_message("system", &format!("Undo failed: {e}"), None),
-                None => tui.push_message("system", "No recent file modifications to undo.", None),
-            }
-        }
-        cmd if cmd.starts_with("/bench") => {
-            let n_tokens = if cmd.starts_with("/bench ") {
-                cmd[7..].trim().parse::<usize>().unwrap_or(32).clamp(1, 256)
-            } else {
-                32
-            };
-            tui.push_message("system", &format!("Running on-demand benchmark generating {n_tokens} tokens..."), None);
-            tui.render_chat();
-            let prompt = "Explain in one sentence why systems programming in Rust is reliable and performant.";
-            let (reply, secs, tokens) = unsafe { engine.generate_reply(prompt, n_tokens, false, &mut |_| {}) };
-            let speed = tokens as f64 / secs.max(0.001);
-            let result_msg = format!("Benchmark complete: {:.1} tok/s ({tokens} tokens in {:.2}s)\nSample: \"{}\"", speed, secs, reply.trim());
-            tui.push_message("system", &result_msg, None);
-        }
-        "/stats" => {
-            let (ws, private, _) = crate::memory_guard::process_counters();
-            let free_ram = crate::mmap_file::available_ram_bytes() >> 20;
-            let stats_msg = format!(
-                "Engine Performance & Memory:\n  Resident: {} MiB · Private: {} MiB · Available RAM: {} MiB\n  KV-Cache: {}/{} tokens\n  MoE Tokens Evaluated: {}",
-                ws >> 20, private >> 20, free_ram,
-                engine.cur_pos, engine.max_seq,
-                engine.moe_stats.tokens
-            );
-            tui.push_message("system", &stats_msg, None);
-        }
-        other => {
-            tui.push_message("system", &format!("Unknown command '{other}'. Type /help for available commands."), None);
-        }
+        other => tui.error(&format!("Unknown command {other}. Type /help.")),
     }
-
-    tui.render_chat();
-    true
-}
-
-/// Executes a conversation turn ASYNCHRONOUSLY on a background worker thread.
-/// The UI thread remains fully interactive at 60 FPS: live tokens update continuously without
-/// needing user input, while the user can scroll with mouse wheel, review history with arrow keys,
-/// type their next draft into the input card, or cancel with Escape!
-fn execute_tui_turn(
-    tui: &mut SpindleTui,
-    engine: &mut crate::smollm_chat::SmolLm2Engine,
-    _governor: Option<&crate::memory_guard::Governor>,
-    prompt: &str,
-    allow_think: bool,
-    max_tokens: usize,
-) {
-    tui.push_message("user", prompt, None);
-    tui.scroll_offset = 0;
-    tui.push_message("assistant", "Thinking...", None);
-    tui.render_chat();
-
-    let abort_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    engine.abort_signal = Some(abort_flag.clone());
-
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::scope(|s| {
-        let abort_worker = abort_flag.clone();
-        let engine_ref = &mut *engine;
-
-        s.spawn(move || {
-            crate::pin_current_thread_to_pcore();
-            let mut current_input = prompt.to_string();
-            let mut steps = 0;
-            const MAX_STEPS: usize = 5;
-
-            loop {
-                if abort_worker.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send(WorkerEvent::Stopped);
-                    break;
-                }
-
-                let timing_before = engine_ref.cluster_timing;
-                let tx_token = tx.clone();
-                let (out_text, secs, tokens) = unsafe {
-                    engine_ref.generate_reply(&current_input, max_tokens, allow_think, &mut |token_piece| {
-                        let _ = tx_token.send(WorkerEvent::Token(token_piece.to_string()));
-                    })
-                };
-
-                if abort_worker.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send(WorkerEvent::Stopped);
-                    break;
-                }
-
-                let tok_per_sec = tokens as f64 / secs.max(0.001);
-                let (acc, tot, _) = engine_ref.spec_stats;
-                let delta_steps = engine_ref.cluster_timing.steps.saturating_sub(timing_before.steps);
-                let timing_str = if delta_steps > 0 {
-                    let delta_w = engine_ref.cluster_timing.worker_us.saturating_sub(timing_before.worker_us);
-                    let delta_l = engine_ref.cluster_timing.local_us.saturating_sub(timing_before.local_us);
-                    let w_ms = (delta_w as f64 / delta_steps as f64) / 1000.0;
-                    let l_ms = (delta_l as f64 / delta_steps as f64) / 1000.0;
-                    format!(" · w: {w_ms:.0}ms, l: {l_ms:.0}ms")
-                } else {
-                    String::new()
-                };
-                let speed_badge = if tot > 0 {
-                    let pct = (acc as f64 / tot as f64) * 100.0;
-                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s · spec {acc}/{tot} ({pct:.0}%){timing_str}")
-                } else {
-                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s{timing_str}")
-                };
-
-                // Tool calls go through the shared executor (`tools::execute`).
-                if engine_ref.enable_tools && steps < MAX_STEPS {
-                    let (calls, _) = crate::tools::parse_tool_calls(&out_text);
-                    if !calls.is_empty() {
-                        steps += 1;
-                        let mut responses = Vec::new();
-                        for call in &calls {
-                            let (_, title) = crate::agent::call_title(call);
-                            let _ = tx.send(WorkerEvent::ToolStart(format!("Action: {title}")));
-                            let mut confirm = |_: &str| true;
-                            let mut ctx = crate::tools::ToolCtx { confirm: &mut confirm, max_chars: 8000 };
-                            responses.push(crate::tools::execute(call, &mut ctx).output);
-                        }
-                        current_input = responses
-                            .iter()
-                            .map(|r| format!("<tool_response>\n{r}\n</tool_response>"))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        continue;
-                    }
-                }
-
-                let display_reply = out_text.trim().to_string();
-                let _ = tx.send(WorkerEvent::Done {
-                    reply: display_reply,
-                    speed_badge,
-                });
-                break;
-            }
-        });
-
-        // Main UI Thread: 60 FPS non-blocking Event Loop during live streaming
-        let mut stream_buffer = String::new();
-        let mut is_generating = true;
-        let mut last_render = std::time::Instant::now();
-
-        while is_generating {
-            let mut updated = false;
-
-            // 1. Drain all pending incoming worker events (live streaming tokens)
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    WorkerEvent::Token(piece) => {
-                        stream_buffer.push_str(&piece);
-                        if let Some(last_msg) = tui.history.last_mut() {
-                            if last_msg.role == "assistant" {
-                                last_msg.text = stream_buffer.clone();
-                            }
-                        }
-                        updated = true;
-                    }
-                    WorkerEvent::ToolStart(summary) => {
-                        if let Some(last_msg) = tui.history.last_mut() {
-                            if last_msg.role == "assistant" && stream_buffer.is_empty() {
-                                tui.history.pop();
-                            }
-                        }
-                        tui.push_message("tool", &summary, None);
-                        tui.push_message("assistant", "Thinking...", None);
-                        stream_buffer.clear();
-                        updated = true;
-                    }
-                    WorkerEvent::Done { reply, speed_badge } => {
-                        if let Some(last_msg) = tui.history.last_mut() {
-                            if last_msg.role == "assistant" {
-                                last_msg.text = if reply.is_empty() { stream_buffer.clone() } else { reply };
-                                last_msg.speed_badge = Some(speed_badge);
-                            } else {
-                                tui.push_message("assistant", &reply, Some(&speed_badge));
-                            }
-                        }
-                        is_generating = false;
-                        updated = true;
-                    }
-                    WorkerEvent::Stopped => {
-                        if let Some(last_msg) = tui.history.last_mut() {
-                            if last_msg.role == "assistant" {
-                                if stream_buffer.is_empty() {
-                                    last_msg.text = "[Generation stopped by user]".to_string();
-                                } else {
-                                    last_msg.text = format!("{} [stopped]", stream_buffer.trim());
-                                }
-                                last_msg.speed_badge = Some("stopped".to_string());
-                            }
-                        }
-                        is_generating = false;
-                        updated = true;
-                    }
-                }
-            }
-
-            // 2. Non-blocking user keyboard & mouse input handling while streaming!
-            match tui.poll_key() {
-                KeyAction::Char(c) => {
-                    tui.input.insert(c);
-                    updated = true;
-                }
-                KeyAction::Backspace => {
-                    tui.input.backspace();
-                    updated = true;
-                }
-                KeyAction::Delete => {
-                    tui.input.delete();
-                    updated = true;
-                }
-                KeyAction::Left => {
-                    tui.input.move_left();
-                    updated = true;
-                }
-                KeyAction::Right => {
-                    tui.input.move_right();
-                    updated = true;
-                }
-                KeyAction::Home => {
-                    tui.input.move_home();
-                    updated = true;
-                }
-                KeyAction::End => {
-                    tui.input.move_end();
-                    updated = true;
-                }
-                KeyAction::ScrollUp(n) => {
-                    tui.scroll_offset = tui.scroll_offset.saturating_add(n);
-                    updated = true;
-                }
-                KeyAction::ScrollDown(n) => {
-                    tui.scroll_offset = tui.scroll_offset.saturating_sub(n);
-                    updated = true;
-                }
-                KeyAction::PageUp => {
-                    tui.scroll_offset = tui.scroll_offset.saturating_add(6);
-                    updated = true;
-                }
-                KeyAction::PageDown => {
-                    tui.scroll_offset = tui.scroll_offset.saturating_sub(6);
-                    updated = true;
-                }
-                KeyAction::Up => {
-                    tui.scroll_offset = tui.scroll_offset.saturating_add(2);
-                    updated = true;
-                }
-                KeyAction::Down => {
-                    tui.scroll_offset = tui.scroll_offset.saturating_sub(2);
-                    updated = true;
-                }
-                KeyAction::Escape => {
-                    abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                KeyAction::Enter => {
-                    // If user pressed Enter with a typed draft, abort current generation to send new prompt!
-                    if !tui.input.text.trim().is_empty() {
-                        abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                }
-                _ => {}
-            }
-
-            // 3. Render frame if updated or throttled to ~28-30 FPS
-            if updated || last_render.elapsed().as_millis() >= 35 {
-                tui.render_chat();
-                last_render = std::time::Instant::now();
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    });
-
-    engine.abort_signal = None;
-    tui.render_chat();
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_canvas_draw_and_clear() {
-        let mut canvas = Canvas::new(80, 24);
-        assert_eq!(canvas.width, 80);
-        assert_eq!(canvas.height, 24);
-
-        canvas.set(5, 5, 'A', Rgb::SKY_BLUE, Rgb::CARD_BG, true, false);
-        let idx = 5 * 80 + 5;
-        assert_eq!(canvas.grid[idx].ch, 'A');
-        assert_eq!(canvas.grid[idx].fg, Rgb::SKY_BLUE);
-
-        canvas.clear(Rgb::BG_DARK);
-        assert_eq!(canvas.grid[idx].ch, ' ');
-        assert_eq!(canvas.grid[idx].bg, Rgb::BG_DARK);
-    }
-
-    #[test]
-    fn test_canvas_draw_card() {
-        let mut canvas = Canvas::new(80, 24);
-        canvas.draw_card(10, 5, 40, 6, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
-
-        let bar_idx = 5 * 80 + 10;
-        assert_eq!(canvas.grid[bar_idx].ch, '▌');
-        assert_eq!(canvas.grid[bar_idx].fg, Rgb::BRIGHT_BLUE);
-
-        let tr_idx = 5 * 80 + 49;
-        assert_eq!(canvas.grid[tr_idx].ch, '╮');
-    }
-
-    #[test]
-    fn test_input_buffer_operations() {
-        let mut buf = InputBuffer::default();
-        buf.insert('h');
-        buf.insert('i');
-        assert_eq!(buf.text, "hi");
-        assert_eq!(buf.cursor, 2);
-
-        buf.backspace();
-        assert_eq!(buf.text, "h");
-        assert_eq!(buf.cursor, 1);
-
-        buf.insert('e');
-        buf.insert('y');
-        assert_eq!(buf.text, "hey");
-
-        buf.move_home();
-        assert_eq!(buf.cursor, 0);
-
-        buf.move_right();
-        assert_eq!(buf.cursor, 1);
-
-        buf.delete();
-        assert_eq!(buf.text, "hy");
-
-        // Multi-byte UTF-8 test (ñ is 2 bytes: 0xC3 0xB1)
-        buf.clear();
-        buf.insert('k');
-        buf.insert('u');
-        buf.insert('m');
-        buf.insert('u');
-        buf.insert('s');
-        buf.insert('t');
-        buf.insert('a');
-        assert_eq!(buf.text, "kumusta");
-        assert_eq!(buf.cursor, 7);
-
-        buf.insert('ñ');
-        assert_eq!(buf.text, "kumustañ");
-        assert_eq!(buf.cursor, 8);
-
-        buf.backspace();
-        assert_eq!(buf.text, "kumusta");
-        assert_eq!(buf.cursor, 7);
-    }
-
-    #[test]
-    fn test_spindle_tui_welcome_and_chat_render() {
-        let mut tui = SpindleTui::new("Qwen3-30B-A3B", Some("192.168.1.10:42424"), "fp8", 0.03, "layers 35..48");
-        tui.canvas.resize(80, 24);
-        tui.render_welcome();
-        assert!(tui.running);
-
-        // Test chronological chat rendering
-        tui.push_message("user", "Hello Spindle", None);
-        tui.push_message("assistant", "I am ready to assist you.", Some("8.5 tok/s"));
-        tui.render_chat();
-        assert_eq!(tui.history.len(), 2);
-    }
-
-    #[test]
-    fn test_wrap_text() {
-        let long_text = "I am Qwen, a large language model created by Alibaba. I can help you with various tasks such as answering questions, generating code, reviewing files, and automating your developer workflows.";
-        let wrapped = wrap_text(long_text, 40);
-        assert!(wrapped.len() >= 3);
-        for line in &wrapped {
-            assert!(line.chars().count() <= 40, "Line exceeds max width 40: '{}'", line);
+    fn info() -> SessionInfo {
+        SessionInfo {
+            model: "test-model".into(),
+            cluster: Some("10.0.0.2:42424".into()),
+            local_layers: "layers 24..48".into(),
+            worker_layers: Some("layers 0..24".into()),
+            wire: Some("fp8".into()),
+            ctx_max: 4096,
+            ctx_used: 100,
+            tools: true,
+            think: false,
+            speculate: true,
+            last_tps: Some(11.0),
+            spec: (3, 4),
+            branch: None,
         }
     }
 
     #[test]
-    fn test_engine_send() {
-        fn assert_send<T: Send>() {}
-        assert_send::<crate::smollm_chat::SmolLm2Engine>();
-    }
-
-    #[test]
-    fn test_thread_scope() {
-        let mut val = 42;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                val += 1;
-            });
-        });
-        assert_eq!(val, 43);
-    }
-
-    #[test]
-    fn test_scope_reborrow() {
-        let mut num = 100;
-        let num_ref = &mut num;
-        std::thread::scope(|s| {
-            let r = &mut *num_ref;
-            s.spawn(move || {
-                *r += 50;
-            });
-        });
-        assert_eq!(*num_ref, 150);
-    }
-
-    #[test]
-    fn test_scroll_navigation() {
-        let mut tui = SpindleTui::new("Qwen3-30B-A3B", None, "fp8", 0.03, "layers 0..48");
-        assert_eq!(tui.scroll_offset, 0);
-
-        // Simulate ScrollUp (mouse wheel up)
-        tui.scroll_offset = tui.scroll_offset.saturating_add(3);
-        assert_eq!(tui.scroll_offset, 3);
-
-        // Simulate ScrollDown (mouse wheel down)
-        tui.scroll_offset = tui.scroll_offset.saturating_sub(3);
-        assert_eq!(tui.scroll_offset, 0);
-
-        // Simulate PageUp
-        tui.scroll_offset = tui.scroll_offset.saturating_add(6);
-        assert_eq!(tui.scroll_offset, 6);
-
-        // Simulate PageDown
-        tui.scroll_offset = tui.scroll_offset.saturating_sub(6);
-        assert_eq!(tui.scroll_offset, 0);
-    }
-
-    #[test]
-    fn test_parse_input_bytes_swallows_mouse_clicks_and_parses_wheel() {
-        // 1. Mouse click press & release sequences: button 0 press (\x1b[<0;77;27M) and release (\x1b[<0;77;27m)
-        let click_bytes = b"\x1b[<0;77;27M\x1b[<0;77;27m";
-        let (actions, consumed) = parse_input_bytes(click_bytes);
-        assert_eq!(consumed, click_bytes.len());
-        // All click actions are None
-        for a in &actions {
-            assert_eq!(*a, KeyAction::None);
+    fn input_buffer_utf8_editing() {
+        let mut b = InputBuffer::default();
+        for c in "kumusta".chars() {
+            b.insert(c);
         }
+        b.insert('ñ');
+        assert_eq!((b.text.as_str(), b.cursor), ("kumustañ", 8));
+        b.backspace();
+        b.move_home();
+        b.delete();
+        assert_eq!(b.text, "umusta");
+        b.move_end();
+        b.insert_str("\nline 2");
+        assert_eq!(b.text, "umusta\nline 2");
+    }
 
-        // 2. Mouse wheel up: button 64 (\x1b[<64;77;27M)
-        let wheel_up = b"\x1b[<64;77;27M";
-        let (actions, consumed) = parse_input_bytes(wheel_up);
-        assert_eq!(consumed, wheel_up.len());
-        assert_eq!(actions, vec![KeyAction::ScrollUp(3)]);
-
-        // 3. Mouse wheel down: button 65 (\x1b[<65;77;27M)
-        let wheel_down = b"\x1b[<65;77;27M";
-        let (actions, consumed) = parse_input_bytes(wheel_down);
-        assert_eq!(consumed, wheel_down.len());
-        assert_eq!(actions, vec![KeyAction::ScrollDown(3)]);
-
-        // 4. Orphaned CSI fragments (like [<0;77;27M) without leading ESC
-        let orphan = b"[<0;77;27M";
-        let (actions, consumed) = parse_input_bytes(orphan);
-        assert_eq!(consumed, orphan.len());
-        assert_eq!(actions.len(), 0);
-
-        // 5. Orphaned SGR semicolon fragments (like ;77;27M)
-        let orphan_semi = b";77;27M";
-        let (actions, consumed) = parse_input_bytes(orphan_semi);
-        assert_eq!(consumed, orphan_semi.len());
-        assert_eq!(actions.len(), 0);
-
-        // 6. Normal text mixed with swallowed mouse clicks
-        let mixed = b"hello\x1b[<0;10;10M world";
-        let (actions, consumed) = parse_input_bytes(mixed);
-        assert_eq!(consumed, mixed.len());
-        let text: String = actions.into_iter().filter_map(|a| match a {
-            KeyAction::Char(c) => Some(c),
-            _ => None,
-        }).collect();
+    #[test]
+    fn parse_input_handles_mouse_paste_and_ctrl_keys() {
+        let (a, n) = parse_input_bytes(b"\x1b[<0;77;27M\x1b[<0;77;27m");
+        assert_eq!(n, 22);
+        assert!(a.iter().all(|k| *k == KeyAction::None));
+        assert_eq!(parse_input_bytes(b"\x1b[<64;7;7M").0, vec![KeyAction::ScrollUp(3)]);
+        assert_eq!(parse_input_bytes(b"[<0;77;27M").0.len(), 0);
+        let text: String = parse_input_bytes(b"hello\x1b[<0;10;10M world").0.into_iter().filter_map(|a| if let KeyAction::Char(c) = a { Some(c) } else { None }).collect();
         assert_eq!(text, "hello world");
+        // Bracketed paste: multi-line text arrives as one Paste, CRLF normalized; Enter not sent.
+        let (a, n) = parse_input_bytes(b"\x1b[200~line1\r\nline2\x1b[201~\r");
+        assert_eq!(n, 25);
+        assert_eq!(a, vec![KeyAction::Paste("line1\nline2".into()), KeyAction::Enter]);
+        // Unfinished paste waits for more bytes.
+        assert_eq!(parse_input_bytes(b"\x1b[200~partial").1, 0);
+        assert_eq!(parse_input_bytes(&[3, 4, 10]).0, vec![KeyAction::CtrlC, KeyAction::CtrlD, KeyAction::Newline]);
     }
 
     #[test]
-    fn test_slash_command_dispatch() {
+    fn split_reply_hides_tool_markup_and_think() {
+        let (t, v, p) = split_reply("<think>plan it</think>\n\nI'll read it.\n<tool_call>\n{\"name\":\"read_file\"");
+        assert_eq!((t.as_str(), v.as_str(), p), ("plan it", "I'll read it.", true));
+        let (_, v, p) = split_reply("a<tool_call>{}</tool_call>b");
+        assert_eq!((v.as_str(), p), ("ab", false));
+    }
+
+    #[test]
+    fn wrap_text_respects_width() {
+        let s = "I am a large language model that can help with answering questions, generating code and automating developer workflows.";
+        for l in wrap_text(s, 40) {
+            assert!(l.chars().count() <= 40, "{l:?}");
+        }
+        assert_eq!(wrap_text("    indented code line", 40), vec!["    indented code line"]);
+    }
+
+    #[test]
+    fn transcript_layout_and_full_render() {
+        let mut tui = SpindleTui::new(info());
+        tui.canvas.resize(120, 30);
+        tui.entries.push(Entry::User("Fix the bug in `main.rs`".into()));
+        tui.entries.push(Entry::Assistant { raw: "Sure.\n```rust\nfn main() {}\n```\n- one **two** `three`".into(), streaming: false });
+        tui.entries.push(Entry::Tool { icon: "→", title: "Read src/main.rs".into(), state: ToolState::Ok, error: None, preview: None, block: false });
+        tui.entries.push(Entry::Tool { icon: "←", title: "Edit src/main.rs".into(), state: ToolState::Ok, error: None, preview: Some("-old\n+new".into()), block: true });
+        tui.entries.push(Entry::Tool { icon: "$", title: "cargo test".into(), state: ToolState::Failed, error: None, preview: Some("error[E0425]\n(exit code 101)".into()), block: true });
+        tui.entries.push(Entry::Footer { agent: "Agent".into(), detail: "test-model · 2.0s · 11.0 tok/s".into() });
+        let lines = tui.transcript(80);
+        let flat: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.text.as_str()).collect()).collect();
+        assert!(lines.iter().any(|l| l.bar == Some(PRIMARY) && l.bg == Some(PANEL)), "user panel");
+        assert!(flat.iter().any(|l| l.contains("→ Read src/main.rs")));
+        assert!(lines.iter().any(|l| l.bg == Some(DIFF_ADD_BG)) && lines.iter().any(|l| l.bg == Some(DIFF_DEL_BG)));
+        assert!(flat.iter().any(|l| l.contains("$ cargo test")));
+        assert!(flat.iter().any(|l| l.contains("▣ Agent")));
+        // Code block rendered on a panel; inline code green.
+        assert!(lines.iter().any(|l| l.bg == Some(PANEL) && flat_contains(l, "fn main() {}")));
+        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text == "three" && s.fg == SUCCESS)));
+        // Widths never exceed the column.
+        for l in &flat {
+            assert!(l.chars().count() <= 82, "{l:?}");
+        }
+        tui.render_session(120, 30);
+        tui.render_session(60, 20);
+        let mut home = SpindleTui::new(info());
+        home.canvas.resize(80, 24);
+        home.render_home(80, 24);
+    }
+
+    /// Prints a rendered session as plain text (`cargo test --release dump_session -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn dump_session_screen() {
+        for (w, h) in [(130u16, 40u16), (80, 34)] {
+            let mut tui = SpindleTui::new(info());
+            tui.canvas.resize(w, h);
+            tui.entries.push(Entry::User("Rename the greeting in demo.rs to \"hello spindle\" and run the tests".into()));
+            tui.entries.push(Entry::Assistant { raw: "<think>Need to read the file first.</think>\n\nI'll check the file first.".into(), streaming: false });
+            tui.entries.push(Entry::Tool { icon: "→", title: "Read demo.rs".into(), state: ToolState::Ok, error: None, preview: None, block: false });
+            tui.entries.push(Entry::Tool { icon: "✱", title: "Grep \"hello\" (2 matches)".into(), state: ToolState::Ok, error: None, preview: None, block: false });
+            tui.entries.push(Entry::Tool { icon: "←", title: "Edit demo.rs".into(), state: ToolState::Ok, error: None, preview: Some("-    println!(\"hello\");\n+    println!(\"hello spindle\");".into()), block: true });
+            tui.entries.push(Entry::Tool { icon: "$", title: "cargo test".into(), state: ToolState::Ok, error: None, preview: Some("running 3 tests\ntest a ... ok\ntest result: ok. 3 passed".into()), block: true });
+            tui.entries.push(Entry::Assistant { raw: "Done. The greeting now reads **hello spindle** and all tests pass:\n- `demo.rs` line 2 updated\n- `cargo test`: 3 passed".into(), streaming: false });
+            tui.entries.push(Entry::Footer { agent: "Agent".into(), detail: "Qwen3-30B-A3B · 14.2s · 11.8 tok/s · spec 41/52".into() });
+            tui.input.set_text("/to");
+            tui.render_session(w, h);
+            println!("===== {w}x{h} =====");
+            for y in 0..h {
+                let row: String = (0..w).map(|x| tui.canvas.cell(x, y).unwrap().ch).collect();
+                println!("{}", row.trim_end());
+            }
+        }
+    }
+
+    fn flat_contains(l: &Line, s: &str) -> bool {
+        l.spans.iter().map(|x| x.text.as_str()).collect::<String>().contains(s)
+    }
+
+    #[test]
+    fn prompt_wraps_and_tracks_cursor() {
+        let mut tui = SpindleTui::new(info());
+        tui.input.set_text("abcdefghij\nxy");
+        let (rows, cur) = tui.prompt_rows(4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij", "xy"]);
+        assert_eq!(cur, (3, 2));
+        tui.input.cursor = 4;
+        assert_eq!(tui.prompt_rows(4).1, (1, 0));
+    }
+
+    #[test]
+    fn slash_popup_and_completion() {
+        assert!(command_matches("/t").iter().any(|(c, _)| *c == "/tools"));
+        assert!(command_matches("/tools on").is_empty());
+        let mut tui = SpindleTui::new(info());
+        tui.input.set_text("/too");
+        assert_eq!(tui.handle_key(KeyAction::Enter), None);
+        assert_eq!(tui.input.text, "/tools");
+        assert_eq!(tui.handle_key(KeyAction::Enter).as_deref(), Some("/tools"));
+        // Ctrl+C clears first, quits on an empty prompt; Esc never quits.
+        tui.input.set_text("draft");
+        tui.handle_key(KeyAction::Escape);
+        assert!(tui.running && tui.input.text.is_empty());
+        tui.handle_key(KeyAction::CtrlC);
+        assert!(!tui.running);
+    }
+
+    #[test]
+    fn slash_commands_dispatch() {
         let path = "smollm2-135m-q4_k_m.gguf";
         if !std::path::Path::new(path).exists() {
             return;
         }
-        let mut engine = crate::smollm_chat::SmolLm2Engine::load(path).expect("load");
-        let mut tui = SpindleTui::new("smollm2", None, "fp8", 0.03, "layers 0..30");
-        let mut allow_think = false;
-        let mut max_tokens = 64;
+        let mut engine = SmolLm2Engine::load(path).expect("load");
+        let mut tui = SpindleTui::new(info());
+        let mut opts = AgentOpts::default();
+        assert!(handle_slash_command(&mut tui, &mut engine, "/help", &mut opts).is_none());
+        assert!(tui.entries.iter().any(|e| matches!(e, Entry::Notice { text, .. } if text.contains("/tools"))));
+        handle_slash_command(&mut tui, &mut engine, "/think on", &mut opts);
+        assert!(opts.allow_think);
+        handle_slash_command(&mut tui, &mut engine, "/tools on", &mut opts);
+        assert!(engine.enable_tools && engine.system_prompt.contains("<tools>"));
+        // A custom system prompt keeps its case and survives the tools section swap.
+        handle_slash_command(&mut tui, &mut engine, "/system Ikaw ay si Spindle.", &mut opts);
+        assert!(engine.system_prompt.starts_with("Ikaw ay si Spindle.") && engine.system_prompt.contains("<tools>"));
+        handle_slash_command(&mut tui, &mut engine, "/tools off", &mut opts);
+        assert_eq!(engine.system_prompt, "Ikaw ay si Spindle.");
+        assert!(handle_slash_command(&mut tui, &mut engine, "/init", &mut opts).is_some());
+        handle_slash_command(&mut tui, &mut engine, "/max 300", &mut opts);
+        assert_eq!(opts.max_tokens, 300);
+    }
 
-        // Non-command should return false so it passes to LLM inference
-        assert!(!handle_slash_command(&mut tui, &mut engine, "hi how are you", &mut allow_think, &mut max_tokens));
-
-        // /help command should be intercepted and output system reference table
-        assert!(handle_slash_command(&mut tui, &mut engine, "/help", &mut allow_think, &mut max_tokens));
-        assert!(tui.history.iter().any(|m| m.role == "system" && m.text.contains("Available Slash Commands")));
-
-        // /think toggle
-        assert!(handle_slash_command(&mut tui, &mut engine, "/think on", &mut allow_think, &mut max_tokens));
-        assert!(allow_think);
-        assert!(handle_slash_command(&mut tui, &mut engine, "/think off", &mut allow_think, &mut max_tokens));
-        assert!(!allow_think);
-
-        // /tools toggle
-        assert!(handle_slash_command(&mut tui, &mut engine, "/tools on", &mut allow_think, &mut max_tokens));
-        assert!(engine.enable_tools);
-
-        // /stats
-        assert!(handle_slash_command(&mut tui, &mut engine, "/stats", &mut allow_think, &mut max_tokens));
-        assert!(tui.history.iter().any(|m| m.role == "system" && m.text.contains("Engine Performance")));
+    #[test]
+    fn engine_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SmolLm2Engine>();
     }
 }
