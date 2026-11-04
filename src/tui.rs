@@ -1,8 +1,9 @@
 //! OpenCode-grade Full-Screen Terminal User Interface (TUI) for Spindle.
 //!
 //! Provides an alternate screen canvas, 24-bit TrueColor atomic frame rendering,
-//! floating elevated card layout, responsive word-wrapping, live incremental token streaming,
-//! scroll history (PgUp/PgDn), prompt history (Up/Down), and an electric blue theme.
+//! floating elevated card layout, responsive word-wrapping, non-blocking asynchronous
+//! token streaming (user can type and scroll during generation), SGR 1006 mouse wheel scrolling,
+//! arrow key scroll navigation, prompt history, and an electric blue theme.
 
 use std::io::{self, Read, Write};
 use windows::Win32::System::Console::{
@@ -85,8 +86,9 @@ impl TerminalGuard {
             let _ = SetConsoleMode(in_handle, CONSOLE_MODE(new_in));
 
             let mut stdout = io::stdout();
-            // Enter alternate screen buffer (\x1b[?1049h), hide cursor (\x1b[?25l), disable auto-wrap (\x1b[?7l)
-            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?7l");
+            // Enter alternate buffer (\x1b[?1049h), hide cursor (\x1b[?25l), disable auto-wrap (\x1b[?7l),
+            // enable normal mouse tracking (\x1b[?1000h), enable SGR extended mouse mode (\x1b[?1006h)
+            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h");
             let _ = stdout.flush();
 
             Ok(Self {
@@ -103,8 +105,9 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         unsafe {
             let mut stdout = io::stdout();
-            // Enable auto-wrap (\x1b[?7h), show cursor (\x1b[?25h), exit alternate screen buffer (\x1b[?1049l), reset styles
-            let _ = write!(stdout, "\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
+            // Disable SGR mouse (\x1b[?1006l), disable mouse (\x1b[?1000l), enable auto-wrap (\x1b[?7h),
+            // show cursor (\x1b[?25h), exit alternate screen buffer (\x1b[?1049l), reset styles
+            let _ = write!(stdout, "\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
             let _ = stdout.flush();
 
             let _ = SetConsoleMode(self.out_handle, self.orig_out_mode);
@@ -309,7 +312,7 @@ pub const LOGO_GRADIENT: [Rgb; 4] = [
     Rgb(29, 78, 216),   // Deep Cobalt Blue
 ];
 
-/// Keys captured during the event loop.
+/// Keys and mouse actions captured during the non-blocking event loop.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KeyAction {
     Char(char),
@@ -324,13 +327,15 @@ pub enum KeyAction {
     Down,
     PageUp,
     PageDown,
+    ScrollUp(usize),
+    ScrollDown(usize),
     Tab,
     CtrlP,
     Escape,
     None,
 }
 
-/// Non-blocking raw keyboard reader using ANSI/VT escape parser.
+/// Non-blocking raw keyboard and mouse reader using ANSI/VT and SGR 1006 parser.
 pub fn read_key_nonblocking() -> KeyAction {
     let mut stdin = io::stdin();
     let mut byte = [0u8; 1];
@@ -351,6 +356,56 @@ pub fn read_key_nonblocking() -> KeyAction {
                 if seq[0] == b'[' {
                     if stdin.read(&mut seq[1..2]).unwrap_or(0) == 1 {
                         match seq[1] {
+                            b'<' => {
+                                // SGR 1006 Mouse Event: \x1b[<button;x;yM or m
+                                let mut sgr_buf = Vec::with_capacity(16);
+                                let mut b = [0u8; 1];
+                                while stdin.read(&mut b).unwrap_or(0) == 1 {
+                                    if b[0] == b'M' || b[0] == b'm' {
+                                        break;
+                                    }
+                                    sgr_buf.push(b[0]);
+                                    if sgr_buf.len() >= 32 {
+                                        break;
+                                    }
+                                }
+                                let sgr_str = String::from_utf8_lossy(&sgr_buf);
+                                let btn = sgr_str.split(';').next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                                match btn {
+                                    64 | 68 | 80 => KeyAction::ScrollUp(3),   // Wheel Up (normal, shift, ctrl)
+                                    65 | 69 | 81 => KeyAction::ScrollDown(3), // Wheel Down (normal, shift, ctrl)
+                                    _ => KeyAction::None,
+                                }
+                            }
+                            b'M' => {
+                                // Legacy X10/X11 mouse event: 3 bytes follow
+                                let mut m_bytes = [0u8; 3];
+                                if stdin.read(&mut m_bytes).unwrap_or(0) == 3 {
+                                    let btn = m_bytes[0].saturating_sub(32);
+                                    match btn {
+                                        64 => KeyAction::ScrollUp(3),
+                                        65 => KeyAction::ScrollDown(3),
+                                        _ => KeyAction::None,
+                                    }
+                                } else {
+                                    KeyAction::None
+                                }
+                            }
+                            b'1' => {
+                                // Modifier sequences: e.g. \x1b[1;5A (Ctrl+Up), \x1b[1;2A (Shift+Up)
+                                let mut mod_seq = [0u8; 3];
+                                if stdin.read(&mut mod_seq).unwrap_or(0) == 3 {
+                                    match mod_seq[2] {
+                                        b'A' => KeyAction::ScrollUp(2),
+                                        b'B' => KeyAction::ScrollDown(2),
+                                        b'C' => KeyAction::Right,
+                                        b'D' => KeyAction::Left,
+                                        _ => KeyAction::None,
+                                    }
+                                } else {
+                                    KeyAction::None
+                                }
+                            }
                             b'A' => KeyAction::Up,
                             b'B' => KeyAction::Down,
                             b'C' => KeyAction::Right,
@@ -819,9 +874,9 @@ impl SpindleTui {
 
         // Render scroll indicator if scrolled up into history
         if self.scroll_offset > 0 {
-            let scroll_indicator = format!("[▲ Scroll: +{} lines | PgDn to bottom]", self.scroll_offset);
+            let scroll_indicator = format!("[▲ Scrolled: +{} lines | Mouse wheel or PgDn to bottom]", self.scroll_offset);
             let sx = w.saturating_sub(scroll_indicator.len() as u16 + 4);
-            self.canvas.print(sx, 1, &scroll_indicator, Rgb::SKY_BLUE, Rgb::BG_DARK, true, false);
+            self.canvas.print(sx, 1, &scroll_indicator, Rgb::ICE_CYAN, Rgb::BG_DARK, true, false);
         }
 
         // 4. Floating Input Card docked at the bottom
@@ -900,7 +955,7 @@ impl SpindleTui {
         });
     }
 
-    /// Runs a prompt turn through the TUI loop, rendering frames and collecting keyboard input.
+    /// Runs an idle prompt turn through the TUI loop, rendering frames and collecting keyboard input.
     pub fn poll_input(&mut self) -> Option<String> {
         loop {
             if self.history.is_empty() {
@@ -917,23 +972,49 @@ impl SpindleTui {
                 KeyAction::Right => self.input.move_right(),
                 KeyAction::Home => self.input.move_home(),
                 KeyAction::End => self.input.move_end(),
+                KeyAction::ScrollUp(n) => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(n);
+                }
+                KeyAction::ScrollDown(n) => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(n);
+                }
+                KeyAction::PageUp => {
+                    self.scroll_offset = self.scroll_offset.saturating_add(6);
+                }
+                KeyAction::PageDown => {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(6);
+                }
                 KeyAction::Up => {
-                    // Up arrow: recall previous prompt if input is empty
-                    if self.input.text.is_empty() && !self.prompt_history.is_empty() {
-                        let idx = self.history_idx.map_or(self.prompt_history.len() - 1, |i| i.saturating_sub(1));
-                        self.history_idx = Some(idx);
-                        self.input.set_text(&self.prompt_history[idx]);
+                    // Up arrow: If scrolled up into history, scroll further up!
+                    if self.scroll_offset > 0 {
+                        self.scroll_offset = self.scroll_offset.saturating_add(2);
+                    } else if self.input.text.is_empty() {
+                        if !self.prompt_history.is_empty() && self.history_idx.is_none() {
+                            let idx = self.prompt_history.len() - 1;
+                            self.history_idx = Some(idx);
+                            self.input.set_text(&self.prompt_history[idx]);
+                        } else if !self.history.is_empty() {
+                            // Empty input with chat history: scroll up into convo!
+                            self.scroll_offset = self.scroll_offset.saturating_add(2);
+                        }
                     } else if let Some(idx) = self.history_idx {
                         if idx > 0 {
                             let new_idx = idx - 1;
                             self.history_idx = Some(new_idx);
                             self.input.set_text(&self.prompt_history[new_idx]);
+                        } else {
+                            // At earliest prompt: clear and scroll up
+                            self.history_idx = None;
+                            self.input.clear();
+                            self.scroll_offset = self.scroll_offset.saturating_add(2);
                         }
                     }
                 }
                 KeyAction::Down => {
-                    // Down arrow: forward prompt recall
-                    if let Some(idx) = self.history_idx {
+                    // Down arrow: If scrolled up, scroll back down towards bottom!
+                    if self.scroll_offset > 0 {
+                        self.scroll_offset = self.scroll_offset.saturating_sub(2);
+                    } else if let Some(idx) = self.history_idx {
                         if idx + 1 < self.prompt_history.len() {
                             let new_idx = idx + 1;
                             self.history_idx = Some(new_idx);
@@ -943,12 +1024,6 @@ impl SpindleTui {
                             self.input.clear();
                         }
                     }
-                }
-                KeyAction::PageUp => {
-                    self.scroll_offset = self.scroll_offset.saturating_add(4);
-                }
-                KeyAction::PageDown => {
-                    self.scroll_offset = self.scroll_offset.saturating_sub(4);
                 }
                 KeyAction::Enter => {
                     let text = self.input.text.trim().to_string();
@@ -971,6 +1046,17 @@ impl SpindleTui {
             }
         }
     }
+}
+
+/// Message events transmitted from background generation worker to UI thread.
+enum WorkerEvent {
+    Token(String),
+    ToolStart(String),
+    Done {
+        reply: String,
+        speed_badge: String,
+    },
+    Stopped,
 }
 
 /// Launches the full-screen OpenCode TUI interactive session.
@@ -1022,6 +1108,9 @@ pub fn run_tui(
     drop(guard);
 }
 
+/// Executes a conversation turn ASYNCHRONOUSLY on a background worker thread.
+/// The UI thread remains fully interactive at 60 FPS: the user can scroll with mouse wheel,
+/// review history with arrow keys, type their next draft into the input card, and cancel with Escape!
 fn execute_tui_turn(
     tui: &mut SpindleTui,
     engine: &mut crate::smollm_chat::SmolLm2Engine,
@@ -1030,136 +1119,234 @@ fn execute_tui_turn(
     allow_think: bool,
     max_tokens: usize,
 ) {
-    // 1. Record user turn first
     tui.push_message("user", prompt, None);
     tui.scroll_offset = 0;
+    tui.push_message("assistant", "Thinking...", None);
     tui.render_chat();
 
-    let mut current_input = prompt.to_string();
-    let mut steps = 0;
-    let mut last_call_sig = None;
-    const MAX_STEPS: usize = 5;
+    let abort_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    engine.abort_signal = Some(abort_flag.clone());
 
-    loop {
-        // Push initial live assistant slot
-        tui.push_message("assistant", "Thinking...", None);
-        tui.render_chat();
+    let (tx, rx) = std::sync::mpsc::channel();
 
+    std::thread::scope(|s| {
+        let abort_worker = abort_flag.clone();
+        let engine_ref = &mut *engine;
+
+        s.spawn(move || {
+            let mut current_input = prompt.to_string();
+            let mut steps = 0;
+            let mut last_call_sig = None;
+            const MAX_STEPS: usize = 5;
+
+            loop {
+                if abort_worker.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(WorkerEvent::Stopped);
+                    break;
+                }
+
+                let tx_token = tx.clone();
+                let (out_text, secs, tokens) = unsafe {
+                    engine_ref.generate_reply(&current_input, max_tokens, allow_think, &mut |token_piece| {
+                        let _ = tx_token.send(WorkerEvent::Token(token_piece.to_string()));
+                    })
+                };
+
+                if abort_worker.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(WorkerEvent::Stopped);
+                    break;
+                }
+
+                let tok_per_sec = tokens as f64 / secs.max(0.001);
+                let speed_badge = format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s");
+
+                // Check if model emitted an agentic tool call
+                if engine_ref.enable_tools && steps < MAX_STEPS {
+                    if let Some(call) = crate::tools::parse_tool_call(&out_text) {
+                        let call_sig = format!("{}:{:?}:{:?}", call.name, call.path, call.command);
+                        if last_call_sig.as_ref() == Some(&call_sig) {
+                            let _ = tx.send(WorkerEvent::ToolStart(format!("Action: {} (duplicate skipped)", call.name)));
+                            current_input = "<tool_response>\nAction already completed. Please provide your final answer to the user.\n</tool_response>".to_string();
+                            steps += 1;
+                            continue;
+                        }
+                        last_call_sig = Some(call_sig);
+                        steps += 1;
+
+                        let action_summary = match (&call.path, &call.command) {
+                            (Some(p), _) => format!("Action: {} (path: {p})", call.name),
+                            (_, Some(c)) => format!("Action: {} (cmd: {c})", call.name),
+                            _ => format!("Action: {}", call.name),
+                        };
+                        let _ = tx.send(WorkerEvent::ToolStart(action_summary));
+
+                        let tool_result = match call.name.as_str() {
+                            "read_file" => {
+                                let p = call.path.as_deref().unwrap_or("");
+                                crate::tools::tool_read_file(p, call.start_line, call.limit)
+                            }
+                            "write_file" => {
+                                let p = call.path.as_deref().unwrap_or("");
+                                let c = call.content.as_deref().unwrap_or("");
+                                crate::tools::tool_write_file(p, c)
+                            }
+                            "edit_file" => {
+                                let p = call.path.as_deref().unwrap_or("");
+                                let t = call.target.as_deref().unwrap_or("");
+                                let r = call.replacement.as_deref().unwrap_or("");
+                                crate::tools::tool_edit_file(p, t, r)
+                            }
+                            "delete_file" => {
+                                let p = call.path.as_deref().unwrap_or("");
+                                crate::tools::tool_delete_file(p)
+                            }
+                            "list_dir" => {
+                                let p = call.path.as_deref().unwrap_or(".");
+                                crate::tools::tool_list_dir(p)
+                            }
+                            "run_command" => {
+                                let cmd = call.command.as_deref().unwrap_or("");
+                                crate::tools::tool_run_command(cmd, |_| true)
+                            }
+                            "search_web" => {
+                                let q = call.query.as_deref().unwrap_or("");
+                                crate::tools::tool_search_web(q)
+                            }
+                            "search_symbols" => {
+                                let pat = call.pattern.as_deref().unwrap_or(call.query.as_deref().unwrap_or(""));
+                                let p = call.path.as_deref();
+                                let st = call.symbol_type.as_deref();
+                                crate::tools::tool_search_symbols(pat, p, st)
+                            }
+                            other => Err(format!("Unknown tool: '{other}'")),
+                        };
+
+                        match tool_result {
+                            Ok(res) => {
+                                current_input = format!("<tool_response>\n{}\n</tool_response>", res);
+                                continue;
+                            }
+                            Err(err) => {
+                                current_input = format!("<tool_response>\nError: {}\n</tool_response>", err);
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                let display_reply = out_text.trim().to_string();
+                let _ = tx.send(WorkerEvent::Done {
+                    reply: display_reply,
+                    speed_badge,
+                });
+                break;
+            }
+        });
+
+        // Main UI Thread: 60 FPS Event Loop during streaming
         let mut stream_buffer = String::new();
+        let mut is_generating = true;
         let mut last_render = std::time::Instant::now();
 
-        let (out_text, secs, tokens) = unsafe {
-            engine.generate_reply(&current_input, max_tokens, allow_think, &mut |token_piece| {
-                stream_buffer.push_str(token_piece);
-                if let Some(last_msg) = tui.history.last_mut() {
-                    last_msg.text = stream_buffer.clone();
+        while is_generating {
+            // Drain incoming worker events
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    WorkerEvent::Token(piece) => {
+                        stream_buffer.push_str(&piece);
+                        if let Some(last_msg) = tui.history.last_mut() {
+                            if last_msg.role == "assistant" {
+                                last_msg.text = stream_buffer.clone();
+                            }
+                        }
+                    }
+                    WorkerEvent::ToolStart(summary) => {
+                        if let Some(last_msg) = tui.history.last_mut() {
+                            if last_msg.role == "assistant" && stream_buffer.is_empty() {
+                                tui.history.pop();
+                            }
+                        }
+                        tui.push_message("tool", &summary, None);
+                        tui.push_message("assistant", "Thinking...", None);
+                        stream_buffer.clear();
+                    }
+                    WorkerEvent::Done { reply, speed_badge } => {
+                        if let Some(last_msg) = tui.history.last_mut() {
+                            if last_msg.role == "assistant" {
+                                last_msg.text = if reply.is_empty() { stream_buffer.clone() } else { reply };
+                                last_msg.speed_badge = Some(speed_badge);
+                            } else {
+                                tui.push_message("assistant", &reply, Some(&speed_badge));
+                            }
+                        }
+                        is_generating = false;
+                    }
+                    WorkerEvent::Stopped => {
+                        if let Some(last_msg) = tui.history.last_mut() {
+                            if last_msg.role == "assistant" {
+                                if stream_buffer.is_empty() {
+                                    last_msg.text = "[Generation stopped by user]".to_string();
+                                } else {
+                                    last_msg.text = format!("{} [stopped]", stream_buffer.trim());
+                                }
+                                last_msg.speed_badge = Some("stopped".to_string());
+                            }
+                        }
+                        is_generating = false;
+                    }
                 }
-                // Throttle live stream updates to ~35ms (~28 FPS) to prevent compute starvation
-                if last_render.elapsed().as_millis() >= 35 {
-                    tui.render_chat();
-                    last_render = std::time::Instant::now();
+            }
+
+            // Non-blocking user keyboard & mouse input handling while streaming!
+            match read_key_nonblocking() {
+                KeyAction::Char(c) => tui.input.insert(c),
+                KeyAction::Backspace => tui.input.backspace(),
+                KeyAction::Delete => tui.input.delete(),
+                KeyAction::Left => tui.input.move_left(),
+                KeyAction::Right => tui.input.move_right(),
+                KeyAction::Home => tui.input.move_home(),
+                KeyAction::End => tui.input.move_end(),
+                KeyAction::ScrollUp(n) => {
+                    tui.scroll_offset = tui.scroll_offset.saturating_add(n);
                 }
-            })
-        };
-
-        let tok_per_sec = tokens as f64 / secs.max(0.001);
-        let speed_badge = format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s");
-
-        // Check if model emitted a tool call
-        if engine.enable_tools && steps < MAX_STEPS {
-            if let Some(call) = crate::tools::parse_tool_call(&out_text) {
-                // Remove temporary streaming slot before processing tool call
-                tui.history.pop();
-
-                let call_sig = format!("{}:{:?}:{:?}", call.name, call.path, call.command);
-                if last_call_sig.as_ref() == Some(&call_sig) {
-                    tui.push_message("tool", &format!("Action: {} (duplicate skipped)", call.name), None);
-                    tui.render_chat();
-                    current_input = "<tool_response>\nAction already completed. Please provide your final answer to the user.\n</tool_response>".to_string();
-                    steps += 1;
-                    continue;
+                KeyAction::ScrollDown(n) => {
+                    tui.scroll_offset = tui.scroll_offset.saturating_sub(n);
                 }
-                last_call_sig = Some(call_sig);
-                steps += 1;
+                KeyAction::PageUp => {
+                    tui.scroll_offset = tui.scroll_offset.saturating_add(6);
+                }
+                KeyAction::PageDown => {
+                    tui.scroll_offset = tui.scroll_offset.saturating_sub(6);
+                }
+                KeyAction::Up => {
+                    tui.scroll_offset = tui.scroll_offset.saturating_add(2);
+                }
+                KeyAction::Down => {
+                    tui.scroll_offset = tui.scroll_offset.saturating_sub(2);
+                }
+                KeyAction::Escape => {
+                    abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                KeyAction::Enter => {
+                    // If user pressed Enter with a typed draft, abort current generation to send new prompt!
+                    if !tui.input.text.trim().is_empty() {
+                        abort_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                _ => {}
+            }
 
-                let action_summary = match (&call.path, &call.command) {
-                    (Some(p), _) => format!("Action: {} (path: {p})", call.name),
-                    (_, Some(c)) => format!("Action: {} (cmd: {c})", call.name),
-                    _ => format!("Action: {}", call.name),
-                };
-                tui.push_message("tool", &action_summary, None);
+            if last_render.elapsed().as_millis() >= 25 {
                 tui.render_chat();
-
-                let tool_result = match call.name.as_str() {
-                    "read_file" => {
-                        let p = call.path.as_deref().unwrap_or("");
-                        crate::tools::tool_read_file(p, call.start_line, call.limit)
-                    }
-                    "write_file" => {
-                        let p = call.path.as_deref().unwrap_or("");
-                        let c = call.content.as_deref().unwrap_or("");
-                        crate::tools::tool_write_file(p, c)
-                    }
-                    "edit_file" => {
-                        let p = call.path.as_deref().unwrap_or("");
-                        let t = call.target.as_deref().unwrap_or("");
-                        let r = call.replacement.as_deref().unwrap_or("");
-                        crate::tools::tool_edit_file(p, t, r)
-                    }
-                    "delete_file" => {
-                        let p = call.path.as_deref().unwrap_or("");
-                        crate::tools::tool_delete_file(p)
-                    }
-                    "list_dir" => {
-                        let p = call.path.as_deref().unwrap_or(".");
-                        crate::tools::tool_list_dir(p)
-                    }
-                    "run_command" => {
-                        let cmd = call.command.as_deref().unwrap_or("");
-                        crate::tools::tool_run_command(cmd, |_| true)
-                    }
-                    "search_web" => {
-                        let q = call.query.as_deref().unwrap_or("");
-                        crate::tools::tool_search_web(q)
-                    }
-                    "search_symbols" => {
-                        let pat = call.pattern.as_deref().unwrap_or(call.query.as_deref().unwrap_or(""));
-                        let p = call.path.as_deref();
-                        let st = call.symbol_type.as_deref();
-                        crate::tools::tool_search_symbols(pat, p, st)
-                    }
-                    other => Err(format!("Unknown tool: '{other}'")),
-                };
-
-                match tool_result {
-                    Ok(res) => {
-                        current_input = format!("<tool_response>\n{}\n</tool_response>", res);
-                        continue;
-                    }
-                    Err(err) => {
-                        current_input = format!("<tool_response>\nError: {}\n</tool_response>", err);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        // Finalize assistant message with telemetry badge
-        let display_reply = out_text.trim();
-        if let Some(last_msg) = tui.history.last_mut() {
-            if last_msg.role == "assistant" {
-                last_msg.text = display_reply.to_string();
-                last_msg.speed_badge = Some(speed_badge);
+                last_render = std::time::Instant::now();
             } else {
-                tui.push_message("assistant", display_reply, Some(&speed_badge));
+                std::thread::sleep(std::time::Duration::from_millis(8));
             }
-        } else {
-            tui.push_message("assistant", display_reply, Some(&speed_badge));
         }
+    });
 
-        tui.render_chat();
-        break;
-    }
+    engine.abort_signal = None;
+    tui.render_chat();
 }
 
 #[cfg(test)]
@@ -1243,5 +1430,57 @@ mod tests {
         for line in &wrapped {
             assert!(line.chars().count() <= 40, "Line exceeds max width 40: '{}'", line);
         }
+    }
+
+    #[test]
+    fn test_engine_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<crate::smollm_chat::SmolLm2Engine>();
+    }
+
+    #[test]
+    fn test_thread_scope() {
+        let mut val = 42;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                val += 1;
+            });
+        });
+        assert_eq!(val, 43);
+    }
+
+    #[test]
+    fn test_scope_reborrow() {
+        let mut num = 100;
+        let num_ref = &mut num;
+        std::thread::scope(|s| {
+            let r = &mut *num_ref;
+            s.spawn(move || {
+                *r += 50;
+            });
+        });
+        assert_eq!(*num_ref, 150);
+    }
+
+    #[test]
+    fn test_scroll_navigation() {
+        let mut tui = SpindleTui::new("Qwen3-30B-A3B", None, "fp8", 0.03, "layers 0..48");
+        assert_eq!(tui.scroll_offset, 0);
+
+        // Simulate ScrollUp (mouse wheel up)
+        tui.scroll_offset = tui.scroll_offset.saturating_add(3);
+        assert_eq!(tui.scroll_offset, 3);
+
+        // Simulate ScrollDown (mouse wheel down)
+        tui.scroll_offset = tui.scroll_offset.saturating_sub(3);
+        assert_eq!(tui.scroll_offset, 0);
+
+        // Simulate PageUp
+        tui.scroll_offset = tui.scroll_offset.saturating_add(6);
+        assert_eq!(tui.scroll_offset, 6);
+
+        // Simulate PageDown
+        tui.scroll_offset = tui.scroll_offset.saturating_sub(6);
+        assert_eq!(tui.scroll_offset, 0);
     }
 }

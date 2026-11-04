@@ -930,6 +930,8 @@ pub struct SmolLm2Engine {
     pub kv_branches: HashMap<String, (usize, usize, Option<usize>, Option<usize>)>,
     /// Cluster execution timing breakdown per token.
     pub cluster_timing: ClusterTiming,
+    /// Atomic abort signal to cancel generation early when user hits Escape or Ctrl+C.
+    pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -1190,6 +1192,7 @@ impl SmolLm2Engine {
             cluster_client: None,
             kv_branches: HashMap::new(),
             cluster_timing: ClusterTiming::default(),
+            abort_signal: None,
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -2500,6 +2503,11 @@ impl SmolLm2Engine {
         };
 
         while !should_stop(generated, recent.len(), answer_from, in_think) {
+            if let Some(signal) = &self.abort_signal {
+                if signal.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
             let penalty_window = &recent[answer_from.unwrap_or(0).min(recent.len())..];
             let next_id = self.sample_next_token(&last_hidden, penalty_window, generated < 2 || in_think, forbid_think);
             if self.stop_ids.contains(&next_id) {
@@ -2539,6 +2547,11 @@ impl SmolLm2Engine {
                 let max_draft = self.draft_len.min(max_new_tokens.saturating_sub(recent.len().saturating_sub(answer_from.unwrap_or(0))));
                 let mut draft_tokens = Vec::with_capacity(max_draft);
                 for _ in 0..max_draft {
+                    if let Some(signal) = &self.abort_signal {
+                        if signal.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                    }
                     draft.ensure_kv_room(1);
                     let d = draft.sample_next_token(&draft_hidden, &[], false, forbid_think);
                     if draft.stop_ids.contains(&d) {
