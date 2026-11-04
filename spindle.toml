@@ -10,4 +10,6 @@ threads = 4
 moe_prune = 0.03
 tools = true
 think = false
+draft = "qwen3-0.6b-q8_0.gguf"
+draft_len = 3
 

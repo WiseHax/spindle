@@ -1681,7 +1681,7 @@ impl SmolLm2Engine {
         let mut last_hidden = vec![0.0f32; self.cfg.dim];
         let mut client = self.cluster_client.take();
         if let Some(c) = client.as_mut() {
-            for chunk in ids.chunks(32) {
+            for chunk in ids.chunks(128) {
                 self.ensure_kv_room(chunk.len());
                 let worker_hiddens = c
                     .prefill(chunk, self.cur_pos)
@@ -1696,7 +1696,7 @@ impl SmolLm2Engine {
             self.cluster_client = client;
             return last_hidden;
         }
-        for chunk in ids.chunks(32) {
+        for chunk in ids.chunks(128) {
             self.ensure_kv_room(chunk.len());
             if chunk.len() == 1 {
                 last_hidden = self.forward_hidden(chunk[0], self.cur_pos);
@@ -2465,11 +2465,11 @@ impl SmolLm2Engine {
         if self.n_keep == 0 {
             let sys = self.encode_system();
             self.feed(&sys);
+            self.n_keep = self.cur_pos;
             if let Some(draft) = draft_engine.as_mut() {
                 draft.feed(&sys);
                 draft.n_keep = self.n_keep;
             }
-            self.n_keep = self.cur_pos;
         }
         let mut turn_ids = self.encode_user_turn(user_prompt, allow_think);
         // A single turn can never be larger than the non-system window (leave room to reply).
@@ -2483,6 +2483,7 @@ impl SmolLm2Engine {
         }
         let reply_start = self.cur_pos;
         let shifts_before = self.kv_shifts;
+        let t_gen = Instant::now();
 
         let mut recent = Vec::with_capacity(max_new_tokens);
         // Reasoning models: are we inside <think>, and where does the answer start in `recent`?
@@ -2750,8 +2751,14 @@ impl SmolLm2Engine {
             draft.feed(&closing);
         }
         self.draft_engine = draft_engine;
-        let secs = t0.elapsed().as_secs_f64();
-        (reply, secs, turn_ids.len() + generated)
+        let gen_secs = t_gen.elapsed().as_secs_f64();
+        let total_secs = t0.elapsed().as_secs_f64();
+        let (secs, toks) = if generated > 0 {
+            (gen_secs, generated)
+        } else {
+            (total_secs, turn_ids.len())
+        };
+        (reply, secs, toks)
     }
 }
 

@@ -723,6 +723,7 @@ pub struct SpindleTui {
     pub prune_val: f32,
     pub layers_info: String,
     pub git_branch: String,
+    pub draft_name: Option<String>,
     input_reader: InputReader,
 }
 
@@ -750,6 +751,7 @@ impl SpindleTui {
             prune_val,
             layers_info: layers_info.to_string(),
             git_branch: branch,
+            draft_name: None,
             input_reader: InputReader::new(),
         }
     }
@@ -910,8 +912,37 @@ impl SpindleTui {
             let low_mem = "· low-mem";
             if mx + (low_mem.len() as u16) < max_card_content_x {
                 self.canvas.print(mx, meta_y, low_mem, Rgb::MUTED, Rgb::CARD_BG, false, false);
+                mx += low_mem.len() as u16 + 1;
             }
         }
+
+        if let Some(draft) = &self.draft_name {
+            let draft_badge = format!("· spec: {draft}");
+            if mx + (draft_badge.len() as u16) < max_card_content_x {
+                self.canvas.print(mx, meta_y, &draft_badge, Rgb::ICE_CYAN, Rgb::CARD_BG, false, false);
+            }
+        }
+    }
+
+    /// Renders a pre-warming notification while system prompt and KV-cache are initialized.
+    pub fn render_warming(&mut self, text: &str) {
+        let (w, h) = terminal_size();
+        self.canvas.resize(w, h);
+        self.canvas.clear(Rgb::BG_DARK);
+
+        let center_x = w / 2;
+        let card_w = 68.min(w.saturating_sub(6));
+        let card_h = 5u16;
+        let card_x = center_x.saturating_sub(card_w / 2);
+        let card_y = (h / 2).saturating_sub(3);
+
+        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::ICE_CYAN);
+        let title = "INITIALIZING KV-CACHE & PRE-WARMING SYSTEM PROMPT";
+        self.canvas.print(card_x + 3, card_y + 1, title, Rgb::ICE_CYAN, Rgb::CARD_BG, true, false);
+        self.canvas.print(card_x + 3, card_y + 3, text, Rgb::MUTED, Rgb::CARD_BG, false, false);
+
+        self.render_docked_footer(w, h);
+        let _ = self.canvas.flush();
     }
 
     /// Renders the conversation view strictly CHRONOLOGICALLY with word wrapping and scroll support.
@@ -925,7 +956,8 @@ impl SpindleTui {
         self.canvas.fill_rect(0, 0, w, 1, ' ', Rgb::WHITE, header_bg);
         self.canvas.print(2, 0, "SPINDLE v0.1.0", Rgb::BRIGHT_BLUE, header_bg, true, false);
 
-        let status = format!("· {} · {} · 9.0 tok/s record", self.model_name, self.layers_info);
+        let draft_part = self.draft_name.as_ref().map(|d| format!(" · spec: {d}")).unwrap_or_default();
+        let status = format!("· {} · {}{} · 9.0+ tok/s target", self.model_name, self.layers_info, draft_part);
         if let Some(p) = &self.cluster_peer {
             let mesh_str = format!("mesh: {p}");
             let mx = w.saturating_sub(mesh_str.len() as u16 + 4);
@@ -1215,8 +1247,18 @@ pub fn run_tui(
         0.03,
         &layers_str,
     );
+    if let Some(draft) = &engine.draft_engine {
+        tui.draft_name = Some(draft.idx.model_name.clone());
+    }
 
     let max_tokens = if opts.max_tokens > 0 { opts.max_tokens.min(engine.max_seq) } else { 2048.min(engine.max_seq) };
+
+    if engine.n_keep == 0 {
+        tui.render_warming("Prefilling system prompt and tools across cluster mesh...");
+        unsafe {
+            engine.prefill_system();
+        }
+    }
 
     // If an initial prompt was provided, execute it immediately
     if let Some(first_p) = opts.first_prompt {
@@ -1292,7 +1334,13 @@ fn execute_tui_turn(
                 }
 
                 let tok_per_sec = tokens as f64 / secs.max(0.001);
-                let speed_badge = format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s");
+                let (acc, tot, _) = engine_ref.spec_stats;
+                let speed_badge = if tot > 0 {
+                    let pct = (acc as f64 / tot as f64) * 100.0;
+                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s · spec {acc}/{tot} ({pct:.0}%)")
+                } else {
+                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s")
+                };
 
                 // Check if model emitted an agentic tool call
                 if engine_ref.enable_tools && steps < MAX_STEPS {
