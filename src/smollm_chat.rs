@@ -1529,6 +1529,26 @@ impl SmolLm2Engine {
         self.rng = SplitMix64(cfg.seed);
     }
 
+    /// Connects this (master) engine to a cluster worker. The context window becomes the
+    /// smaller of the two nodes' KV capacity, so the worker is never asked for a position it
+    /// has no slot for; KV shifts are mirrored to it from then on (`ensure_kv_room`).
+    pub fn attach_cluster(&mut self, client: crate::cluster_net::ClusterClient) {
+        if let Some(peer) = client.peer_max_seq {
+            if peer < self.max_seq && self.cur_pos == 0 {
+                crate::ui::note(&format!("context limited to {peer} tokens by the worker's free RAM"));
+                self.max_seq = peer;
+            }
+        } else {
+            crate::ui::note("worker did not report its KV size (old binary?); update both nodes");
+        }
+        self.cluster_client = Some(client);
+    }
+
+    /// How many sliding-window KV shifts happened so far.
+    pub fn kv_shift_count(&self) -> u64 {
+        self.kv_shifts
+    }
+
     /// Forgets the whole conversation (system prompt is re-fed on the next turn).
     pub fn reset_kv(&mut self) {
         if let Some(client) = self.cluster_client.as_mut() {
@@ -1891,7 +1911,6 @@ impl SmolLm2Engine {
     /// each kept K vector is re-rotated by `-n_discard` so its position encoding stays
     /// consistent.
     pub fn ensure_kv_room(&mut self, needed: usize) {
-        let c = self.cfg;
         if self.cur_pos + needed <= self.max_seq {
             return;
         }
@@ -1899,6 +1918,25 @@ impl SmolLm2Engine {
         // Evict at least what we need, rounded up to half the window to amortize the shift.
         let want = (self.cur_pos + needed - self.max_seq).max(n_ctx / 2);
         let n_discard = want.min(n_ctx);
+        // The cluster worker holds the other layers' KV for the same positions: it must
+        // drop exactly the same tokens, or every later position desyncs.
+        if let Some(client) = self.cluster_client.as_mut() {
+            client
+                .kv_shift(self.n_keep, n_discard, self.cur_pos)
+                .expect("cluster worker KV shift failed");
+        }
+        self.shift_kv(n_discard);
+    }
+
+    /// Drops `n_discard` tokens right after the `n_keep` pinned (system) positions, moving the
+    /// rest down and re-rotating their keys so RoPE positions stay consistent.
+    pub fn shift_kv(&mut self, n_discard: usize) {
+        let c = self.cfg;
+        let n_ctx = self.cur_pos.saturating_sub(self.n_keep);
+        let n_discard = n_discard.min(n_ctx);
+        if n_discard == 0 {
+            return;
+        }
         let n_move = n_ctx - n_discard;
 
         let mut k_tmp = vec![0.0f32; c.kv_dim];
@@ -1988,11 +2026,13 @@ impl SmolLm2Engine {
     /// Processes up to 32 tokens per layer-synchronous batch so a multi-token prompt scans
     /// the model's layers once per chunk instead of once per token.
     unsafe fn feed(&mut self, ids: &[usize]) -> Vec<f32> {
+        self.remember_tokens(ids);
         let mut last_hidden = vec![0.0f32; self.cfg.dim];
-        let mut client = self.cluster_client.take();
-        if let Some(c) = client.as_mut() {
+        if self.cluster_client.is_some() {
             for chunk in ids.chunks(128) {
+                // With the client attached, so a shift is mirrored to the worker.
                 self.ensure_kv_room(chunk.len());
+                let c = self.cluster_client.as_mut().unwrap();
                 let worker_hiddens = c
                     .prefill(chunk, self.cur_pos)
                     .expect("cluster prefill failed");
@@ -2003,7 +2043,6 @@ impl SmolLm2Engine {
                     last_hidden = h;
                 }
             }
-            self.cluster_client = client;
             return last_hidden;
         }
         for chunk in ids.chunks(128) {

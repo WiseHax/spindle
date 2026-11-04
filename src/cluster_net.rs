@@ -31,6 +31,13 @@ pub const FRAME_RESET: u8 = 0x07;
 pub const FRAME_PING: u8 = 0x08;
 pub const FRAME_PONG: u8 = 0x09;
 pub const FRAME_SET_PRUNE: u8 = 0x0A;
+/// Master -> worker: apply the master's sliding-window KV shift (`n_keep`, `n_discard`,
+/// master `cur_pos`, all u32 LE) so both halves of the model keep identical positions.
+/// The worker replies with an empty `FRAME_KV_SHIFT`.
+pub const FRAME_KV_SHIFT: u8 = 0x0B;
+/// Master -> worker (empty): asks for the worker's KV capacity. Reply: `FRAME_KV_INFO` with
+/// `max_seq: u32 LE`. Additive: workers that predate it simply don't answer (master times out).
+pub const FRAME_KV_INFO: u8 = 0x0C;
 pub const FRAME_SHUTDOWN: u8 = 0xFF;
 
 #[repr(u8)]
@@ -458,6 +465,8 @@ pub struct ClusterClient {
     pub worker_range: (usize, usize),
     pub dim: usize,
     pub scratch_payload: Vec<u8>,
+    /// Worker KV-cache capacity in positions (`None` = worker too old to report it).
+    pub peer_max_seq: Option<usize>,
 }
 
 impl ClusterClient {
@@ -509,13 +518,44 @@ impl ClusterClient {
             ));
         }
 
-        Ok(Self {
+        let mut client = Self {
             stream,
             wire_format,
             worker_range: (worker_hs.layer_start, worker_hs.layer_end),
             dim,
             scratch_payload: Vec::with_capacity(32 * 1024),
-        })
+            peer_max_seq: None,
+        };
+        client.peer_max_seq = client.query_kv_info();
+        Ok(client)
+    }
+
+    /// Asks the worker how many KV positions it holds. An old worker ignores the frame, so
+    /// this waits at most 3 s and then gives up (and the connection stays usable).
+    fn query_kv_info(&mut self) -> Option<usize> {
+        let tcp = &self.stream.stream;
+        tcp.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+        let res = self
+            .stream
+            .send_frame(FRAME_KV_INFO, WireFormat::Fp32, &[])
+            .and_then(|_| self.stream.recv_frame());
+        let _ = self.stream.stream.set_read_timeout(None);
+        match res {
+            Ok((hdr, p)) if hdr.frame_type == FRAME_KV_INFO && p.len() >= 4 => {
+                Some(u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize)
+            }
+            _ => None,
+        }
+    }
+
+    /// Mirrors the master's KV shift on the worker (see `FRAME_KV_SHIFT`).
+    pub fn kv_shift(&mut self, n_keep: usize, n_discard: usize, cur_pos: usize) -> std::io::Result<()> {
+        let mut p = [0u8; 12];
+        p[0..4].copy_from_slice(&(n_keep as u32).to_le_bytes());
+        p[4..8].copy_from_slice(&(n_discard as u32).to_le_bytes());
+        p[8..12].copy_from_slice(&(cur_pos as u32).to_le_bytes());
+        self.stream.send_frame(FRAME_KV_SHIFT, WireFormat::Fp32, &p)?;
+        self.recv_frame_type(FRAME_KV_SHIFT).map(|_| ())
     }
 
     pub fn ping(&mut self) -> std::io::Result<Duration> {
@@ -641,6 +681,18 @@ impl ClusterClient {
     }
 }
 
+fn check_kv_bounds(engine: &SmolLm2Engine, start: usize, n: usize) -> std::io::Result<()> {
+    if start + n > engine.max_seq || n == 0 {
+        eprintln!(
+            "[cluster:node] request for KV positions {start}..{} exceeds this worker's {} slots; master and worker are out of sync (update both binaries)",
+            start + n,
+            engine.max_seq
+        );
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "KV position out of range"));
+    }
+    Ok(())
+}
+
 /// Runs the worker node event loop on an accepted connection.
 pub fn serve_worker_connection(
     engine: &mut SmolLm2Engine,
@@ -724,19 +776,37 @@ pub fn serve_worker_connection(
                 }
                 cs.send_frame(FRAME_SET_PRUNE, WireFormat::Fp32, &[])?;
             }
+            FRAME_KV_INFO => {
+                cs.send_frame(FRAME_KV_INFO, WireFormat::Fp32, &(engine.max_seq as u32).to_le_bytes())?;
+            }
+            FRAME_KV_SHIFT => {
+                if payload.len() >= 12 {
+                    let rd = |i: usize| u32::from_le_bytes(payload[i..i + 4].try_into().unwrap()) as usize;
+                    let (n_keep, n_discard, cur_pos) = (rd(0), rd(4), rd(8));
+                    engine.n_keep = n_keep;
+                    engine.cur_pos = cur_pos.min(engine.max_seq);
+                    engine.shift_kv(n_discard);
+                }
+                cs.send_frame(FRAME_KV_SHIFT, WireFormat::Fp32, &[])?;
+            }
             FRAME_PREFILL_REQ => {
                 if payload.len() < 8 {
                     continue;
                 }
                 let n_tokens = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
                 let start_pos = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+                if payload.len() < 8 + n_tokens * 4 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated prefill request"));
+                }
                 let mut tokens = Vec::with_capacity(n_tokens);
                 for i in 0..n_tokens {
                     let tid = u32::from_le_bytes(payload[8 + i * 4..12 + i * 4].try_into().unwrap()) as usize;
                     tokens.push(tid);
                 }
 
-                engine.ensure_kv_room(tokens.len());
+                // The master owns the sliding window (it sends FRAME_KV_SHIFT); a worker that
+                // shifted on its own would desync positions. Refuse instead of writing OOB.
+                check_kv_bounds(engine, start_pos, tokens.len())?;
                 let hiddens = unsafe { engine.forward_batch_slice(Some(&tokens), None, start_pos) };
                 engine.cur_pos = start_pos + tokens.len();
 
@@ -757,7 +827,7 @@ pub fn serve_worker_connection(
                     None => continue,
                 };
 
-                engine.ensure_kv_room(1);
+                check_kv_bounds(engine, req.pos, 1)?;
                 let act = unsafe { engine.forward_slice(Some(req.token_id), None, req.pos) };
                 engine.cur_pos = req.pos + 1;
 
@@ -933,6 +1003,111 @@ mod tests {
         assert!(!generated_text.is_empty());
     }
 
+    /// Runs one greedy reply on a loopback 2-node cluster (worker 0..mid, master mid..n, FP8
+    /// wire like production). Returns `(reply, tok/s, spec_stats, round_trips)`.
+    fn cluster_reply(path: &'static str, speculate: bool, prompt: &str, n: usize) -> Option<(String, f64, (usize, usize, usize), u64)> {
+        let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let n_layers = SmolLm2Engine::load_sharded(path, 0..1).ok()?.cfg.n_layers;
+        let mid = n_layers / 2;
+        let handle = std::thread::spawn(move || {
+            let mut w = SmolLm2Engine::load_sharded(path, 0..mid).expect("load worker");
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = serve_worker_connection(&mut w, stream, WireFormat::Fp8);
+        });
+        let mut m = SmolLm2Engine::load_sharded(path, mid..n_layers).expect("load master");
+        let client = match ClusterClient::connect(addr, &m.idx.model_name, m.cfg.dim, n_layers, (mid, n_layers), WireFormat::Fp8) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[test:cluster] Skipping live socket test: {e}");
+                return None;
+            }
+        };
+        m.attach_cluster(client);
+        m.speculate = speculate;
+        m.set_sampler(crate::smollm_chat::SamplerConfig { temperature: 0.0, repeat_penalty: 1.0, seed: 1, ..Default::default() });
+        let (reply, secs, toks) = unsafe { m.generate_reply(prompt, n, false, &mut |_| {}) };
+        let stats = (m.spec_stats, m.cluster_timing.steps);
+        if let Some(mut c) = m.cluster_client.take() {
+            let _ = c.stream.send_frame(FRAME_SHUTDOWN, WireFormat::Fp32, &[]);
+        }
+        let _ = handle.join();
+        Some((reply, toks as f64 / secs, stats.0, stats.1))
+    }
+
+    /// Prompt-lookup speculation over the real TCP worker path: same reply as plain decoding,
+    /// with fewer network round trips (each verify batch is one PREFILL frame).
+    #[test]
+    fn test_cluster_loopback_prompt_lookup_is_exact() {
+        let path = "qwen3-0.6b-q8_0.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let prompt = "Copy this Rust function exactly, inside a rust code block:\n\n\
+            fn fibonacci(n: u64) -> u64 {\n    let mut a = 0u64;\n    let mut b = 1u64;\n    for _ in 0..n {\n        let t = a + b;\n        a = b;\n        b = t;\n    }\n    a\n}\n";
+        let Some((off, tps_off, _, rt_off)) = cluster_reply(path, false, prompt, 96) else { return };
+        let Some((on, tps_on, st, rt_on)) = cluster_reply(path, true, prompt, 96) else { return };
+        println!(
+            "[cluster:lookup] off {tps_off:.1} tok/s, {rt_off} round trips | on {tps_on:.1} tok/s, {rt_on} round trips | accepted {}/{} in {} verifies",
+            st.0, st.1, st.2
+        );
+        assert_eq!(off, on, "speculative cluster reply diverged");
+        assert!(st.0 > 0 && rt_on < rt_off, "expected accepted drafts and fewer round trips");
+    }
+
+    /// A long conversation forces sliding-window KV shifts. The worker must mirror the
+    /// master's shift exactly: a 2-node run (FP32 wire, so activations are bit-exact) must
+    /// produce the same replies as one node with the same context size. The worker has the
+    /// smaller KV cache here, so this also checks the context clamp in `attach_cluster`.
+    #[test]
+    fn test_cluster_kv_shift_stays_in_sync() {
+        let path = "qwen3-0.6b-q8_0.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        const CTX: usize = 128;
+        let turns = ["Count from one to twenty in words.", "Now list five colors.", "Name three planets and one fact each."];
+        let greedy = crate::smollm_chat::SamplerConfig { temperature: 0.0, repeat_penalty: 1.0, seed: 1, ..Default::default() };
+
+        let mut single = SmolLm2Engine::load(path).expect("load");
+        single.max_seq = CTX;
+        single.set_sampler(greedy);
+        let want: Vec<String> = turns.iter().map(|t| unsafe { single.generate_reply(t, 48, false, &mut |_| {}).0 }).collect();
+        drop(single);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let n_layers = 28;
+        let mid = n_layers / 2;
+        let handle = std::thread::spawn(move || {
+            let mut w = SmolLm2Engine::load_sharded(path, 0..mid).expect("load worker");
+            w.max_seq = CTX;
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = serve_worker_connection(&mut w, stream, WireFormat::Fp32);
+        });
+        let mut m = SmolLm2Engine::load_sharded(path, mid..n_layers).expect("load master");
+        let client = match ClusterClient::connect(addr, &m.idx.model_name, m.cfg.dim, n_layers, (mid, n_layers), WireFormat::Fp32) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("[test:cluster] Skipping live socket test: {e}");
+                return;
+            }
+        };
+        assert_eq!(client.peer_max_seq, Some(CTX));
+        m.attach_cluster(client);
+        assert_eq!(m.max_seq, CTX, "master context must shrink to the worker's capacity");
+        m.set_sampler(greedy);
+        let got: Vec<String> = turns.iter().map(|t| unsafe { m.generate_reply(t, 48, false, &mut |_| {}).0 }).collect();
+        let shifts = m.kv_shift_count();
+        if let Some(mut c) = m.cluster_client.take() {
+            let _ = c.stream.send_frame(FRAME_SHUTDOWN, WireFormat::Fp32, &[]);
+        }
+        let _ = handle.join();
+        println!("[cluster:kv-shift] {shifts} shifts | replies: {got:?}");
+        assert!(shifts > 0, "test must actually exercise a KV shift");
+        assert_eq!(got, want, "cluster replies diverged from single-node after KV shifts");
+    }
+
     #[test]
     fn test_cluster_loopback_speculative_decoding() {
         let path = "smollm2-135m-q4_k_m.gguf";
@@ -968,7 +1143,7 @@ mod tests {
             Err(e) => panic!("client connect error: {e}"),
         };
 
-        master_engine.cluster_client = Some(client);
+        master_engine.attach_cluster(client);
         let draft_engine = SmolLm2Engine::load(path).expect("load draft");
         master_engine.enable_draft(draft_engine);
 

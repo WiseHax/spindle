@@ -1235,7 +1235,7 @@ fn main() -> Result<()> {
                         std::process::exit(1);
                     }
                 };
-                engine.cluster_client = Some(client);
+                engine.attach_cluster(client);
             }
 
             if cli.pack_experts {
