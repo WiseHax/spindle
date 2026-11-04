@@ -28,7 +28,7 @@ Tool output is cut down to what fits in the remaining context. Long outputs keep
 beginning and end. If the model repeats the exact same call it has already made twice, it
 gets an error instead, which breaks most loops.
 
-The interface shows each call as a row (`→ Read src/main.rs`, `✱ Grep "fn main"`). Edits show
+The interface shows each call as a row (`▸ Read src/main.rs`, `⌕ Grep "fn main"`). Edits show
 a diff and commands show their output. The raw `<tool_call>` text is never printed, even
 when a small model spells the tags out token by token.
 

@@ -70,17 +70,17 @@ impl TurnStats {
 pub fn call_title(call: &ToolCall) -> (&'static str, String) {
     let path = call.str_arg(&["path", "file_path"]).unwrap_or("");
     match call.name.as_str() {
-        "read_file" | "read" => ("→", format!("Read {path}")),
-        "write_file" | "write" => ("←", format!("Write {path}")),
-        "edit_file" | "edit" => ("←", format!("Edit {path}")),
-        "delete_file" => ("←", format!("Delete {path}")),
-        "list_dir" | "ls" => ("→", format!("List {}", if path.is_empty() { "." } else { path })),
-        "glob" => ("✱", format!("Glob \"{}\"", call.str_arg(&["pattern"]).unwrap_or(""))),
-        "grep" | "search_symbols" => ("✱", format!("Grep \"{}\"", call.str_arg(&["pattern", "query"]).unwrap_or(""))),
-        "run_command" | "bash" | "shell" => ("$", call.str_arg(&["command", "cmd"]).unwrap_or("").to_string()),
-        "web_search" | "search_web" => ("◈", format!("Search \"{}\"", call.str_arg(&["query"]).unwrap_or(""))),
-        "fetch_url" => ("%", format!("Fetch {}", call.str_arg(&["url"]).unwrap_or(""))),
-        other => ("⚙", other.to_string()),
+        "read_file" | "read" => ("▸", format!("Read {path}")),
+        "write_file" | "write" => ("✎", format!("Write {path}")),
+        "edit_file" | "edit" => ("✎", format!("Edit {path}")),
+        "delete_file" => ("✎", format!("Delete {path}")),
+        "list_dir" | "ls" => ("▸", format!("List {}", if path.is_empty() { "." } else { path })),
+        "glob" => ("⌕", format!("Glob \"{}\"", call.str_arg(&["pattern"]).unwrap_or(""))),
+        "grep" | "search_symbols" => ("⌕", format!("Grep \"{}\"", call.str_arg(&["pattern", "query"]).unwrap_or(""))),
+        "run_command" | "bash" | "shell" => ("❯", call.str_arg(&["command", "cmd"]).unwrap_or("").to_string()),
+        "web_search" | "search_web" => ("◎", format!("Search \"{}\"", call.str_arg(&["query"]).unwrap_or(""))),
+        "fetch_url" => ("⇣", format!("Fetch {}", call.str_arg(&["url"]).unwrap_or(""))),
+        other => ("▪", other.to_string()),
     }
 }
 

@@ -1,8 +1,8 @@
-//! Full-screen terminal UI, laid out like opencode's TUI (github.com/anomalyco/opencode,
-//! `packages/tui`): its dark theme palette, `┃`-bordered user messages and prompt, inline
-//! tool rows (`→ Read`, `✱ Grep`, ...), block tools for shell/edit output with diffs, an
-//! assistant footer (`▣ Agent · model · 3.2s · 12 tok/s`), a status row under the prompt and
-//! a session sidebar on wide terminals.
+//! Full-screen terminal UI: the pixel logo and prompt box on the home screen, a loading
+//! screen while the system prompt is processed, then the conversation. User messages are
+//! marked `›`. Tool calls appear as one-line rows (`▸ Read`, `⌕ Grep`, ...) or as blocks
+//! for shell output and edit diffs. Each reply ends with a `◆` footer (mode, model, time,
+//! speed). A status row sits under the prompt, and a session sidebar shows on wide terminals.
 //!
 //! Rendering is a cell canvas flushed in one write per frame (no flicker). Generation runs
 //! on a worker thread so the UI keeps scrolling/typing at ~60 FPS; tool permission prompts
@@ -33,27 +33,35 @@ use crate::{
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
-/// opencode's default dark theme (`theme/assets/opencode.json`).
+/// Spindle's colors: a deep navy background with blue accents, matching the logo.
 pub mod theme {
     use super::Rgb;
-    pub const BG: Rgb = Rgb(0x0a, 0x0a, 0x0a);
-    pub const PANEL: Rgb = Rgb(0x14, 0x14, 0x14);
-    pub const ELEMENT: Rgb = Rgb(0x1e, 0x1e, 0x1e);
-    pub const BORDER: Rgb = Rgb(0x48, 0x48, 0x48);
-    pub const BORDER_SUBTLE: Rgb = Rgb(0x3c, 0x3c, 0x3c);
-    pub const PRIMARY: Rgb = Rgb(0xfa, 0xb2, 0x83);
-    pub const SECONDARY: Rgb = Rgb(0x5c, 0x9c, 0xf5);
-    pub const ACCENT: Rgb = Rgb(0x9d, 0x7c, 0xd8);
-    pub const TEXT: Rgb = Rgb(0xee, 0xee, 0xee);
-    pub const MUTED: Rgb = Rgb(0x80, 0x80, 0x80);
-    pub const ERROR: Rgb = Rgb(0xe0, 0x6c, 0x75);
-    pub const WARNING: Rgb = Rgb(0xf5, 0xa7, 0x42);
-    pub const SUCCESS: Rgb = Rgb(0x7f, 0xd8, 0x8f);
-    pub const INFO: Rgb = Rgb(0x56, 0xb6, 0xc2);
-    pub const DIFF_ADD: Rgb = Rgb(0x4f, 0xd6, 0xbe);
-    pub const DIFF_DEL: Rgb = Rgb(0xc5, 0x3b, 0x53);
-    pub const DIFF_ADD_BG: Rgb = Rgb(0x20, 0x30, 0x3b);
-    pub const DIFF_DEL_BG: Rgb = Rgb(0x37, 0x22, 0x2c);
+    pub const BG: Rgb = Rgb(0x0b, 0x0f, 0x17);
+    pub const PANEL: Rgb = Rgb(0x11, 0x18, 0x26);
+    pub const ELEMENT: Rgb = Rgb(0x18, 0x22, 0x35);
+    pub const BORDER: Rgb = Rgb(0x2a, 0x3a, 0x57);
+    pub const BORDER_SUBTLE: Rgb = Rgb(0x1e, 0x2a, 0x40);
+    pub const PRIMARY: Rgb = Rgb(0x4c, 0x8d, 0xff);
+    pub const SECONDARY: Rgb = Rgb(0x5e, 0xc8, 0xff);
+    pub const ACCENT: Rgb = Rgb(0x9c, 0xc4, 0xff);
+    pub const TEXT: Rgb = Rgb(0xe3, 0xea, 0xf5);
+    pub const MUTED: Rgb = Rgb(0x7a, 0x87, 0x9e);
+    pub const ERROR: Rgb = Rgb(0xef, 0x6b, 0x73);
+    pub const WARNING: Rgb = Rgb(0xf2, 0xb7, 0x4e);
+    pub const SUCCESS: Rgb = Rgb(0x5f, 0xd3, 0x9a);
+    pub const INFO: Rgb = Rgb(0x5e, 0xc8, 0xff);
+    pub const DIFF_ADD: Rgb = Rgb(0x6e, 0xe7, 0xb7);
+    pub const DIFF_DEL: Rgb = Rgb(0xf0, 0x8a, 0x8a);
+    pub const DIFF_ADD_BG: Rgb = Rgb(0x10, 0x2c, 0x28);
+    pub const DIFF_DEL_BG: Rgb = Rgb(0x33, 0x17, 0x20);
+    /// Top-to-bottom colors of the logo's five pixel rows.
+    pub const LOGO_ROWS: [Rgb; 5] = [
+        Rgb(0xee, 0xf4, 0xff),
+        Rgb(0xb6, 0xd3, 0xff),
+        Rgb(0x7f, 0xae, 0xff),
+        Rgb(0x4c, 0x8d, 0xff),
+        Rgb(0x2a, 0x63, 0xe6),
+    ];
 }
 use theme::*;
 
@@ -599,16 +607,18 @@ fn fmt_tokens(n: usize) -> String {
     }
 }
 
-/// Letters of the "spindle" wordmark, three rows each.
-const LOGO: [[&str; 3]; 7] = [
-    ["█▀▀▀", "▀▀▀█", "▀▀▀▀"],
-    ["█▀▀█", "█▀▀▀", "▀   "],
-    ["▀█▀", " █ ", "▀▀▀"],
-    ["█▀▀▄", "█  █", "▀  ▀"],
-    ["█▀▀▄", "█  █", "▀▀▀ "],
-    ["█   ", "█   ", "▀▀▀▀"],
-    ["█▀▀▀", "█▀▀ ", "▀▀▀▀"],
+/// The "SPINDLE" pixel logo: five rows per letter, colored top to bottom with
+/// `theme::LOGO_ROWS`.
+const LOGO: [[&str; 5]; 7] = [
+    ["████", "█   ", "████", "   █", "████"],
+    ["████", "█  █", "████", "█   ", "█   "],
+    ["███", " █ ", " █ ", " █ ", "███"],
+    ["█  █", "██ █", "█ ██", "█  █", "█  █"],
+    ["███ ", "█  █", "█  █", "█  █", "███ "],
+    ["█   ", "█   ", "█   ", "█   ", "████"],
+    ["████", "█   ", "███ ", "█   ", "████"],
 ];
+const LOGO_H: u16 = 5;
 
 /// What the loading screen shows.
 struct LoadingView {
@@ -726,7 +736,7 @@ enum Entry {
     /// Raw reply text (with think / tool-call markup; filtered at render time).
     Assistant { raw: String, streaming: bool },
     Tool { icon: &'static str, title: String, state: ToolState, error: Option<String>, preview: Option<String>, block: bool },
-    /// `▣ Agent · model · 3.2s · 11.4 tok/s · ...`
+    /// `◆ Agent · model · 3.2s · 11.4 tok/s · ...`
     Footer { agent: String, detail: String },
     Notice { text: String, error: bool },
 }
@@ -750,7 +760,7 @@ struct Line {
     spans: Vec<Span>,
     /// Background for the whole row (panels: user messages, tool blocks, code).
     bg: Option<Rgb>,
-    /// `┃` drawn in the first column in this color.
+    /// `│` drawn in the first column in this color.
     bar: Option<Rgb>,
 }
 
@@ -805,7 +815,7 @@ fn markdown_lines(text: &str, width: usize, out: &mut Vec<Line>) {
     }
 }
 
-/// `inline code` in green, **bold** in bold (opencode's markdown colors).
+/// `inline code` in cyan, **bold** in bold.
 fn inline_markdown(s: &str) -> Vec<Span> {
     let mut out = Vec::new();
     let mut code = false;
@@ -814,7 +824,7 @@ fn inline_markdown(s: &str) -> Vec<Span> {
     let mut chars = s.chars().peekable();
     let flush = |cur: &mut String, out: &mut Vec<Span>, code: bool, bold: bool| {
         if !cur.is_empty() {
-            out.push(Span { text: std::mem::take(cur), fg: if code { SUCCESS } else { TEXT }, bold, italic: false });
+            out.push(Span { text: std::mem::take(cur), fg: if code { SECONDARY } else { TEXT }, bold, italic: false });
         }
     };
     while let Some(c) = chars.next() {
@@ -839,12 +849,10 @@ impl Entry {
         match self {
             Entry::User(text) => {
                 out.push(Line::blank());
-                let pad = Line { spans: vec![], bg: Some(PANEL), bar: Some(PRIMARY) };
-                out.push(pad.clone());
-                for l in wrap_text(text, w.saturating_sub(4)) {
-                    out.push(Line { spans: vec![span(format!("  {l}"), TEXT)], bg: Some(PANEL), bar: Some(PRIMARY) });
+                for (i, l) in wrap_text(text, w.saturating_sub(4)).into_iter().enumerate() {
+                    let lead = Span { text: if i == 0 { " › ".into() } else { "   ".into() }, fg: PRIMARY, bold: true, italic: false };
+                    out.push(Line::of(vec![lead, Span { text: l, fg: TEXT, bold: true, italic: false }]));
                 }
-                out.push(pad);
             }
             Entry::Assistant { raw, streaming } => {
                 let (thinking, visible, pending_tool) = split_reply(raw);
@@ -890,9 +898,9 @@ impl Entry {
                 let glyph = if *state == ToolState::Running { spinner_frame(t0).to_string() } else { icon.to_string() };
                 if *block {
                     out.push(Line::blank());
-                    let row = |spans: Vec<Span>| Line { spans, bg: Some(PANEL), bar: Some(BG) };
+                    let row = |spans: Vec<Span>| Line { spans, bg: Some(PANEL), bar: Some(BORDER) };
                     out.push(row(vec![]));
-                    let head = if *icon == "$" {
+                    let head = if *icon == "❯" {
                         vec![span(format!("  {glyph} "), if *state == ToolState::Running { MUTED } else { TEXT }), span(title.clone(), TEXT)]
                     } else {
                         vec![span(format!("  {glyph} "), color), span(title.clone(), color)]
@@ -905,12 +913,12 @@ impl Entry {
                         out.push(row(vec![]));
                         for pl in p.lines().take(24) {
                             let (fg, bg) = match pl.chars().next() {
-                                Some('+') if *icon != "$" => (DIFF_ADD, Some(DIFF_ADD_BG)),
-                                Some('-') if *icon != "$" => (DIFF_DEL, Some(DIFF_DEL_BG)),
+                                Some('+') if *icon != "❯" => (DIFF_ADD, Some(DIFF_ADD_BG)),
+                                Some('-') if *icon != "❯" => (DIFF_DEL, Some(DIFF_DEL_BG)),
                                 _ => (MUTED, None),
                             };
                             for part in hard_wrap(pl, w.saturating_sub(6)) {
-                                out.push(Line { spans: vec![span("  ", TEXT), span(part, fg)], bg: bg.or(Some(PANEL)), bar: Some(BG) });
+                                out.push(Line { spans: vec![span("  ", TEXT), span(part, fg)], bg: bg.or(Some(PANEL)), bar: Some(BORDER) });
                             }
                         }
                     }
@@ -931,7 +939,7 @@ impl Entry {
             }
             Entry::Footer { agent, detail } => {
                 out.push(Line::blank());
-                out.push(Line::of(vec![span("   ▣ ", PRIMARY), span(agent.clone(), PRIMARY), span(format!(" · {detail}"), MUTED)]));
+                out.push(Line::of(vec![span("   ◆ ", PRIMARY), span(agent.clone(), ACCENT), span(format!(" · {detail}"), MUTED)]));
             }
             Entry::Notice { text, error } => {
                 out.push(Line::blank());
@@ -1082,7 +1090,7 @@ impl SpindleTui {
         let bg = line.bg.unwrap_or(BG);
         let mut x = x0;
         if let Some(bar) = line.bar {
-            self.canvas.put(x0, y, '┃', bar, BG, false);
+            self.canvas.put(x0, y, '│', bar, BG, false);
             x += 1;
         }
         for s in &line.spans {
@@ -1098,60 +1106,51 @@ impl SpindleTui {
         }
     }
 
-    /// Prompt box (opencode `component/prompt`): `┃` bar, panel background, input rows,
-    /// a metadata row, then a `▀` bottom edge. Returns its height. `y` is its top row.
+    /// Prompt box: a rounded border whose top edge names the mode, model and where it runs;
+    /// a `›` marker before the input. Turns amber while a permission request is open.
+    /// Returns its height (input rows + 4). `y` is its top row.
     fn draw_prompt(&mut self, x0: u16, y: u16, w: u16, rows: &[String], cursor: (usize, usize)) -> u16 {
-        let bar = if self.confirm.is_some() { WARNING } else { PRIMARY };
         let h = rows.len() as u16 + 4;
-        self.canvas.fill(x0 + 1, y, w.saturating_sub(1), h - 1, PANEL);
-        for r in 0..h - 1 {
-            self.canvas.put(x0, y + r, '┃', bar, BG, false);
-        }
-        let tx = x0 + 3;
+        let tx = x0 + 4;
         let max_x = x0 + w.saturating_sub(2);
         if let Some((what, _)) = self.confirm.clone() {
-            self.canvas.text(tx, y + 1, max_x, "△ Permission required", WARNING, PANEL, true);
+            self.draw_box(x0, y, w, h, WARNING, PANEL, &[("Permission required".into(), WARNING, true)]);
             let line: String = what.chars().take((max_x - tx) as usize).collect();
-            self.canvas.text(tx, y + 2, max_x, &line, TEXT, PANEL, false);
-            let mut x = self.canvas.text(tx, y + h - 2, max_x, "enter", TEXT, PANEL, true);
-            x = self.canvas.text(x, y + h - 2, max_x, " allow   ", MUTED, PANEL, false);
-            x = self.canvas.text(x, y + h - 2, max_x, "esc", TEXT, PANEL, true);
-            self.canvas.text(x, y + h - 2, max_x, " deny", MUTED, PANEL, false);
-        } else if self.input.text.is_empty() {
-            self.canvas.put(tx, y + 1, ' ', PANEL, TEXT, false);
+            self.canvas.text(x0 + 2, y + 1, max_x, "! ", WARNING, PANEL, true);
+            self.canvas.text(tx, y + 1, max_x, &line, TEXT, PANEL, false);
+            let ky = y + h - 2;
+            let mut x = self.canvas.text(tx, ky, max_x, "enter", TEXT, PANEL, true);
+            x = self.canvas.text(x, ky, max_x, " allow   ", MUTED, PANEL, false);
+            x = self.canvas.text(x, ky, max_x, "esc", TEXT, PANEL, true);
+            self.canvas.text(x, ky, max_x, " deny", MUTED, PANEL, false);
+            return h;
+        }
+        let mode = if self.info.tools { "Agent" } else { "Chat" };
+        let mut label = vec![(mode.to_string(), PRIMARY, true), (self.info.model.clone(), TEXT, false)];
+        label.push(match &self.info.cluster {
+            Some(peer) => (format!("cluster {peer}"), MUTED, false),
+            None => ("local".into(), MUTED, false),
+        });
+        if self.info.think {
+            label.push(("think".into(), ACCENT, false));
+        }
+        let border = if self.generating { BORDER_SUBTLE } else { BORDER };
+        self.draw_box(x0, y, w, h, border, PANEL, &label);
+        let iy = y + 2;
+        self.canvas.text(x0 + 2, iy, max_x, "›", PRIMARY, PANEL, true);
+        if self.input.text.is_empty() {
+            self.canvas.put(tx, iy, ' ', PANEL, TEXT, false);
             let ph = if self.entries.is_empty() { "Ask anything… \"What does this project do?\"" } else { "Ask anything…" };
-            self.canvas.text(tx + 1, y + 1, max_x, ph, MUTED, PANEL, false);
+            self.canvas.text(tx + 1, iy, max_x, ph, MUTED, PANEL, false);
         } else {
             for (i, r) in rows.iter().enumerate() {
-                self.canvas.text(tx, y + 1 + i as u16, max_x, r, TEXT, PANEL, false);
+                self.canvas.text(tx, iy + i as u16, max_x, r, TEXT, PANEL, false);
             }
             let (cr, cc) = cursor;
             let cx = tx + cc as u16;
-            let cy = y + 1 + cr as u16;
+            let cy = iy + cr as u16;
             let under = self.canvas.cell(cx, cy).map_or(' ', |c| c.ch);
             self.canvas.put(cx, cy, under, PANEL, TEXT, false);
-        }
-        if self.confirm.is_none() {
-            // Metadata row: agent mode, model, where it runs.
-            let my = y + h - 2;
-            let mode = if self.info.tools { "Agent" } else { "Chat" };
-            let mut x = self.canvas.text(tx, my, max_x, mode, PRIMARY, PANEL, true);
-            x = self.canvas.text(x, my, max_x, "  ", MUTED, PANEL, false);
-            x = self.canvas.text(x, my, max_x, &self.info.model.clone(), TEXT, PANEL, false);
-            let where_ = match &self.info.cluster {
-                Some(peer) => format!("  cluster {peer}"),
-                None => "  local".to_string(),
-            };
-            x = self.canvas.text(x, my, max_x, &where_, MUTED, PANEL, false);
-            if self.info.think {
-                self.canvas.text(x, my, max_x, "  think", ACCENT, PANEL, false);
-            }
-        }
-        // Bottom edge: `╹` under the bar and a half-block strip in the panel color.
-        let ey = y + h - 1;
-        self.canvas.put(x0, ey, '╹', bar, BG, false);
-        for cx in x0 + 1..x0 + w {
-            self.canvas.put(cx, ey, '▀', PANEL, BG, false);
         }
         h
     }
@@ -1249,7 +1248,7 @@ impl SpindleTui {
             if *y + 2 >= h {
                 return;
             }
-            c.text(tx, *y, max_x, head, TEXT, PANEL, true);
+            c.text(tx, *y, max_x, head, ACCENT, PANEL, true);
             *y += 1;
             for (r, fg) in rows {
                 if *y + 2 >= h {
@@ -1313,17 +1312,47 @@ impl SpindleTui {
         let _ = self.canvas.flush();
     }
 
-    /// The three-row "spindle" wordmark centered at row `top`: "spin" muted, "dle" bright,
-    /// like opencode's two-tone wordmark.
+    /// The pixel logo centered at row `top`, `LOGO_H` rows tall.
     fn draw_logo(&mut self, w: u16, top: u16) {
         let logo_w: u16 = LOGO.iter().map(|g| g[0].chars().count() as u16 + 1).sum::<u16>() - 1;
         let lx = w.saturating_sub(logo_w) / 2;
-        for row in 0..3 {
+        for row in 0..LOGO_H {
+            let fg = theme::LOGO_ROWS[row as usize];
             let mut x = lx;
-            for (i, g) in LOGO.iter().enumerate() {
-                let fg = if i < 4 { MUTED } else { TEXT };
+            for g in LOGO.iter() {
                 x = self.canvas.text(x, top + row, w, g[row as usize], fg, BG, false) + 1;
             }
+        }
+    }
+
+    /// A rounded box filled with `bg`. `label` (if any) is set into the top border.
+    fn draw_box(&mut self, x0: u16, y0: u16, w: u16, h: u16, border: Rgb, bg: Rgb, label: &[(String, Rgb, bool)]) {
+        if w < 4 || h < 2 {
+            return;
+        }
+        self.canvas.fill(x0 + 1, y0 + 1, w - 2, h - 2, bg);
+        let (x1, y1) = (x0 + w - 1, y0 + h - 1);
+        self.canvas.put(x0, y0, '╭', border, BG, false);
+        self.canvas.put(x1, y0, '╮', border, BG, false);
+        self.canvas.put(x0, y1, '╰', border, BG, false);
+        self.canvas.put(x1, y1, '╯', border, BG, false);
+        for x in x0 + 1..x1 {
+            self.canvas.put(x, y0, '─', border, BG, false);
+            self.canvas.put(x, y1, '─', border, BG, false);
+        }
+        for y in y0 + 1..y1 {
+            self.canvas.put(x0, y, '│', border, bg, false);
+            self.canvas.put(x1, y, '│', border, bg, false);
+        }
+        if !label.is_empty() {
+            let mut x = self.canvas.text(x0 + 2, y0, x1 - 1, " ", border, BG, false);
+            for (i, (t, fg, bold)) in label.iter().enumerate() {
+                if i > 0 {
+                    x = self.canvas.text(x, y0, x1 - 1, " · ", MUTED, BG, false);
+                }
+                x = self.canvas.text(x, y0, x1 - 1, t, *fg, BG, *bold);
+            }
+            self.canvas.text(x, y0, x1 - 1, " ", border, BG, false);
         }
     }
 
@@ -1344,21 +1373,16 @@ impl SpindleTui {
         let card_w = w.saturating_sub(4).min(80);
         let inner = card_w.saturating_sub(6);
         let steps = view.done_steps.len() as u16;
-        // logo, gap, card (title, blank, steps, current, blank, bar, detail)
-        let card_h = 2 + steps + 1 + 1 + 1 + 1 + 2;
-        let top = h.saturating_sub(3 + 2 + card_h + 2) / 2;
+        // card: border, blank, steps, current, blank, bar, detail, blank, border
+        let card_h = 2 + 1 + steps + 1 + 1 + 2 + 1;
+        let top = h.saturating_sub(LOGO_H + 2 + card_h + 2) / 2;
         self.draw_logo(w, top);
         let bx = w.saturating_sub(card_w) / 2;
-        let cy = top + 5;
-        self.canvas.fill(bx, cy, card_w, card_h, PANEL);
-        for row in cy..cy + card_h {
-            self.canvas.put(bx, row, '┃', PRIMARY, PANEL, false);
-        }
+        let cy = top + LOGO_H + 2;
+        self.draw_box(bx, cy, card_w, card_h, BORDER, PANEL, &[(view.title.clone(), TEXT, true)]);
         let x0 = bx + 3;
-        let max_x = bx + card_w - 2;
-        let mut y = cy + 1;
-        self.canvas.text(x0, y, max_x, &view.title, TEXT, PANEL, true);
-        y += 2;
+        let max_x = bx + card_w - 3;
+        let mut y = cy + 2;
         for (label, result) in &view.done_steps {
             let x = self.canvas.text(x0, y, max_x, "✓ ", SUCCESS, PANEL, false);
             let x = self.canvas.text(x, y, max_x, &format!("{label:<9}"), MUTED, PANEL, false);
@@ -1374,10 +1398,10 @@ impl SpindleTui {
         let pct = format!(" {:>3.0}%", frac * 100.0);
         let bar_w = inner.saturating_sub(pct.len() as u16) as usize;
         let filled = (frac * bar_w as f64).round() as usize;
-        let bar: String = "━".repeat(filled);
-        let rest: String = "━".repeat(bar_w - filled);
+        let bar: String = "█".repeat(filled);
+        let rest: String = "░".repeat(bar_w - filled);
         let x = self.canvas.text(x0, y, max_x, &bar, PRIMARY, PANEL, false);
-        let x = self.canvas.text(x, y, max_x, &rest, BORDER_SUBTLE, PANEL, false);
+        let x = self.canvas.text(x, y, max_x, &rest, BORDER, PANEL, false);
         self.canvas.text(x, y, max_x, &pct, TEXT, PANEL, false);
         y += 1;
         let secs = view.started.elapsed().as_secs_f64();
@@ -1406,11 +1430,11 @@ impl SpindleTui {
         let box_w = w.saturating_sub(4).min(75);
         let (rows, cursor) = self.prompt_rows(box_w.saturating_sub(6) as usize);
         let prompt_h = rows.len() as u16 + 4;
-        let block_h = 3 + 2 + prompt_h;
+        let block_h = LOGO_H + 2 + prompt_h;
         let top = h.saturating_sub(block_h + 2) / 2;
         self.draw_logo(w, top);
         let bx = w.saturating_sub(box_w) / 2;
-        let py = top + 5;
+        let py = top + LOGO_H + 2;
         self.draw_popup(bx, py, box_w);
         let ph = self.draw_prompt(bx, py, box_w, &rows, cursor);
         let hint_y = py + ph + 1;
@@ -1630,17 +1654,17 @@ fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts
                         }
                     }
                     UiEvent::Agent(AgentEvent::ToolStart { icon, title }) => {
-                        let block = matches!(icon, "$");
+                        let block = matches!(icon, "❯");
                         tui.entries.push(Entry::Tool { icon, title, state: ToolState::Running, error: None, preview: None, block });
                     }
                     UiEvent::Agent(AgentEvent::ToolEnd(o)) => {
-                        let block = o.icon == "$" || (o.ok && o.preview.is_some());
+                        let block = o.icon == "❯" || (o.ok && o.preview.is_some());
                         let error = (!o.ok).then(|| o.output.lines().next().unwrap_or("").trim_start_matches("Error: ").to_string());
                         let entry = Entry::Tool {
                             icon: o.icon,
                             title: o.title.clone(),
                             state: if o.ok { ToolState::Ok } else { ToolState::Failed },
-                            error: if o.icon == "$" { None } else { error },
+                            error: if o.icon == "❯" { None } else { error },
                             preview: o.preview.clone(),
                             block,
                         };
@@ -2048,20 +2072,20 @@ mod tests {
         tui.canvas.resize(120, 30);
         tui.entries.push(Entry::User("Fix the bug in `main.rs`".into()));
         tui.entries.push(Entry::Assistant { raw: "Sure.\n```rust\nfn main() {}\n```\n- one **two** `three`".into(), streaming: false });
-        tui.entries.push(Entry::Tool { icon: "→", title: "Read src/main.rs".into(), state: ToolState::Ok, error: None, preview: None, block: false });
-        tui.entries.push(Entry::Tool { icon: "←", title: "Edit src/main.rs".into(), state: ToolState::Ok, error: None, preview: Some("-old\n+new".into()), block: true });
-        tui.entries.push(Entry::Tool { icon: "$", title: "cargo test".into(), state: ToolState::Failed, error: None, preview: Some("error[E0425]\n(exit code 101)".into()), block: true });
+        tui.entries.push(Entry::Tool { icon: "▸", title: "Read src/main.rs".into(), state: ToolState::Ok, error: None, preview: None, block: false });
+        tui.entries.push(Entry::Tool { icon: "✎", title: "Edit src/main.rs".into(), state: ToolState::Ok, error: None, preview: Some("-old\n+new".into()), block: true });
+        tui.entries.push(Entry::Tool { icon: "❯", title: "cargo test".into(), state: ToolState::Failed, error: None, preview: Some("error[E0425]\n(exit code 101)".into()), block: true });
         tui.entries.push(Entry::Footer { agent: "Agent".into(), detail: "test-model · 2.0s · 11.0 tok/s".into() });
         let lines = tui.transcript(80);
         let flat: Vec<String> = lines.iter().map(|l| l.spans.iter().map(|s| s.text.as_str()).collect()).collect();
-        assert!(lines.iter().any(|l| l.bar == Some(PRIMARY) && l.bg == Some(PANEL)), "user panel");
-        assert!(flat.iter().any(|l| l.contains("→ Read src/main.rs")));
+        assert!(flat.iter().any(|l| l.starts_with(" › Fix the bug")), "user message marker");
+        assert!(flat.iter().any(|l| l.contains("▸ Read src/main.rs")));
         assert!(lines.iter().any(|l| l.bg == Some(DIFF_ADD_BG)) && lines.iter().any(|l| l.bg == Some(DIFF_DEL_BG)));
-        assert!(flat.iter().any(|l| l.contains("$ cargo test")));
-        assert!(flat.iter().any(|l| l.contains("▣ Agent")));
-        // Code block rendered on a panel; inline code green.
+        assert!(flat.iter().any(|l| l.contains("❯ cargo test")));
+        assert!(flat.iter().any(|l| l.contains("◆ Agent")));
+        // Code block rendered on a panel; inline code cyan.
         assert!(lines.iter().any(|l| l.bg == Some(PANEL) && flat_contains(l, "fn main() {}")));
-        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text == "three" && s.fg == SUCCESS)));
+        assert!(lines.iter().any(|l| l.spans.iter().any(|s| s.text == "three" && s.fg == SECONDARY)));
         // Widths never exceed the column.
         for l in &flat {
             assert!(l.chars().count() <= 82, "{l:?}");
@@ -2082,10 +2106,10 @@ mod tests {
             tui.canvas.resize(w, h);
             tui.entries.push(Entry::User("Rename the greeting in demo.rs to \"hello spindle\" and run the tests".into()));
             tui.entries.push(Entry::Assistant { raw: "<think>Need to read the file first.</think>\n\nI'll check the file first.".into(), streaming: false });
-            tui.entries.push(Entry::Tool { icon: "→", title: "Read demo.rs".into(), state: ToolState::Ok, error: None, preview: None, block: false });
-            tui.entries.push(Entry::Tool { icon: "✱", title: "Grep \"hello\" (2 matches)".into(), state: ToolState::Ok, error: None, preview: None, block: false });
-            tui.entries.push(Entry::Tool { icon: "←", title: "Edit demo.rs".into(), state: ToolState::Ok, error: None, preview: Some("-    println!(\"hello\");\n+    println!(\"hello spindle\");".into()), block: true });
-            tui.entries.push(Entry::Tool { icon: "$", title: "cargo test".into(), state: ToolState::Ok, error: None, preview: Some("running 3 tests\ntest a ... ok\ntest result: ok. 3 passed".into()), block: true });
+            tui.entries.push(Entry::Tool { icon: "▸", title: "Read demo.rs".into(), state: ToolState::Ok, error: None, preview: None, block: false });
+            tui.entries.push(Entry::Tool { icon: "⌕", title: "Grep \"hello\" (2 matches)".into(), state: ToolState::Ok, error: None, preview: None, block: false });
+            tui.entries.push(Entry::Tool { icon: "✎", title: "Edit demo.rs".into(), state: ToolState::Ok, error: None, preview: Some("-    println!(\"hello\");\n+    println!(\"hello spindle\");".into()), block: true });
+            tui.entries.push(Entry::Tool { icon: "❯", title: "cargo test".into(), state: ToolState::Ok, error: None, preview: Some("running 3 tests\ntest a ... ok\ntest result: ok. 3 passed".into()), block: true });
             tui.entries.push(Entry::Assistant { raw: "Done. The greeting now reads **hello spindle** and all tests pass:\n- `demo.rs` line 2 updated\n- `cargo test`: 3 passed".into(), streaming: false });
             tui.entries.push(Entry::Footer { agent: "Agent".into(), detail: "Qwen3-30B-A3B · 14.2s · 11.8 tok/s · spec 41/52".into() });
             tui.input.set_text("/to");

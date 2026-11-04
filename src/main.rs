@@ -789,7 +789,7 @@ struct CliConfig {
     ctx: Option<usize>,
     /// `--tools`: enables agentic tools (file operations, web search, sandboxed execution).
     tools: bool,
-    /// `--tui`: launches the full-screen OpenCode-style TUI interface.
+    /// `--tui`: launches the full-screen interface (the default; `--no-tui` turns it off).
     tui: bool,
 }
 

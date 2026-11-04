@@ -71,7 +71,7 @@ pub fn modified_files() -> Vec<String> {
 }
 
 /// Project instructions fed into the system prompt: `SPINDLE.md`, or the `AGENTS.md`
-/// convention shared with opencode / other agents.
+/// convention shared with other coding agents.
 pub fn load_spindle_md() -> Option<String> {
     for candidate in ["SPINDLE.md", "spindle.md", ".spindle.md", "AGENTS.md"] {
         if let Ok(text) = fs::read_to_string(candidate) {
@@ -307,7 +307,7 @@ pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
 #[derive(Clone, Debug)]
 pub struct ToolOutcome {
     pub ok: bool,
-    /// opencode-style glyph: `→` read, `←` write/edit, `✱` search, `$` shell, `◈` web, `%` fetch.
+    /// Row glyph: `▸` read/list, `✎` write/edit/delete, `⌕` search, `❯` shell, `◎` web, `⇣` fetch.
     pub icon: &'static str,
     /// One-line summary, e.g. `Read src/main.rs:1-250`.
     pub title: String,
@@ -425,8 +425,8 @@ pub fn execute(call: &ToolCall, ctx: &mut ToolCtx) -> ToolOutcome {
             let pat = call.str_arg(&["pattern", "query"]).unwrap_or("");
             let title = format!("Symbols \"{pat}\"");
             match tool_search_symbols(pat, Some(if path.is_empty() { "." } else { &path }), call.str_arg(&["symbol_type"])) {
-                Ok(o) => ToolOutcome::ok("✱", title, truncate_middle(&o, ctx.max_chars)),
-                Err(e) => ToolOutcome::err("✱", title, e),
+                Ok(o) => ToolOutcome::ok("⌕", title, truncate_middle(&o, ctx.max_chars)),
+                Err(e) => ToolOutcome::err("⌕", title, e),
             }
         }
         "run_command" | "bash" | "shell" => {
@@ -438,20 +438,20 @@ pub fn execute(call: &ToolCall, ctx: &mut ToolCtx) -> ToolOutcome {
             let q = call.str_arg(&["query", "q"]).unwrap_or("");
             let title = format!("Search \"{q}\"");
             match tool_search_web(q) {
-                Ok(o) => ToolOutcome::ok("◈", title, truncate_middle(&o, ctx.max_chars)),
-                Err(e) => ToolOutcome::err("◈", title, e),
+                Ok(o) => ToolOutcome::ok("◎", title, truncate_middle(&o, ctx.max_chars)),
+                Err(e) => ToolOutcome::err("◎", title, e),
             }
         }
         "fetch_url" => {
             let url = call.str_arg(&["url"]).unwrap_or("");
             let title = format!("Fetch {url}");
             match fetch_url(url) {
-                Ok(o) => ToolOutcome::ok("%", title, truncate_middle(&o, ctx.max_chars)),
-                Err(e) => ToolOutcome::err("%", title, e),
+                Ok(o) => ToolOutcome::ok("⇣", title, truncate_middle(&o, ctx.max_chars)),
+                Err(e) => ToolOutcome::err("⇣", title, e),
             }
         }
         other => ToolOutcome::err(
-            "⚙",
+            "▪",
             other.to_string(),
             format!(
                 "unknown tool '{other}'. Available: {}",
@@ -471,21 +471,21 @@ fn read_file(path: &str, offset: Option<usize>, limit: Option<usize>, max_chars:
         }
     };
     if path.is_empty() {
-        return ToolOutcome::err("→", "Read".into(), "missing 'path'".into());
+        return ToolOutcome::err("▸", "Read".into(), "missing 'path'".into());
     }
     if let GuardDecision::Block(r) = guard::check_path(path, false) {
-        return ToolOutcome::err("→", title(first), format!("refused: {r}"));
+        return ToolOutcome::err("▸", title(first), format!("refused: {r}"));
     }
     let p = Path::new(path);
     if p.is_dir() {
-        return ToolOutcome::err("→", title(first), format!("'{path}' is a directory; use list_dir"));
+        return ToolOutcome::err("▸", title(first), format!("'{path}' is a directory; use list_dir"));
     }
     let bytes = match fs::read(p) {
         Ok(b) => b,
-        Err(e) => return ToolOutcome::err("→", title(first), format!("cannot read '{path}': {e}")),
+        Err(e) => return ToolOutcome::err("▸", title(first), format!("cannot read '{path}': {e}")),
     };
     if bytes.iter().take(8192).any(|&b| b == 0) {
-        return ToolOutcome::err("→", title(first), format!("'{path}' looks like a binary file ({} bytes)", bytes.len()));
+        return ToolOutcome::err("▸", title(first), format!("'{path}' looks like a binary file ({} bytes)", bytes.len()));
     }
     let raw = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = raw.lines().collect();
@@ -509,22 +509,22 @@ fn read_file(path: &str, offset: Option<usize>, limit: Option<usize>, max_chars:
     } else if total == 0 {
         out.push_str("(empty file)\n");
     }
-    ToolOutcome::ok("→", title(end), out)
+    ToolOutcome::ok("▸", title(end), out)
 }
 
 fn write_file(path: &str, content: &str, ctx: &mut ToolCtx) -> ToolOutcome {
     let title = format!("Write {path}");
     if path.is_empty() {
-        return ToolOutcome::err("←", "Write".into(), "missing 'path'".into());
+        return ToolOutcome::err("✎", "Write".into(), "missing 'path'".into());
     }
     if let Err(e) = check_write(path, ctx) {
-        return ToolOutcome::err("←", title, e);
+        return ToolOutcome::err("✎", title, e);
     }
     let p = Path::new(path);
     if let Some(parent) = p.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
-                return ToolOutcome::err("←", title, format!("cannot create '{}': {e}", parent.display()));
+                return ToolOutcome::err("✎", title, format!("cannot create '{}': {e}", parent.display()));
             }
         }
     }
@@ -534,34 +534,34 @@ fn write_file(path: &str, content: &str, ctx: &mut ToolCtx) -> ToolOutcome {
         Ok(()) => {
             let n = content.lines().count();
             let mut o = ToolOutcome::ok(
-                "←",
+                "✎",
                 title,
                 format!("{} '{path}' ({n} lines, {} bytes).", if existed { "Overwrote" } else { "Created" }, content.len()),
             );
             o.preview = Some(content.lines().take(12).map(|l| format!("+{l}")).collect::<Vec<_>>().join("\n"));
             o
         }
-        Err(e) => ToolOutcome::err("←", title, format!("cannot write '{path}': {e}")),
+        Err(e) => ToolOutcome::err("✎", title, format!("cannot write '{path}': {e}")),
     }
 }
 
 fn edit_file(path: &str, old: &str, new: &str, replace_all: bool, ctx: &mut ToolCtx) -> ToolOutcome {
     let title = format!("Edit {path}");
     if path.is_empty() {
-        return ToolOutcome::err("←", "Edit".into(), "missing 'path'".into());
+        return ToolOutcome::err("✎", "Edit".into(), "missing 'path'".into());
     }
     if old.is_empty() {
-        return ToolOutcome::err("←", title, "old_string is empty; use write_file to create a file".into());
+        return ToolOutcome::err("✎", title, "old_string is empty; use write_file to create a file".into());
     }
     if old == new {
-        return ToolOutcome::err("←", title, "old_string and new_string are identical".into());
+        return ToolOutcome::err("✎", title, "old_string and new_string are identical".into());
     }
     if let Err(e) = check_write(path, ctx) {
-        return ToolOutcome::err("←", title, e);
+        return ToolOutcome::err("✎", title, e);
     }
     let src = match fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) => return ToolOutcome::err("←", title, format!("cannot read '{path}': {e}")),
+        Err(e) => return ToolOutcome::err("✎", title, format!("cannot read '{path}': {e}")),
     };
     // Windows files use CRLF, but models write `\n`: match in the file's own line endings.
     let crlf = src.contains("\r\n");
@@ -580,11 +580,11 @@ fn edit_file(path: &str, old: &str, new: &str, replace_all: bool, ctx: &mut Tool
             .find(|(_, l)| !first.is_empty() && l.contains(first))
             .map(|(i, l)| format!(" A similar line is at {}: {:?} - check whitespace/indentation and read the file again.", i + 1, l.trim_end()))
             .unwrap_or_else(|| " Read the file again and copy old_string exactly.".into());
-        return ToolOutcome::err("←", title, format!("old_string not found in '{path}'.{hint}"));
+        return ToolOutcome::err("✎", title, format!("old_string not found in '{path}'.{hint}"));
     }
     if n > 1 && !replace_all {
         return ToolOutcome::err(
-            "←",
+            "✎",
             title,
             format!("old_string occurs {n} times in '{path}'; add surrounding lines to make it unique, or set replace_all=true"),
         );
@@ -592,10 +592,10 @@ fn edit_file(path: &str, old: &str, new: &str, replace_all: bool, ctx: &mut Tool
     let updated = if replace_all { src.replace(&old_f, &new_f) } else { src.replacen(&old_f, &new_f, 1) };
     push_undo_snapshot(path);
     if let Err(e) = fs::write(path, &updated) {
-        return ToolOutcome::err("←", title, format!("cannot write '{path}': {e}"));
+        return ToolOutcome::err("✎", title, format!("cannot write '{path}': {e}"));
     }
     let line = src[..src.find(&old_f).unwrap_or(0)].matches('\n').count() + 1;
-    let mut o = ToolOutcome::ok("←", title, format!("Edited '{path}' ({} replacement(s), starting at line {line}).", if replace_all { n } else { 1 }));
+    let mut o = ToolOutcome::ok("✎", title, format!("Edited '{path}' ({} replacement(s), starting at line {line}).", if replace_all { n } else { 1 }));
     let mut diff: Vec<String> = old.lines().map(|l| format!("-{l}")).collect();
     diff.extend(new.lines().map(|l| format!("+{l}")));
     o.preview = Some(diff.join("\n"));
@@ -606,18 +606,18 @@ fn delete_file(path: &str, ctx: &mut ToolCtx) -> ToolOutcome {
     let title = format!("Delete {path}");
     let p = Path::new(path);
     if path.is_empty() || !p.is_file() {
-        return ToolOutcome::err("←", title, format!("'{path}' is not an existing file"));
+        return ToolOutcome::err("✎", title, format!("'{path}' is not an existing file"));
     }
     if let Err(e) = check_write(path, ctx) {
-        return ToolOutcome::err("←", title, e);
+        return ToolOutcome::err("✎", title, e);
     }
     if !(ctx.confirm)(&format!("Delete file {path}")) {
-        return ToolOutcome::err("←", title, "the user declined deleting this file".into());
+        return ToolOutcome::err("✎", title, "the user declined deleting this file".into());
     }
     push_undo_snapshot(path);
     match fs::remove_file(p) {
-        Ok(()) => ToolOutcome::ok("←", title, format!("Deleted '{path}' (the user can /undo it).")),
-        Err(e) => ToolOutcome::err("←", title, format!("cannot delete '{path}': {e}")),
+        Ok(()) => ToolOutcome::ok("✎", title, format!("Deleted '{path}' (the user can /undo it).")),
+        Err(e) => ToolOutcome::err("✎", title, format!("cannot delete '{path}': {e}")),
     }
 }
 
@@ -625,7 +625,7 @@ fn list_dir(path: &str, max_chars: usize) -> ToolOutcome {
     let title = format!("List {path}");
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
-        Err(e) => return ToolOutcome::err("→", title, format!("cannot list '{path}': {e}")),
+        Err(e) => return ToolOutcome::err("▸", title, format!("cannot list '{path}': {e}")),
     };
     let (mut dirs, mut files) = (Vec::new(), Vec::new());
     for e in entries.flatten() {
@@ -646,7 +646,7 @@ fn list_dir(path: &str, max_chars: usize) -> ToolOutcome {
     if out.is_empty() {
         out.push_str("(empty directory)\n");
     }
-    ToolOutcome::ok("→", title, truncate_middle(&out, max_chars))
+    ToolOutcome::ok("▸", title, truncate_middle(&out, max_chars))
 }
 
 fn human_size(n: u64) -> String {
@@ -736,7 +736,7 @@ pub fn glob_match(pattern: &str, path: &str) -> bool {
 fn glob_tool(pattern: &str, path: &str, max_chars: usize) -> ToolOutcome {
     let title = format!("Glob \"{pattern}\"");
     if pattern.trim().is_empty() {
-        return ToolOutcome::err("✱", title, "missing 'pattern'".into());
+        return ToolOutcome::err("⌕", title, "missing 'pattern'".into());
     }
     let root = Path::new(if path.is_empty() { "." } else { path });
     let mut hits: Vec<(std::time::SystemTime, String)> = walk_files(root, 50_000)
@@ -751,7 +751,7 @@ fn glob_tool(pattern: &str, path: &str, max_chars: usize) -> ToolOutcome {
             }
         })
         .collect();
-    // Most recently modified first, like opencode.
+    // Most recently modified first.
     hits.sort_by(|a, b| b.0.cmp(&a.0));
     let n = hits.len();
     let mut out: String = hits.iter().take(200).map(|(_, p)| format!("{p}\n")).collect();
@@ -761,13 +761,13 @@ fn glob_tool(pattern: &str, path: &str, max_chars: usize) -> ToolOutcome {
     if n == 0 {
         out = format!("No files match '{pattern}'.\n");
     }
-    ToolOutcome::ok("✱", format!("{title} ({n} {})", if n == 1 { "file" } else { "files" }), truncate_middle(&out, max_chars))
+    ToolOutcome::ok("⌕", format!("{title} ({n} {})", if n == 1 { "file" } else { "files" }), truncate_middle(&out, max_chars))
 }
 
 fn grep_tool(pattern: &str, path: &str, include: Option<&str>, max_chars: usize) -> ToolOutcome {
     let title = format!("Grep \"{pattern}\"");
     if pattern.is_empty() {
-        return ToolOutcome::err("✱", title, "missing 'pattern'".into());
+        return ToolOutcome::err("⌕", title, "missing 'pattern'".into());
     }
     // Smart case: all-lowercase patterns match case-insensitively.
     let ci = !pattern.chars().any(char::is_uppercase);
@@ -807,7 +807,7 @@ fn grep_tool(pattern: &str, path: &str, include: Option<&str>, max_chars: usize)
     if n == 0 {
         out = format!("No matches for '{pattern}'.\n");
     }
-    ToolOutcome::ok("✱", format!("{title} ({n} {})", if n == 1 { "match" } else { "matches" }), truncate_middle(&out, max_chars))
+    ToolOutcome::ok("⌕", format!("{title} ({n} {})", if n == 1 { "match" } else { "matches" }), truncate_middle(&out, max_chars))
 }
 
 // ------------------------------------------------------------------- shell and web
@@ -815,13 +815,13 @@ fn grep_tool(pattern: &str, path: &str, include: Option<&str>, max_chars: usize)
 fn run_command(cmd: &str, timeout_s: usize, ctx: &mut ToolCtx) -> ToolOutcome {
     let title = cmd.to_string();
     if cmd.trim().is_empty() {
-        return ToolOutcome::err("$", title, "missing 'command'".into());
+        return ToolOutcome::err("❯", title, "missing 'command'".into());
     }
     match guard::check_command(cmd) {
-        GuardDecision::Block(r) => return ToolOutcome::err("$", title, format!("refused: {r}")),
+        GuardDecision::Block(r) => return ToolOutcome::err("❯", title, format!("refused: {r}")),
         GuardDecision::NeedConfirmation(r) => {
             if !(ctx.confirm)(&format!("{}: {cmd}", capitalize(&r))) {
-                return ToolOutcome::err("$", title, "the user declined running this command".into());
+                return ToolOutcome::err("❯", title, "the user declined running this command".into());
             }
         }
         GuardDecision::Allow => {}
@@ -831,7 +831,7 @@ fn run_command(cmd: &str, timeout_s: usize, ctx: &mut ToolCtx) -> ToolOutcome {
             let body = truncate_middle(out.trim_end(), ctx.max_chars.saturating_sub(64).max(512));
             let mut o = ToolOutcome {
                 ok: code == 0,
-                icon: "$",
+                icon: "❯",
                 title,
                 output: format!("Exit code: {code}\n{body}"),
                 preview: None,
@@ -847,7 +847,7 @@ fn run_command(cmd: &str, timeout_s: usize, ctx: &mut ToolCtx) -> ToolOutcome {
             o.preview = Some(prev);
             o
         }
-        Err(e) => ToolOutcome::err("$", title, format!("failed to start: {e}")),
+        Err(e) => ToolOutcome::err("❯", title, format!("failed to start: {e}")),
     }
 }
 

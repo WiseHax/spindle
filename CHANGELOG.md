@@ -50,9 +50,11 @@ First release. Spindle runs Qwen3-30B-A3B across two PCs on a home network (7–
   `replace_all` is set.
 - Deleting files, guarded commands and writes outside the project ask for confirmation in
   both interfaces.
-- The full-screen interface was rebuilt. It has a prompt box, inline tool rows, diff and
-  shell blocks, a permission dialog, a session sidebar, command completion and multi-line
-  input.
+- The full-screen interface was rebuilt with Spindle's own look: a navy and blue theme, the
+  pixel logo with a blue gradient, and a rounded prompt box that shows the mode, model and
+  worker in its border. User messages are marked `›`, and tool calls appear as rows (`▸`
+  read, `✎` edit, `⌕` search, `❯` shell) or as diff and output blocks. It also has a
+  permission dialog, a session sidebar, command completion and multi-line input.
 - Rewrote the interface text, help and messages to be plain and specific.
 
 ### Fixes
