@@ -845,24 +845,20 @@ fn load_config_file(cfg: &mut CliConfig) {
 }
 
 fn auto_discover_model() -> Option<String> {
-    if let Ok(entries) = std::fs::read_dir(".") {
-        let mut ggufs: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".gguf") && !name.contains("draft") && !name.contains("0.6b") {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !ggufs.is_empty() {
-            ggufs.sort();
-            return Some(ggufs[0].clone());
+    // The biggest GGUF in the folder is the main model; files named "draft" are speculation
+    // helpers, never the main model.
+    let mut best: Option<(u64, String)> = None;
+    for e in std::fs::read_dir(".").ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.to_ascii_lowercase().ends_with(".gguf") || name.to_ascii_lowercase().contains("draft") {
+            continue;
+        }
+        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(s, _)| size > *s) {
+            best = Some((size, name));
         }
     }
-    None
+    best.map(|(_, n)| n)
 }
 
 fn parse_cli() -> CliConfig {
