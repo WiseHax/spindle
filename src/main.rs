@@ -249,6 +249,14 @@ unsafe fn lock_thread_to_core(target: LogicalCpu, role: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn pin_current_thread_to_pcore() {
+    unsafe {
+        if let Ok(topo) = detect_hybrid_topology() {
+            let _ = lock_thread_to_core(topo.worker_pcores[0], "tui-worker");
+        }
+    }
+}
+
 // ------------------------------------------------------ shared ring state
 
 #[repr(align(64))]

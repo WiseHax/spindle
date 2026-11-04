@@ -1534,6 +1534,7 @@ fn execute_tui_turn(
         let engine_ref = &mut *engine;
 
         s.spawn(move || {
+            crate::pin_current_thread_to_pcore();
             let mut current_input = prompt.to_string();
             let mut steps = 0;
             let mut last_call_sig = None;
@@ -1545,6 +1546,7 @@ fn execute_tui_turn(
                     break;
                 }
 
+                let timing_before = engine_ref.cluster_timing;
                 let tx_token = tx.clone();
                 let (out_text, secs, tokens) = unsafe {
                     engine_ref.generate_reply(&current_input, max_tokens, allow_think, &mut |token_piece| {
@@ -1559,11 +1561,21 @@ fn execute_tui_turn(
 
                 let tok_per_sec = tokens as f64 / secs.max(0.001);
                 let (acc, tot, _) = engine_ref.spec_stats;
+                let delta_steps = engine_ref.cluster_timing.steps.saturating_sub(timing_before.steps);
+                let timing_str = if delta_steps > 0 {
+                    let delta_w = engine_ref.cluster_timing.worker_us.saturating_sub(timing_before.worker_us);
+                    let delta_l = engine_ref.cluster_timing.local_us.saturating_sub(timing_before.local_us);
+                    let w_ms = (delta_w as f64 / delta_steps as f64) / 1000.0;
+                    let l_ms = (delta_l as f64 / delta_steps as f64) / 1000.0;
+                    format!(" · w: {w_ms:.0}ms, l: {l_ms:.0}ms")
+                } else {
+                    String::new()
+                };
                 let speed_badge = if tot > 0 {
                     let pct = (acc as f64 / tot as f64) * 100.0;
-                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s · spec {acc}/{tot} ({pct:.0}%)")
+                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s · spec {acc}/{tot} ({pct:.0}%){timing_str}")
                 } else {
-                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s")
+                    format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s{timing_str}")
                 };
 
                 // Check if model emitted an agentic tool call

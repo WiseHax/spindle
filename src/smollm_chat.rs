@@ -2724,6 +2724,7 @@ impl SmolLm2Engine {
             on_text(&piece);
             reply.push_str(&piece);
         }
+        let gen_secs = t_gen.elapsed().as_secs_f64();
         // Qwen3's chat template keeps only the final answer of earlier turns, not their
         // reasoning. Rewind the cache to the start of this reply and re-feed just the answer,
         // which also saves context (the reasoning is usually the longer part). Skipped if the
@@ -2751,7 +2752,6 @@ impl SmolLm2Engine {
             draft.feed(&closing);
         }
         self.draft_engine = draft_engine;
-        let gen_secs = t_gen.elapsed().as_secs_f64();
         let total_secs = t0.elapsed().as_secs_f64();
         let (secs, toks) = if generated > 0 {
             (gen_secs, generated)
