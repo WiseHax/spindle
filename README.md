@@ -4,7 +4,7 @@ Spindle runs GGUF language models on the CPU. It runs on one Windows PC, or spli
 across two PCs on the same network so that together they hold a model neither could load
 alone.
 
-![The spindle terminal interface](docs/images/spindle.png)
+![Spindle starting a session: Qwen3-30B-A3B split across two PCs](docs/images/spindle.png)
 
 The whole engine is in this repository, written in Rust: the GGUF parser, the tokenizer, the
 transformer and mixture-of-experts layers, the AVX2 kernels, the thread pool, the cluster
