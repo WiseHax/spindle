@@ -1628,34 +1628,49 @@ impl SmolLm2Engine {
         self.draft_len = len.clamp(1, 16);
     }
 
-    /// Enables or disables agentic tool usage (file ops, web search, shell execution).
+    /// The model family's default system prompt (or `$SPINDLE_SYSTEM_PROMPT`).
+    pub fn default_system_prompt(&self) -> String {
+        if let Ok(custom) = std::env::var("SPINDLE_SYSTEM_PROMPT") {
+            return custom;
+        }
+        let name = self.idx.model_name.to_lowercase();
+        if name.contains("smollm") {
+            SMOLLM_SYSTEM_PROMPT.to_string()
+        } else if name.contains("granite") {
+            GRANITE_SYSTEM_PROMPT.to_string()
+        } else if name.contains("qwen") {
+            QWEN_SYSTEM_PROMPT.to_string()
+        } else {
+            DEFAULT_SYSTEM_PROMPT.to_string()
+        }
+    }
+
+    /// Enables or disables agentic tool usage (file ops, search, shell, web). The user's own
+    /// system prompt (e.g. `--system-prompt`) is kept; only the tools section is swapped.
+    /// The KV-cache still holds the old system prompt until the next `reset_kv`.
     pub fn set_tools_enabled(&mut self, enabled: bool) {
         self.enable_tools = enabled;
-        let base_prompt = if let Ok(custom) = std::env::var("SPINDLE_SYSTEM_PROMPT") {
-            custom
-        } else {
-            let name = self.idx.model_name.to_lowercase();
-            if name.contains("smollm") {
-                SMOLLM_SYSTEM_PROMPT.to_string()
-            } else if name.contains("granite") {
-                GRANITE_SYSTEM_PROMPT.to_string()
-            } else if name.contains("qwen") {
-                QWEN_SYSTEM_PROMPT.to_string()
-            } else {
-                DEFAULT_SYSTEM_PROMPT.to_string()
-            }
+        let base = match self.system_prompt.find(TOOLS_SECTION_MARK) {
+            Some(i) => self.system_prompt[..i].to_string(),
+            None => self.system_prompt.clone(),
         };
-        if enabled {
-            let mut prompt = format!("{}\n{}", base_prompt, crate::tools::TOOLS_SYSTEM_PROMPT);
-            if let Some(spindle_md) = crate::tools::load_spindle_md() {
-                prompt.push_str("\n# Project Instructions (SPINDLE.md)\n");
-                prompt.push_str(&spindle_md);
-                prompt.push('\n');
+        let base = if base.trim().is_empty() { self.default_system_prompt() } else { base };
+        self.system_prompt = if enabled {
+            let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into());
+            let (os, shell) = if cfg!(windows) { ("Windows", "PowerShell") } else { ("Unix", "sh") };
+            let mut p = format!(
+                "{base}{TOOLS_SECTION_MARK}\nYou are working as a coding agent on the user's machine.\n\
+                 Working directory: {cwd}\nPlatform: {os} (shell: {shell}){}",
+                crate::tools::tools_system_prompt()
+            );
+            if let Some(md) = crate::tools::load_spindle_md() {
+                p.push_str("\n\n# Project instructions\n");
+                p.push_str(&md);
             }
-            self.system_prompt = prompt;
+            p
         } else {
-            self.system_prompt = base_prompt;
-        }
+            base
+        };
         if let Some(draft) = self.draft_engine.as_mut() {
             draft.system_prompt = self.system_prompt.clone();
         }

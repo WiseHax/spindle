@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+mod agent;
 mod chat_cli;
 mod cluster_net;
 mod expert_cache;

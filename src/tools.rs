@@ -1,85 +1,79 @@
-//! Spindle Agent Tools: Claude Code & Antigravity-style Tool Implementations.
+//! Agent tools: file read/write/edit, search (grep/glob/symbols), shell, web.
 //!
-//! Provides:
-//! - `read_file`: Line-numbered source inspection
-//! - `write_file`: File creation & overwrite with parent directory synthesis
-//! - `edit_file`: Exact search-and-replace surgical editing
-//! - `list_dir`: Directory listing with file sizes
-//! - `search_web`: DuckDuckGo online web search via native curl.exe
-//! - `run_command`: Sandboxed shell execution with AntiSabotage Guard
+//! Tool calls arrive in Qwen's native format (the one its chat template was trained on):
+//! `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`, parsed with a real JSON parser
+//! (`crate::json`). Every tool returns a [`ToolOutcome`]: text for the model, plus a short
+//! title and optional preview (diff / command output) for the UI.
 
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
 };
 
-use crate::guard::{self, GuardDecision};
+use crate::{
+    guard::{self, GuardDecision},
+    json::{self, Json},
+};
+
+// ------------------------------------------------------------------------------- undo
 
 static UNDO_STACK: Mutex<Vec<(String, Option<String>)>> = Mutex::new(Vec::new());
 
 /// Saves a shadow snapshot of the file before modifying, enabling `/undo`.
 pub fn push_undo_snapshot(path_str: &str) {
     let p = Path::new(path_str);
-    let prev = if p.exists() {
-        fs::read_to_string(p).ok()
-    } else {
-        None
-    };
+    let prev = if p.exists() { fs::read_to_string(p).ok() } else { None };
     if let Ok(mut stack) = UNDO_STACK.lock() {
         stack.push((path_str.to_string(), prev));
     }
 }
 
-/// Reverts the most recent file change made by the agent.
-pub fn pop_undo() -> Option<Result<String, String>> {
-    let (path, prev) = {
-        let mut stack = UNDO_STACK.lock().ok()?;
-        stack.pop()?
-    };
+fn restore(path: String, prev: Option<String>) -> Result<String, String> {
     match prev {
-        Some(old_content) => {
-            let res = fs::write(&path, old_content)
-                .map(|_| format!("Restored '{}' to previous state.", path))
-                .map_err(|e| format!("Failed to restore '{}': {}", path, e));
-            Some(res)
-        }
-        None => {
-            let res = fs::remove_file(&path)
-                .map(|_| format!("Removed newly created file '{}'.", path))
-                .map_err(|e| format!("Failed to remove '{}': {}", path, e));
-            Some(res)
-        }
+        Some(old) => fs::write(&path, old)
+            .map(|_| format!("Restored '{path}' to its previous state."))
+            .map_err(|e| format!("Failed to restore '{path}': {e}")),
+        None => fs::remove_file(&path)
+            .map(|_| format!("Removed newly created file '{path}'."))
+            .map_err(|e| format!("Failed to remove '{path}': {e}")),
     }
 }
 
-/// Reverts the most recent file change specifically for a given path.
+/// Reverts the most recent file change made by the agent.
+pub fn pop_undo() -> Option<Result<String, String>> {
+    let (path, prev) = UNDO_STACK.lock().ok()?.pop()?;
+    Some(restore(path, prev))
+}
+
+/// Reverts the most recent file change for a given path.
 pub fn pop_undo_path(target_path: &str) -> Option<Result<String, String>> {
     let (path, prev) = {
         let mut stack = UNDO_STACK.lock().ok()?;
         let idx = stack.iter().rposition(|(p, _)| p == target_path)?;
         stack.remove(idx)
     };
-    match prev {
-        Some(old_content) => {
-            let res = fs::write(&path, old_content)
-                .map(|_| format!("Restored '{}' to previous state.", path))
-                .map_err(|e| format!("Failed to restore '{}': {}", path, e));
-            Some(res)
-        }
-        None => {
-            let res = fs::remove_file(&path)
-                .map(|_| format!("Removed newly created file '{}'.", path))
-                .map_err(|e| format!("Failed to remove '{}': {}", path, e));
-            Some(res)
-        }
-    }
+    Some(restore(path, prev))
 }
 
-/// Checks if SPINDLE.md exists in current workspace to feed persistent project memory.
+/// Distinct files the agent changed this session (most recent first), for the UI sidebar.
+pub fn modified_files() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(stack) = UNDO_STACK.lock() {
+        for (p, _) in stack.iter().rev() {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Project instructions fed into the system prompt: `SPINDLE.md`, or the `AGENTS.md`
+/// convention shared with opencode / other agents.
 pub fn load_spindle_md() -> Option<String> {
-    for candidate in ["SPINDLE.md", "spindle.md", ".spindle.md"] {
+    for candidate in ["SPINDLE.md", "spindle.md", ".spindle.md", "AGENTS.md"] {
         if let Ok(text) = fs::read_to_string(candidate) {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
@@ -90,704 +84,1095 @@ pub fn load_spindle_md() -> Option<String> {
     None
 }
 
-/// System prompt injection defining available tools for Qwen / ChatML models.
-pub const TOOLS_SYSTEM_PROMPT: &str = r#"
-# Tools
-You have access to the following tools to assist the user:
+// ------------------------------------------------------------------------ definitions
 
-## `read_file`
-Description: Read the contents of a file with line numbers.
-Parameters: {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}
+/// `(name, description, JSON-schema parameters)` for every tool the model is told about.
+const TOOL_DEFS: &[(&str, &str, &str)] = &[
+    ("read_file", "Read a text file. Returns numbered lines. Use offset/limit for long files.",
+     r#"{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"1-based first line"},"limit":{"type":"integer","description":"max lines (default 250)"}},"required":["path"]}"#),
+    ("write_file", "Create or overwrite a file with the given content.",
+     r#"{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}"#),
+    ("edit_file", "Replace old_string with new_string in a file. old_string must match exactly (including indentation) and be unique unless replace_all is true. Read the file first.",
+     r#"{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_string","new_string"]}"#),
+    ("delete_file", "Delete a file (the user is asked to confirm).",
+     r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#),
+    ("list_dir", "List files and folders in a directory.",
+     r#"{"type":"object","properties":{"path":{"type":"string"}}}"#),
+    ("glob", "Find files by name pattern, e.g. \"**/*.rs\" or \"src/*.py\".",
+     r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},"required":["pattern"]}"#),
+    ("grep", "Search file contents for a text. Returns path:line: text. Optional include filters file names, e.g. \"*.rs\".",
+     r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]}"#),
+    ("run_command", "Run a shell command (PowerShell on Windows) in the project directory and return its output.",
+     r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"seconds (default 60, max 600)"}},"required":["command"]}"#),
+    ("web_search", "Search the web and return result titles and snippets.",
+     r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
+    ("fetch_url", "Download a web page and return its text.",
+     r#"{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}"#),
+];
 
-## `write_file`
-Description: Create or overwrite a file with given content.
-Parameters: {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}
+/// The tools section of the system prompt, in Qwen2.5/Qwen3's native function-calling format.
+pub fn tools_system_prompt() -> String {
+    let mut s = String::from(
+        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+    );
+    for (name, desc, params) in TOOL_DEFS {
+        s.push_str(&format!(
+            "{{\"type\": \"function\", \"function\": {{\"name\": \"{name}\", \"description\": {}, \"parameters\": {params}}}}}\n",
+            Json::Str(desc.to_string()).to_string_compact()
+        ));
+    }
+    s.push_str(
+        "</tools>\n\nFor each function call, return a json object with function name and arguments \
+         within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n\
+         Work step by step: inspect files before editing them, and after a tool result either call \
+         another tool or give the user a short final answer. Paths are relative to the project directory.",
+    );
+    s
+}
 
-## `edit_file`
-Description: Perform exact search-and-replace edit in a file.
-Parameters: {"type": "object", "properties": {"path": {"type": "string"}, "target": {"type": "string"}, "replacement": {"type": "string"}}, "required": ["path", "target", "replacement"]}
+// ---------------------------------------------------------------------------- parsing
 
-## `delete_file`
-Description: Delete a file from the workspace.
-Parameters: {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
-
-## `list_dir`
-Description: List files and subdirectories in a folder.
-Parameters: {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
-
-## `run_command`
-Description: Run a shell command in the project directory.
-Parameters: {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
-
-## `search_symbols`
-Description: Fast AST/symbol scanner across workspace. Finds function signatures, structs, classes, enums, traits and types without reading full files.
-Parameters: {"type": "object", "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}, "symbol_type": {"type": "string"}}, "required": ["pattern"]}
-
-## `search_web`
-Description: Search the internet online for live information.
-Parameters: {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
-
-To invoke a tool, output:
-<tool_call>
-{"name": "<tool_name>", "arguments": {"<param>": "<value>"}}
-</tool_call>
-Wait for the <tool_response> before continuing.
-After receiving a tool response that fulfills the user's request, provide your final direct answer to the user. Do not call the same tool repeatedly.
-"#;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ToolCall {
     pub name: String,
-    pub path: Option<String>,
-    pub content: Option<String>,
-    pub target: Option<String>,
-    pub replacement: Option<String>,
-    pub command: Option<String>,
-    pub query: Option<String>,
-    pub pattern: Option<String>,
-    pub symbol_type: Option<String>,
-    pub start_line: Option<usize>,
-    pub limit: Option<usize>,
+    pub args: Json,
 }
 
-/// Reads a file and returns contents formatted with 1-based line numbers.
-pub fn tool_read_file(path_str: &str, start_line: Option<usize>, limit: Option<usize>) -> Result<String, String> {
-    if let GuardDecision::Block(r) = guard::check_path(path_str, false) {
-        return Err(format!("[Blocked by Security Guard: {r}]"));
+impl ToolCall {
+    /// First present string argument among `keys` (aliases tolerate older/other prompts).
+    pub fn str_arg(&self, keys: &[&str]) -> Option<&str> {
+        keys.iter().find_map(|k| self.args.get(k).and_then(Json::as_str))
     }
-    let p = Path::new(path_str);
-    if !p.exists() {
-        return Err(format!("File not found: '{path_str}'"));
-    }
-    if p.is_dir() {
-        return Err(format!("'{path_str}' is a directory, not a file. Use list_dir instead."));
-    }
-    let raw = fs::read_to_string(p).map_err(|e| format!("Failed to read '{path_str}': {e}"))?;
-    let lines: Vec<&str> = raw.lines().collect();
-    let total = lines.len();
-    let start = start_line.unwrap_or(1).saturating_sub(1).min(total);
-    let count = limit.unwrap_or(400).min(total.saturating_sub(start));
 
-    let mut out = String::new();
-    out.push_str(&format!("--- {path_str} (showing lines {}-{} of {total}) ---\n", start + 1, start + count));
-    for (i, line) in lines[start..start + count].iter().enumerate() {
-        out.push_str(&format!("{:>4} | {}\n", start + i + 1, line));
+    pub fn num_arg(&self, keys: &[&str]) -> Option<usize> {
+        keys.iter().find_map(|k| self.args.get(k).and_then(Json::as_usize))
     }
-    Ok(out)
+
+    pub fn bool_arg(&self, keys: &[&str]) -> Option<bool> {
+        keys.iter().find_map(|k| self.args.get(k).and_then(Json::as_bool))
+    }
+
+    /// Identity used to spot a model looping on the exact same call.
+    pub fn signature(&self) -> String {
+        format!("{}:{}", self.name, self.args.to_string_compact())
+    }
 }
 
-/// Writes or overwrites a file on disk, automatically creating parent folders.
-pub fn tool_write_file(path_str: &str, content: &str) -> Result<String, String> {
-    if let GuardDecision::Block(r) = guard::check_path(path_str, true) {
-        return Err(format!("[Blocked by Security Guard: {r}]"));
+fn find_ci(hay: &str, needle: &str, from: usize) -> Option<usize> {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || from >= h.len() {
+        return None;
     }
-    let p = Path::new(path_str);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            let _ = fs::create_dir_all(parent);
+    (from..=h.len().saturating_sub(n.len())).find(|&i| h[i..i + n.len()].eq_ignore_ascii_case(n))
+}
+
+/// Turns one `{...}` payload into a call. Accepts `{"name", "arguments"|"parameters"}` (args
+/// as an object or a JSON-encoded string) and the flat `{"name", "path": ...}` form.
+fn call_from_json(v: Json) -> Option<ToolCall> {
+    let name = v.get("name")?.as_str()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = match v.get("arguments").or_else(|| v.get("parameters")).or_else(|| v.get("args")) {
+        Some(Json::Obj(kv)) => Json::Obj(kv.clone()),
+        Some(Json::Str(s)) => json::parse(s).unwrap_or(Json::Obj(Vec::new())),
+        _ => match v {
+            Json::Obj(kv) => Json::Obj(kv.into_iter().filter(|(k, _)| k != "name").collect()),
+            _ => Json::Obj(Vec::new()),
+        },
+    };
+    Some(ToolCall { name, args })
+}
+
+/// Extracts every tool call from a model reply, plus the reply with the call blocks removed
+/// (what the user should see).
+pub fn parse_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
+    let mut calls = Vec::new();
+    let mut visible = String::new();
+    let mut pos = 0;
+    while let Some(open) = find_ci(text, "<tool_call", pos) {
+        visible.push_str(&text[pos..open]);
+        let Some(gt) = text[open..].find('>') else {
+            pos = text.len();
+            break;
+        };
+        let body_start = open + gt + 1;
+        let close = find_ci(text, "</tool_call", body_start);
+        let body_end = close.unwrap_or(text.len());
+        let body = &text[body_start..body_end];
+        // The JSON object may be wrapped in a ``` fence; parse from its first brace.
+        if let Some(brace) = body.find('{') {
+            if let Ok((v, _)) = json::parse_prefix(&body[brace..]) {
+                if let Some(c) = call_from_json(v) {
+                    calls.push(c);
+                }
+            }
+        }
+        pos = match close {
+            Some(c) => text[c..].find('>').map_or(text.len(), |g| c + g + 1),
+            None => text.len(),
+        };
+    }
+    visible.push_str(&text[pos.min(text.len())..]);
+
+    // No tags at all, but the reply is (or ends with) a bare call object: accept it if it
+    // names one of our tools, so a model that forgets the tags still works.
+    if calls.is_empty() {
+        if let Some(brace) = text.find("{\"name\"").or_else(|| text.find("{'name'")) {
+            if let Ok((v, used)) = json::parse_prefix(&text[brace..]) {
+                if let Some(c) = call_from_json(v) {
+                    if TOOL_DEFS.iter().any(|(n, _, _)| *n == c.name) || is_alias(&c.name) {
+                        visible = format!("{}{}", &text[..brace], &text[brace + used..]);
+                        calls.push(c);
+                    }
+                }
+            }
         }
     }
-    push_undo_snapshot(path_str);
-    fs::write(p, content).map_err(|e| format!("Failed to write '{path_str}': {e}"))?;
-    Ok(format!("Successfully wrote {} bytes to '{path_str}'.", content.len()))
+    (calls, visible.trim().to_string())
 }
 
-/// Surgically replaces exact target occurrences in a file.
-pub fn tool_edit_file(path_str: &str, target: &str, replacement: &str) -> Result<String, String> {
-    if let GuardDecision::Block(r) = guard::check_path(path_str, true) {
-        return Err(format!("[Blocked by Security Guard: {r}]"));
-    }
-    let p = Path::new(path_str);
-    if !p.exists() {
-        return Err(format!("File '{path_str}' does not exist."));
-    }
-    let old = fs::read_to_string(p).map_err(|e| format!("Could not read '{path_str}': {e}"))?;
-    if !old.contains(target) {
-        return Err(format!("Target text not found in '{path_str}'. Verify exact whitespace and lines."));
-    }
-    let occurrences = old.matches(target).count();
-    let updated = old.replace(target, replacement);
-    push_undo_snapshot(path_str);
-    fs::write(p, updated).map_err(|e| format!("Could not write updated '{path_str}': {e}"))?;
-    Ok(format!("Successfully replaced {occurrences} occurrence(s) in '{path_str}'."))
+/// Removes `<tool_call>…</tool_call>` from streamed text as it arrives. Small models often
+/// spell the tag out as several plain tokens (`<`, `tool`, `_call`, `>`), so this works on
+/// the accumulated text and holds back a trailing partial tag instead of matching per token.
+#[derive(Default)]
+pub struct ToolMarkupFilter {
+    buf: String,
+    in_tool: bool,
 }
 
-/// Deletes a file on disk after saving a shadow undo snapshot.
-pub fn tool_delete_file(path_str: &str) -> Result<String, String> {
-    if let GuardDecision::Block(r) = guard::check_path(path_str, true) {
-        return Err(format!("[Blocked by Security Guard: {r}]"));
-    }
-    let p = Path::new(path_str);
-    if !p.exists() {
-        return Err(format!("File '{path_str}' does not exist."));
-    }
-    if p.is_dir() {
-        return Err(format!("'{path_str}' is a directory, not a file. Use run_command with rmdir to delete directories."));
-    }
-    push_undo_snapshot(path_str);
-    fs::remove_file(p).map_err(|e| format!("Failed to delete '{path_str}': {e}"))?;
-    Ok(format!("Successfully deleted '{path_str}'."))
+/// Length of the longest suffix of `s` that is a proper prefix of `tag`.
+pub fn partial_tag_suffix(s: &str, tag: &str) -> usize {
+    (1..tag.len().min(s.len() + 1))
+        .rev()
+        .find(|&n| s.is_char_boundary(s.len() - n) && tag.as_bytes().starts_with(&s.as_bytes()[s.len() - n..]))
+        .unwrap_or(0)
 }
 
-/// Lists files and subdirectories with sizes.
-pub fn tool_list_dir(path_str: &str) -> Result<String, String> {
-    let p = if path_str.trim().is_empty() { Path::new(".") } else { Path::new(path_str) };
-    if !p.exists() {
-        return Err(format!("Directory '{path_str}' does not exist."));
-    }
-    let entries = fs::read_dir(p).map_err(|e| format!("Could not read directory '{path_str}': {e}"))?;
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_dir() {
-                dirs.push(format!("{name}/"));
+impl ToolMarkupFilter {
+    /// Feeds a piece; returns the text that is now safe to display.
+    pub fn push(&mut self, piece: &str) -> String {
+        const OPEN: &str = "<tool_call>";
+        const CLOSE: &str = "</tool_call>";
+        self.buf.push_str(piece);
+        let mut out = String::new();
+        loop {
+            if self.in_tool {
+                match self.buf.find(CLOSE) {
+                    Some(i) => {
+                        self.buf.drain(..i + CLOSE.len());
+                        self.in_tool = false;
+                    }
+                    None => {
+                        let keep = partial_tag_suffix(&self.buf, CLOSE);
+                        let cut = self.buf.len() - keep;
+                        self.buf.drain(..cut);
+                        return out;
+                    }
+                }
             } else {
-                let sz = meta.len();
-                let sz_str = if sz > (1024 * 1024) {
-                    format!("{:.1} MiB", sz as f64 / (1024.0 * 1024.0))
-                } else if sz > 1024 {
-                    format!("{:.1} KiB", sz as f64 / 1024.0)
-                } else {
-                    format!("{sz} B")
-                };
-                files.push(format!("{name:<35} ({sz_str})"));
+                match self.buf.find(OPEN) {
+                    Some(i) => {
+                        out.push_str(&self.buf[..i]);
+                        self.buf.drain(..i + OPEN.len());
+                        self.in_tool = true;
+                    }
+                    None => {
+                        let keep = partial_tag_suffix(&self.buf, OPEN);
+                        let cut = self.buf.len() - keep;
+                        out.push_str(&self.buf[..cut]);
+                        self.buf.drain(..cut);
+                        return out;
+                    }
+                }
             }
+        }
+    }
+}
+
+fn is_alias(name: &str) -> bool {
+    matches!(name, "search_web" | "search_symbols" | "read" | "write" | "edit" | "bash" | "shell" | "ls")
+}
+
+/// First tool call in `text` (kept for callers that only need one).
+pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
+    parse_tool_calls(text).0.into_iter().next()
+}
+
+// -------------------------------------------------------------------------- execution
+
+/// What the UI needs to show for a tool call, and what goes back to the model.
+#[derive(Clone, Debug)]
+pub struct ToolOutcome {
+    pub ok: bool,
+    /// opencode-style glyph: `→` read, `←` write/edit, `✱` search, `$` shell, `◈` web, `%` fetch.
+    pub icon: &'static str,
+    /// One-line summary, e.g. `Read src/main.rs:1-250`.
+    pub title: String,
+    /// Full text returned to the model inside `<tool_response>`.
+    pub output: String,
+    /// Optional preview for the UI: a diff (`+`/`-` lines) or the first lines of output.
+    pub preview: Option<String>,
+}
+
+impl ToolOutcome {
+    fn ok(icon: &'static str, title: String, output: String) -> Self {
+        Self { ok: true, icon, title, output, preview: None }
+    }
+    fn err(icon: &'static str, title: String, error: String) -> Self {
+        Self { ok: false, icon, title, output: format!("Error: {error}"), preview: None }
+    }
+}
+
+/// Per-call execution context.
+pub struct ToolCtx<'a> {
+    /// Asks the user to approve an action; `false` aborts it.
+    pub confirm: &'a mut dyn FnMut(&str) -> bool,
+    /// Budget for text returned to the model (keeps one tool result from flooding the context).
+    pub max_chars: usize,
+}
+
+/// Keeps the head and tail of `s` within `max` bytes (char-boundary safe).
+pub fn truncate_middle(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let head = max * 2 / 3;
+    let tail = max - head;
+    let mut h = head;
+    while !s.is_char_boundary(h) {
+        h -= 1;
+    }
+    let mut t = s.len() - tail;
+    while !s.is_char_boundary(t) {
+        t += 1;
+    }
+    format!("{}\n\n... [{} bytes omitted] ...\n\n{}", &s[..h], t - h, &s[t..])
+}
+
+/// Is `p` inside the current working directory? (Writes elsewhere need confirmation.)
+fn inside_workspace(p: &Path) -> bool {
+    let Ok(cwd) = std::env::current_dir() else { return true };
+    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    // Resolve `..` lexically (the target may not exist yet).
+    let mut norm = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => norm.push(other),
+        }
+    }
+    let lower = |p: &Path| p.to_string_lossy().to_lowercase().replace('/', "\\");
+    lower(&norm).starts_with(&lower(&cwd))
+}
+
+fn check_write(path: &str, ctx: &mut ToolCtx) -> Result<(), String> {
+    match guard::check_path(path, true) {
+        GuardDecision::Block(r) => return Err(format!("blocked by security guard: {r}")),
+        GuardDecision::NeedConfirmation(r) => {
+            if !(ctx.confirm)(&format!("{r}: {path}")) {
+                return Err("the user declined this action".into());
+            }
+        }
+        GuardDecision::Allow => {}
+    }
+    if !inside_workspace(Path::new(path)) && !(ctx.confirm)(&format!("Write outside the project directory: {path}")) {
+        return Err("the user declined writing outside the project directory".into());
+    }
+    Ok(())
+}
+
+/// Runs one tool call.
+pub fn execute(call: &ToolCall, ctx: &mut ToolCtx) -> ToolOutcome {
+    let path = call.str_arg(&["path", "file_path", "file", "filename"]).unwrap_or("").trim().to_string();
+    match call.name.as_str() {
+        "read_file" | "read" => {
+            let offset = call.num_arg(&["offset", "start_line", "line"]);
+            let limit = call.num_arg(&["limit", "lines"]);
+            read_file(&path, offset, limit, ctx.max_chars)
+        }
+        "write_file" | "write" => {
+            let content = call.str_arg(&["content", "text", "contents"]).unwrap_or("");
+            write_file(&path, content, ctx)
+        }
+        "edit_file" | "edit" => {
+            let old = call.str_arg(&["old_string", "target", "old", "search"]).unwrap_or("");
+            let new = call.str_arg(&["new_string", "replacement", "new", "replace"]).unwrap_or("");
+            let all = call.bool_arg(&["replace_all"]).unwrap_or(false);
+            edit_file(&path, old, new, all, ctx)
+        }
+        "delete_file" => delete_file(&path, ctx),
+        "list_dir" | "ls" => list_dir(if path.is_empty() { "." } else { &path }, ctx.max_chars),
+        "glob" => glob_tool(call.str_arg(&["pattern", "glob"]).unwrap_or(""), &path, ctx.max_chars),
+        "grep" => grep_tool(
+            call.str_arg(&["pattern", "query", "text"]).unwrap_or(""),
+            &path,
+            call.str_arg(&["include", "glob"]),
+            ctx.max_chars,
+        ),
+        "search_symbols" => {
+            let pat = call.str_arg(&["pattern", "query"]).unwrap_or("");
+            let title = format!("Symbols \"{pat}\"");
+            match tool_search_symbols(pat, Some(if path.is_empty() { "." } else { &path }), call.str_arg(&["symbol_type"])) {
+                Ok(o) => ToolOutcome::ok("✱", title, truncate_middle(&o, ctx.max_chars)),
+                Err(e) => ToolOutcome::err("✱", title, e),
+            }
+        }
+        "run_command" | "bash" | "shell" => {
+            let cmd = call.str_arg(&["command", "cmd"]).unwrap_or("");
+            let timeout = call.num_arg(&["timeout"]).unwrap_or(60).clamp(1, 600);
+            run_command(cmd, timeout, ctx)
+        }
+        "web_search" | "search_web" => {
+            let q = call.str_arg(&["query", "q"]).unwrap_or("");
+            let title = format!("Search \"{q}\"");
+            match tool_search_web(q) {
+                Ok(o) => ToolOutcome::ok("◈", title, truncate_middle(&o, ctx.max_chars)),
+                Err(e) => ToolOutcome::err("◈", title, e),
+            }
+        }
+        "fetch_url" => {
+            let url = call.str_arg(&["url"]).unwrap_or("");
+            let title = format!("Fetch {url}");
+            match fetch_url(url) {
+                Ok(o) => ToolOutcome::ok("%", title, truncate_middle(&o, ctx.max_chars)),
+                Err(e) => ToolOutcome::err("%", title, e),
+            }
+        }
+        other => ToolOutcome::err(
+            "⚙",
+            other.to_string(),
+            format!(
+                "unknown tool '{other}'. Available: {}",
+                TOOL_DEFS.iter().map(|t| t.0).collect::<Vec<_>>().join(", ")
+            ),
+        ),
+    }
+}
+
+fn read_file(path: &str, offset: Option<usize>, limit: Option<usize>, max_chars: usize) -> ToolOutcome {
+    let first = offset.unwrap_or(1).max(1);
+    let title = |end: usize| {
+        if offset.is_some() || limit.is_some() {
+            format!("Read {path}:{first}-{end}")
+        } else {
+            format!("Read {path}")
+        }
+    };
+    if path.is_empty() {
+        return ToolOutcome::err("→", "Read".into(), "missing 'path'".into());
+    }
+    if let GuardDecision::Block(r) = guard::check_path(path, false) {
+        return ToolOutcome::err("→", title(first), format!("blocked by security guard: {r}"));
+    }
+    let p = Path::new(path);
+    if p.is_dir() {
+        return ToolOutcome::err("→", title(first), format!("'{path}' is a directory; use list_dir"));
+    }
+    let bytes = match fs::read(p) {
+        Ok(b) => b,
+        Err(e) => return ToolOutcome::err("→", title(first), format!("cannot read '{path}': {e}")),
+    };
+    if bytes.iter().take(8192).any(|&b| b == 0) {
+        return ToolOutcome::err("→", title(first), format!("'{path}' looks like a binary file ({} bytes)", bytes.len()));
+    }
+    let raw = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = raw.lines().collect();
+    let total = lines.len();
+    let start = (first - 1).min(total);
+    let count = limit.unwrap_or(250).min(total - start);
+    let mut out = String::new();
+    let mut shown = 0;
+    for (i, line) in lines[start..start + count].iter().enumerate() {
+        let l: String = if line.chars().count() > 400 { line.chars().take(400).chain("…".chars()).collect() } else { line.to_string() };
+        let row = format!("{:>5}\t{}\n", start + i + 1, l);
+        if out.len() + row.len() > max_chars {
+            break;
+        }
+        out.push_str(&row);
+        shown += 1;
+    }
+    let end = start + shown;
+    if end < total {
+        out.push_str(&format!("\n(lines {}-{end} of {total}; call read_file with offset={} to continue)\n", start + 1, end + 1));
+    } else if total == 0 {
+        out.push_str("(empty file)\n");
+    }
+    ToolOutcome::ok("→", title(end), out)
+}
+
+fn write_file(path: &str, content: &str, ctx: &mut ToolCtx) -> ToolOutcome {
+    let title = format!("Write {path}");
+    if path.is_empty() {
+        return ToolOutcome::err("←", "Write".into(), "missing 'path'".into());
+    }
+    if let Err(e) = check_write(path, ctx) {
+        return ToolOutcome::err("←", title, e);
+    }
+    let p = Path::new(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return ToolOutcome::err("←", title, format!("cannot create '{}': {e}", parent.display()));
+            }
+        }
+    }
+    let existed = p.exists();
+    push_undo_snapshot(path);
+    match fs::write(p, content) {
+        Ok(()) => {
+            let n = content.lines().count();
+            let mut o = ToolOutcome::ok(
+                "←",
+                title,
+                format!("{} '{path}' ({n} lines, {} bytes).", if existed { "Overwrote" } else { "Created" }, content.len()),
+            );
+            o.preview = Some(content.lines().take(12).map(|l| format!("+{l}")).collect::<Vec<_>>().join("\n"));
+            o
+        }
+        Err(e) => ToolOutcome::err("←", title, format!("cannot write '{path}': {e}")),
+    }
+}
+
+fn edit_file(path: &str, old: &str, new: &str, replace_all: bool, ctx: &mut ToolCtx) -> ToolOutcome {
+    let title = format!("Edit {path}");
+    if path.is_empty() {
+        return ToolOutcome::err("←", "Edit".into(), "missing 'path'".into());
+    }
+    if old.is_empty() {
+        return ToolOutcome::err("←", title, "old_string is empty; use write_file to create a file".into());
+    }
+    if old == new {
+        return ToolOutcome::err("←", title, "old_string and new_string are identical".into());
+    }
+    if let Err(e) = check_write(path, ctx) {
+        return ToolOutcome::err("←", title, e);
+    }
+    let src = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => return ToolOutcome::err("←", title, format!("cannot read '{path}': {e}")),
+    };
+    // Windows files use CRLF, but models write `\n`: match in the file's own line endings.
+    let crlf = src.contains("\r\n");
+    let (old_f, new_f) = if crlf {
+        (old.replace("\r\n", "\n").replace('\n', "\r\n"), new.replace("\r\n", "\n").replace('\n', "\r\n"))
+    } else {
+        (old.to_string(), new.to_string())
+    };
+    let n = src.matches(&old_f).count();
+    if n == 0 {
+        // Help the model recover: point at the closest line to its first old_string line.
+        let first = old.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        let hint = src
+            .lines()
+            .enumerate()
+            .find(|(_, l)| !first.is_empty() && l.contains(first))
+            .map(|(i, l)| format!(" A similar line is at {}: {:?} - check whitespace/indentation and read the file again.", i + 1, l.trim_end()))
+            .unwrap_or_else(|| " Read the file again and copy old_string exactly.".into());
+        return ToolOutcome::err("←", title, format!("old_string not found in '{path}'.{hint}"));
+    }
+    if n > 1 && !replace_all {
+        return ToolOutcome::err(
+            "←",
+            title,
+            format!("old_string occurs {n} times in '{path}'; add surrounding lines to make it unique, or set replace_all=true"),
+        );
+    }
+    let updated = if replace_all { src.replace(&old_f, &new_f) } else { src.replacen(&old_f, &new_f, 1) };
+    push_undo_snapshot(path);
+    if let Err(e) = fs::write(path, &updated) {
+        return ToolOutcome::err("←", title, format!("cannot write '{path}': {e}"));
+    }
+    let line = src[..src.find(&old_f).unwrap_or(0)].matches('\n').count() + 1;
+    let mut o = ToolOutcome::ok("←", title, format!("Edited '{path}' ({} replacement(s), starting at line {line}).", if replace_all { n } else { 1 }));
+    let mut diff: Vec<String> = old.lines().map(|l| format!("-{l}")).collect();
+    diff.extend(new.lines().map(|l| format!("+{l}")));
+    o.preview = Some(diff.join("\n"));
+    o
+}
+
+fn delete_file(path: &str, ctx: &mut ToolCtx) -> ToolOutcome {
+    let title = format!("Delete {path}");
+    let p = Path::new(path);
+    if path.is_empty() || !p.is_file() {
+        return ToolOutcome::err("←", title, format!("'{path}' is not an existing file"));
+    }
+    if let Err(e) = check_write(path, ctx) {
+        return ToolOutcome::err("←", title, e);
+    }
+    if !(ctx.confirm)(&format!("Delete file {path}")) {
+        return ToolOutcome::err("←", title, "the user declined deleting this file".into());
+    }
+    push_undo_snapshot(path);
+    match fs::remove_file(p) {
+        Ok(()) => ToolOutcome::ok("←", title, format!("Deleted '{path}' (the user can /undo it).")),
+        Err(e) => ToolOutcome::err("←", title, format!("cannot delete '{path}': {e}")),
+    }
+}
+
+fn list_dir(path: &str, max_chars: usize) -> ToolOutcome {
+    let title = format!("List {path}");
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => return ToolOutcome::err("→", title, format!("cannot list '{path}': {e}")),
+    };
+    let (mut dirs, mut files) = (Vec::new(), Vec::new());
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        match e.metadata() {
+            Ok(m) if m.is_dir() => dirs.push(format!("{name}/")),
+            Ok(m) => files.push(format!("{name}  ({})", human_size(m.len()))),
+            Err(_) => files.push(name),
         }
     }
     dirs.sort();
     files.sort();
-
-    let mut out = format!("Directory listing for '{}':\n", p.display());
-    for d in dirs {
-        out.push_str(&format!("  [DIR]  {d}\n"));
+    let mut out = String::new();
+    for l in dirs.iter().chain(files.iter()) {
+        out.push_str(l);
+        out.push('\n');
     }
-    for f in files {
-        out.push_str(&format!("  [FILE] {f}\n"));
+    if out.is_empty() {
+        out.push_str("(empty directory)\n");
     }
-    Ok(out)
+    ToolOutcome::ok("→", title, truncate_middle(&out, max_chars))
 }
 
-/// Searches the web online using DuckDuckGo via native curl.exe (zero external dependencies).
+fn human_size(n: u64) -> String {
+    if n >= 1 << 30 {
+        format!("{:.1} GiB", n as f64 / (1u64 << 30) as f64)
+    } else if n >= 1 << 20 {
+        format!("{:.1} MiB", n as f64 / (1u64 << 20) as f64)
+    } else if n >= 1 << 10 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+// ------------------------------------------------------------------- search helpers
+
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", ".cargo", "vendor", ".idea", ".vscode"];
+
+/// Recursively collects files under `root` (skipping build/vendor dirs), at most `cap`.
+fn walk_files(root: &Path, cap: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    if root.is_file() {
+        return vec![root.to_path_buf()];
+    }
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            match e.file_type() {
+                Ok(t) if t.is_dir() => {
+                    if !SKIP_DIRS.contains(&name.as_str()) {
+                        stack.push(p);
+                    }
+                }
+                Ok(t) if t.is_file() => {
+                    out.push(p);
+                    if out.len() >= cap {
+                        return out;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    s.strip_prefix("./").unwrap_or(&s).to_string()
+}
+
+/// Glob match on `/`-separated paths: `*` (within a segment), `?`, and `**` (any depth).
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    fn seg(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => seg(&p[1..], s) || (!s.is_empty() && seg(p, &s[1..])),
+            (Some(b'?'), Some(_)) => seg(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => seg(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    fn parts(p: &[&str], s: &[&str]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => parts(&p[1..], s) || (!s.is_empty() && parts(p, &s[1..])),
+            (Some(a), Some(b)) if seg(a.as_bytes(), b.as_bytes()) => parts(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    let pat = pattern.replace('\\', "/");
+    let path = path.replace('\\', "/");
+    let s: Vec<&str> = path.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+    if !pat.contains('/') {
+        // A bare pattern ("*.rs") matches the file name at any depth.
+        return s.last().is_some_and(|name| seg(pat.as_bytes(), name.as_bytes()));
+    }
+    let p: Vec<&str> = pat.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+    parts(&p, &s)
+}
+
+fn glob_tool(pattern: &str, path: &str, max_chars: usize) -> ToolOutcome {
+    let title = format!("Glob \"{pattern}\"");
+    if pattern.trim().is_empty() {
+        return ToolOutcome::err("✱", title, "missing 'pattern'".into());
+    }
+    let root = Path::new(if path.is_empty() { "." } else { path });
+    let mut hits: Vec<(std::time::SystemTime, String)> = walk_files(root, 50_000)
+        .into_iter()
+        .filter_map(|p| {
+            let rel = p.strip_prefix(root).unwrap_or(&p);
+            if glob_match(pattern, &rel.to_string_lossy()) {
+                let t = fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                Some((t, display_path(&p)))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Most recently modified first, like opencode.
+    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    let n = hits.len();
+    let mut out: String = hits.iter().take(200).map(|(_, p)| format!("{p}\n")).collect();
+    if n > 200 {
+        out.push_str(&format!("({n} files; showing 200, narrow the pattern)\n"));
+    }
+    if n == 0 {
+        out = format!("No files match '{pattern}'.\n");
+    }
+    ToolOutcome::ok("✱", format!("{title} ({n} {})", if n == 1 { "file" } else { "files" }), truncate_middle(&out, max_chars))
+}
+
+fn grep_tool(pattern: &str, path: &str, include: Option<&str>, max_chars: usize) -> ToolOutcome {
+    let title = format!("Grep \"{pattern}\"");
+    if pattern.is_empty() {
+        return ToolOutcome::err("✱", title, "missing 'pattern'".into());
+    }
+    // Smart case: all-lowercase patterns match case-insensitively.
+    let ci = !pattern.chars().any(char::is_uppercase);
+    let needle = if ci { pattern.to_lowercase() } else { pattern.to_string() };
+    let root = Path::new(if path.is_empty() { "." } else { path });
+    let mut out = String::new();
+    let mut n = 0usize;
+    'files: for p in walk_files(root, 20_000) {
+        if let Some(inc) = include {
+            let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if !glob_match(inc, &name) {
+                continue;
+            }
+        }
+        let Ok(meta) = fs::metadata(&p) else { continue };
+        if meta.len() > 2 << 20 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&p) else { continue };
+        if bytes.iter().take(4096).any(|&b| b == 0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        for (i, line) in text.lines().enumerate() {
+            let hit = if ci { line.to_lowercase().contains(&needle) } else { line.contains(&needle) };
+            if hit {
+                n += 1;
+                let l: String = line.trim().chars().take(240).collect();
+                out.push_str(&format!("{}:{}: {l}\n", display_path(&p), i + 1));
+                if n >= 150 || out.len() > max_chars {
+                    out.push_str("(more matches omitted; narrow the pattern or path)\n");
+                    break 'files;
+                }
+            }
+        }
+    }
+    if n == 0 {
+        out = format!("No matches for '{pattern}'.\n");
+    }
+    ToolOutcome::ok("✱", format!("{title} ({n} {})", if n == 1 { "match" } else { "matches" }), truncate_middle(&out, max_chars))
+}
+
+// ------------------------------------------------------------------- shell and web
+
+fn run_command(cmd: &str, timeout_s: usize, ctx: &mut ToolCtx) -> ToolOutcome {
+    let title = cmd.to_string();
+    if cmd.trim().is_empty() {
+        return ToolOutcome::err("$", title, "missing 'command'".into());
+    }
+    match guard::check_command(cmd) {
+        GuardDecision::Block(r) => return ToolOutcome::err("$", title, format!("blocked by security guard: {r}")),
+        GuardDecision::NeedConfirmation(r) => {
+            if !(ctx.confirm)(&format!("{r}: {cmd}")) {
+                return ToolOutcome::err("$", title, "the user declined running this command".into());
+            }
+        }
+        GuardDecision::Allow => {}
+    }
+    match guard::run_sandboxed(cmd, Duration::from_secs(timeout_s as u64)) {
+        Ok((out, code)) => {
+            let body = truncate_middle(out.trim_end(), ctx.max_chars.saturating_sub(64).max(512));
+            let mut o = ToolOutcome {
+                ok: code == 0,
+                icon: "$",
+                title,
+                output: format!("Exit code: {code}\n{body}"),
+                preview: None,
+            };
+            let lines: Vec<&str> = out.trim_end().lines().collect();
+            let mut prev = lines.iter().take(10).copied().collect::<Vec<_>>().join("\n");
+            if lines.len() > 10 {
+                prev.push_str(&format!("\n… {} more lines", lines.len() - 10));
+            }
+            if code != 0 {
+                prev.push_str(&format!("\n(exit code {code})"));
+            }
+            o.preview = Some(prev);
+            o
+        }
+        Err(e) => ToolOutcome::err("$", title, format!("failed to start: {e}")),
+    }
+}
+
+fn url_encode(q: &str) -> String {
+    let mut out = String::new();
+    for b in q.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else if b == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn curl(url: &str, secs: u32) -> Result<String, String> {
+    let out = std::process::Command::new(if cfg!(windows) { "curl.exe" } else { "curl" })
+        .args(["-s", "-L", "--max-time", &secs.to_string(), "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", url])
+        .output()
+        .map_err(|e| format!("cannot run curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("curl failed (exit {:?})", out.status.code()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// DuckDuckGo HTML search via the system `curl` (no extra dependencies).
 pub fn tool_search_web(query: &str) -> Result<String, String> {
     let q = query.trim();
     if q.is_empty() {
-        return Err("Search query cannot be empty.".into());
+        return Err("missing 'query'".into());
     }
-    let mut encoded = String::new();
-    for b in q.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
-            encoded.push(b as char);
-        } else if b == b' ' {
-            encoded.push('+');
-        } else {
-            encoded.push_str(&format!("%{:02X}", b));
-        }
-    }
-    let url = format!("https://html.duckduckgo.com/html/?q={encoded}");
-
-    let mut cmd = std::process::Command::new("curl.exe");
-    cmd.args(["-s", "-L", "--max-time", "10", "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", &url]);
-
-    let output = cmd.output().map_err(|e| format!("Failed to invoke curl for web search: {e}"))?;
-    if !output.status.success() {
-        return Err(format!("curl returned error code {:?}", output.status.code()));
-    }
-    let html = String::from_utf8_lossy(&output.stdout);
+    let html = curl(&format!("https://html.duckduckgo.com/html/?q={}", url_encode(q)), 10)?;
     let mut results = Vec::new();
-
-    // Lightweight extraction of DuckDuckGo HTML results
-    let snippet_tag = "class=\"result__snippet\"";
-    let title_tag = "class=\"result__a\"";
-
-    for part in html.split(title_tag).skip(1).take(5) {
-        let title = if let Some(start) = part.find('>') {
-            if let Some(end) = part[start..].find("</a>") {
-                strip_html(&part[start + 1..start + end])
-            } else {
-                continue;
-            }
-        } else {
-            continue;
-        };
-
-        let snippet = if let Some(s_idx) = part.find(snippet_tag) {
-            let s_part = &part[s_idx..];
-            if let Some(start) = s_part.find('>') {
-                if let Some(end) = s_part[start..].find("</a>") {
-                    strip_html(&s_part[start + 1..start + end])
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        if !title.is_empty() {
-            results.push(format!("- **{}**\n  {}", title.trim(), snippet.trim()));
+    for part in html.split("class=\"result__a\"").skip(1).take(6) {
+        let title = part.find('>').and_then(|s| part[s..].find("</a>").map(|e| strip_html(&part[s + 1..s + e])));
+        let href = part.find("href=\"").and_then(|s| part[s + 6..].find('"').map(|e| part[s + 6..s + 6 + e].to_string()));
+        let snippet = part
+            .find("class=\"result__snippet\"")
+            .and_then(|i| {
+                let sp = &part[i..];
+                sp.find('>').and_then(|s| sp[s..].find("</a>").map(|e| strip_html(&sp[s + 1..s + e])))
+            })
+            .unwrap_or_default();
+        if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
+            let link = href.map(|h| decode_ddg_link(&h)).unwrap_or_default();
+            results.push(format!("- {}\n  {}\n  {}", t.trim(), link, snippet.trim()));
         }
     }
-
     if results.is_empty() {
-        Ok(format!("Search completed for '{q}', but no direct snippets could be parsed from DuckDuckGo HTML."))
+        Ok(format!("No results parsed for '{q}'."))
     } else {
-        Ok(format!("Online search results for '{q}':\n\n{}", results.join("\n\n")))
+        Ok(format!("Results for '{q}':\n{}", results.join("\n")))
     }
 }
 
-/// Runs a shell command through the AntiSabotage Guard.
-pub fn tool_run_command<F>(cmd: &str, confirm_fn: F) -> Result<String, String>
-where
-    F: FnOnce(&str) -> bool,
-{
-    match guard::check_command(cmd) {
-        GuardDecision::Block(reason) => Err(format!("[Blocked by Security Guard: {reason}]")),
-        GuardDecision::NeedConfirmation(reason) => {
-            if confirm_fn(&format!("{reason} (command: '{cmd}')")) {
-                let (out, code) = guard::run_sandboxed(cmd, Duration::from_secs(30))
-                    .map_err(|e| format!("Failed to execute command: {e}"))?;
-                Ok(format!("Exit code: {code}\nOutput:\n{out}"))
-            } else {
-                Err("[Aborted by user confirmation]".into())
+/// DuckDuckGo wraps result links as `//duckduckgo.com/l/?uddg=<encoded url>&...`.
+fn decode_ddg_link(h: &str) -> String {
+    let Some(i) = h.find("uddg=") else { return h.to_string() };
+    let enc = &h[i + 5..];
+    let enc = &enc[..enc.find('&').unwrap_or(enc.len())];
+    let mut out = Vec::new();
+    let b = enc.as_bytes();
+    let mut j = 0;
+    while j < b.len() {
+        if b[j] == b'%' && j + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&enc[j + 1..j + 3], 16) {
+                out.push(v);
+                j += 3;
+                continue;
             }
         }
-        GuardDecision::Allow => {
-            let (out, code) = guard::run_sandboxed(cmd, Duration::from_secs(30))
-                .map_err(|e| format!("Failed to execute command: {e}"))?;
-            Ok(format!("Exit code: {code}\nOutput:\n{out}"))
-        }
+        out.push(b[j]);
+        j += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn fetch_url(url: &str) -> Result<String, String> {
+    let u = url.trim();
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return Err("url must start with http:// or https://".into());
+    }
+    let html = curl(u, 15)?;
+    let text = html_to_text(&html);
+    if text.trim().is_empty() {
+        return Err("the page had no readable text".into());
+    }
+    Ok(text)
+}
+
+/// Visible text of an HTML page: drops script/style/head, tags and blank runs.
+fn html_to_text(html: &str) -> String {
+    let lower = html.to_lowercase();
+    let mut keep = String::with_capacity(html.len() / 2);
+    let mut i = 0;
+    while i < html.len() {
+        let mut skipped = false;
+        for tag in ["script", "style", "head", "noscript", "svg"] {
+            if lower[i..].starts_with(&format!("<{tag}")) {
+                if let Some(end) = lower[i..].find(&format!("</{tag}>")) {
+                    i += end + tag.len() + 3;
+                    skipped = true;
+                    break;
+                }
+            }
+        }
+        if skipped {
+            continue;
+        }
+        let ch = html[i..].chars().next().unwrap();
+        if matches!(lower[i..].get(..4), Some("<br>") | Some("<br/") | Some("</p>") | Some("<li>")) || lower[i..].starts_with("</div") || lower[i..].starts_with("</h") {
+            keep.push('\n');
+        }
+        keep.push(ch);
+        i += ch.len_utf8();
+    }
+    let text = strip_html(&keep);
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in text.lines() {
+        let l = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if l.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push_str(&l);
+        out.push('\n');
+    }
+    out
 }
 
 fn strip_html(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;
     for ch in input.chars() {
-        if ch == '<' {
-            in_tag = true;
-        } else if ch == '>' {
-            in_tag = false;
-        } else if !in_tag {
-            out.push(ch);
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
         }
     }
     out.replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&#x27;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
 }
 
-/// Scans source files across a directory recursively for symbols matching `pattern`.
+// ------------------------------------------------------------------- symbol search
+
+/// Scans source files for declarations (fn/struct/class/...) whose line contains `pattern`.
 pub fn tool_search_symbols(pattern: &str, path_opt: Option<&str>, symbol_type: Option<&str>) -> Result<String, String> {
     let p = path_opt.unwrap_or(".").trim();
-    let root = if p.is_empty() { Path::new(".") } else { Path::new(p) };
+    let root = Path::new(if p.is_empty() { "." } else { p });
     if !root.exists() {
-        return Err(format!("Path '{}' does not exist.", root.display()));
+        return Err(format!("path '{}' does not exist", root.display()));
     }
-    if let GuardDecision::Block(r) = guard::check_path(p, false) {
-        return Err(format!("[Blocked by Security Guard: {r}]"));
-    }
-
-    let pat_lower = pattern.to_lowercase();
-    let type_filter = symbol_type.map(|t| t.trim().to_lowercase());
-
+    let pat = pattern.to_lowercase();
+    let tf = symbol_type.map(|t| t.trim().to_lowercase());
     let mut matches = Vec::new();
-    let mut files_scanned = 0;
-    scan_symbols_recursive(root, &pat_lower, type_filter.as_deref(), &mut matches, &mut files_scanned, 50)?;
-
-    if matches.is_empty() {
-        Ok(format!("No symbols matching '{pattern}' found across {files_scanned} source file(s)."))
-    } else {
-        let mut out = format!("Found {} symbol match(es) across {} source file(s) scanned:\n\n", matches.len(), files_scanned);
-        for m in matches {
-            out.push_str(&format!("  {}\n", m));
-        }
-        Ok(out)
-    }
-}
-
-fn scan_symbols_recursive(
-    dir: &Path,
-    pattern_lower: &str,
-    type_filter: Option<&str>,
-    matches: &mut Vec<String>,
-    files_scanned: &mut usize,
-    max_matches: usize,
-) -> Result<(), String> {
-    if matches.len() >= max_matches {
-        return Ok(());
-    }
-    if dir.is_file() {
-        scan_single_file_symbols(dir, pattern_lower, type_filter, matches, files_scanned, max_matches)?;
-        return Ok(());
-    }
-    let entries = fs::read_dir(dir).map_err(|e| format!("Could not read directory '{}': {e}", dir.display()))?;
-    for entry in entries.flatten() {
-        if matches.len() >= max_matches {
-            break;
-        }
-        let p = entry.path();
-        let fname = entry.file_name().to_string_lossy().to_string();
-        if p.is_dir() {
-            if matches!(fname.as_str(), ".git" | "target" | "node_modules" | ".vscode" | "dist" | "build" | "venv" | ".venv" | ".cargo" | "vendor") {
-                continue;
-            }
-            let _ = scan_symbols_recursive(&p, pattern_lower, type_filter, matches, files_scanned, max_matches);
-        } else {
-            let _ = scan_single_file_symbols(&p, pattern_lower, type_filter, matches, files_scanned, max_matches);
-        }
-    }
-    Ok(())
-}
-
-fn scan_single_file_symbols(
-    p: &Path,
-    pattern_lower: &str,
-    type_filter: Option<&str>,
-    matches: &mut Vec<String>,
-    files_scanned: &mut usize,
-    max_matches: usize,
-) -> Result<(), String> {
-    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let is_source = matches!(ext, "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "go" | "c" | "cpp" | "h" | "hpp" | "toml");
-    if !is_source {
-        return Ok(());
-    }
-    *files_scanned += 1;
-    let Ok(content) = fs::read_to_string(p) else {
-        return Ok(());
-    };
-
-    let p_display = p.to_string_lossy().replace('\\', "/");
-    for (idx, line) in content.lines().enumerate() {
-        if matches.len() >= max_matches {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
+    let mut scanned = 0;
+    for f in walk_files(root, 20_000) {
+        let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "go" | "c" | "cpp" | "h" | "hpp") {
             continue;
         }
-        if is_decl_line(trimmed, ext) {
-            let line_lower = trimmed.to_lowercase();
-            if line_lower.contains(pattern_lower) {
-                if let Some(tf) = type_filter {
-                    if !line_lower.contains(tf) {
-                        continue;
+        scanned += 1;
+        let Ok(content) = fs::read_to_string(&f) else { continue };
+        for (i, line) in content.lines().enumerate() {
+            let t = line.trim();
+            if is_decl_line(t, ext) {
+                let low = t.to_lowercase();
+                if low.contains(&pat) && tf.as_ref().is_none_or(|tf| low.contains(tf.as_str())) {
+                    matches.push(format!("{}:{}: {t}", display_path(&f), i + 1));
+                    if matches.len() >= 50 {
+                        break;
                     }
                 }
-                matches.push(format!("{}:{}: {}", p_display, idx + 1, trimmed));
             }
         }
     }
-    Ok(())
+    if matches.is_empty() {
+        Ok(format!("No symbols matching '{pattern}' in {scanned} source file(s)."))
+    } else {
+        Ok(format!("{} match(es) in {scanned} file(s):\n{}", matches.len(), matches.join("\n")))
+    }
 }
 
 fn is_decl_line(line: &str, ext: &str) -> bool {
+    let starts = |ps: &[&str]| ps.iter().any(|p| line.starts_with(p));
     match ext {
-        "rs" => {
-            line.starts_with("pub fn ") || line.starts_with("fn ") ||
-            line.starts_with("pub async fn ") || line.starts_with("async fn ") ||
-            line.starts_with("pub struct ") || line.starts_with("struct ") ||
-            line.starts_with("pub enum ") || line.starts_with("enum ") ||
-            line.starts_with("pub trait ") || line.starts_with("trait ") ||
-            line.starts_with("impl ") || line.starts_with("pub type ") ||
-            line.starts_with("type ") || line.starts_with("pub const ") ||
-            line.starts_with("const ")
-        }
-        "py" => {
-            line.starts_with("def ") || line.starts_with("async def ") || line.starts_with("class ")
-        }
-        "js" | "ts" | "jsx" | "tsx" => {
-            line.starts_with("function ") || line.starts_with("export function ") ||
-            line.starts_with("class ") || line.starts_with("export class ") ||
-            line.starts_with("interface ") || line.starts_with("export interface ") ||
-            line.starts_with("type ") || line.starts_with("export type ") ||
-            line.starts_with("const ") || line.starts_with("export const ")
-        }
-        "go" => {
-            line.starts_with("func ") || line.starts_with("type ")
-        }
-        "c" | "cpp" | "h" | "hpp" => {
-            line.contains('(') && (line.starts_with("void ") || line.starts_with("int ") || line.starts_with("bool ") || line.starts_with("class ") || line.starts_with("struct "))
-        }
-        _ => line.contains("fn ") || line.contains("struct ") || line.contains("class "),
+        "rs" => starts(&["pub fn ", "fn ", "pub async fn ", "async fn ", "pub(crate) fn ", "pub struct ", "struct ", "pub enum ", "enum ", "pub trait ", "trait ", "impl ", "pub type ", "type ", "pub const ", "const ", "pub(crate) struct ", "pub unsafe fn ", "unsafe fn "]),
+        "py" => starts(&["def ", "async def ", "class "]),
+        "js" | "ts" | "jsx" | "tsx" => starts(&["function ", "export function ", "class ", "export class ", "interface ", "export interface ", "type ", "export type ", "const ", "export const ", "export default "]),
+        "go" => starts(&["func ", "type "]),
+        _ => line.contains('(') && starts(&["void ", "int ", "bool ", "class ", "struct ", "static ", "char ", "float ", "double "]),
     }
-}
-
-/// Parses `<tool_call> ... </tool_call>` payload from the model's generated text.
-/// Tolerates whitespace variations, single quotes, markdown fences, and missing closing tags.
-pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
-    let lower = text.to_lowercase();
-    let body = if let Some(s) = lower.find("<tool_call").or_else(|| lower.find("<toolcall")).or_else(|| lower.find("<tool-call")) {
-        let after_tag_start = &text[s..];
-        let tag_close = after_tag_start.find('>')?;
-        let payload_start = s + tag_close + 1;
-        let payload_slice = &text[payload_start..];
-        let lower_slice = &lower[payload_start..];
-        if let Some(e) = lower_slice.find("</tool_call").or_else(|| lower_slice.find("</toolcall")).or_else(|| lower_slice.find("</tool-call")).or_else(|| lower_slice.find("```")) {
-            &payload_slice[..e]
-        } else if let Some(open_brace) = payload_slice.find('{') {
-            extract_balanced_json(&payload_slice[open_brace..])?
-        } else {
-            payload_slice
-        }
-    } else if let Some(open_brace) = text.find('{') {
-        let candidate = extract_balanced_json(&text[open_brace..])?;
-        if candidate.contains("\"name\"") || candidate.contains("'name'") {
-            candidate
-        } else {
-            return None;
-        }
-    } else {
-        return None;
-    };
-
-    let body = body.trim();
-    let name = extract_json_string(body, "name")?;
-    let path = extract_json_string(body, "path");
-    let content = extract_json_string(body, "content");
-    let target = extract_json_string(body, "target");
-    let replacement = extract_json_string(body, "replacement");
-    let command = extract_json_string(body, "command");
-    let query = extract_json_string(body, "query");
-    let pattern = extract_json_string(body, "pattern");
-    let symbol_type = extract_json_string(body, "symbol_type");
-    let start_line = extract_json_number(body, "start_line");
-    let limit = extract_json_number(body, "limit");
-
-    Some(ToolCall {
-        name,
-        path,
-        content,
-        target,
-        replacement,
-        command,
-        query,
-        pattern,
-        symbol_type,
-        start_line,
-        limit,
-    })
-}
-
-fn extract_balanced_json(s: &str) -> Option<&str> {
-    let mut depth = 0;
-    let mut in_quote = false;
-    let mut quote_char = '"';
-    let mut escape = false;
-    let mut end_idx = None;
-
-    for (i, c) in s.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' {
-            escape = true;
-            continue;
-        }
-        if c == '"' || c == '\'' {
-            if !in_quote {
-                in_quote = true;
-                quote_char = c;
-            } else if c == quote_char {
-                in_quote = false;
-            }
-            continue;
-        }
-        if !in_quote {
-            if c == '{' {
-                depth += 1;
-            } else if c == '}' {
-                depth -= 1;
-                if depth == 0 {
-                    end_idx = Some(i + 1);
-                    break;
-                }
-            }
-        }
-    }
-    end_idx.map(|idx| &s[..idx])
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pat_double = format!("\"{key}\"");
-    let pat_single = format!("'{key}'");
-    let idx = json.find(&pat_double).or_else(|| json.find(&pat_single))?;
-    let key_len = if json[idx..].starts_with(&pat_double) { pat_double.len() } else { pat_single.len() };
-    let after = &json[idx + key_len..];
-    let colon = after.find(':')?;
-    let val_part = after[colon + 1..].trim_start();
-    let quote = val_part.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let mut out = String::new();
-    let mut chars = val_part[quote.len_utf8()..].chars();
-    let mut escape = false;
-
-    while let Some(ch) = chars.next() {
-        if escape {
-            match ch {
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                '\\' => out.push('\\'),
-                '"' => out.push('"'),
-                '\'' => out.push('\''),
-                other => out.push(other),
-            }
-            escape = false;
-        } else if ch == '\\' {
-            escape = true;
-        } else if ch == quote {
-            return Some(out);
-        } else {
-            out.push(ch);
-        }
-    }
-    None
-}
-
-fn extract_json_number(json: &str, key: &str) -> Option<usize> {
-    let pat_double = format!("\"{key}\"");
-    let pat_single = format!("'{key}'");
-    let idx = json.find(&pat_double).or_else(|| json.find(&pat_single))?;
-    let key_len = if json[idx..].starts_with(&pat_double) { pat_double.len() } else { pat_single.len() };
-    let after = &json[idx + key_len..];
-    let colon = after.find(':')?;
-    let val_part = after[colon + 1..].trim_start();
-    let num_str: String = val_part.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num_str.parse().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_tool_call() {
-        let text = r#"
-I will now read the file.
-<tool_call>
-{"name": "read_file", "arguments": {"path": "src/main.rs", "start_line": 10, "limit": 20}}
-</tool_call>
-"#;
-        let call = parse_tool_call(text).expect("parsed call");
-        assert_eq!(call.name, "read_file");
-        assert_eq!(call.path.as_deref(), Some("src/main.rs"));
-        assert_eq!(call.start_line, Some(10));
-        assert_eq!(call.limit, Some(20));
+    fn ctx_yes() -> impl FnMut(&str) -> bool {
+        |_| true
     }
 
     #[test]
-    fn test_file_tools_roundtrip() {
-        let test_path = "target/test_dummy_file.txt";
-        let content = "Hello Spindle!\nLine 2\nLine 3";
-        let res = tool_write_file(test_path, content);
-        assert!(res.is_ok(), "write file failed: {:?}", res);
-
-        let read_res = tool_read_file(test_path, None, None);
-        assert!(read_res.is_ok());
-        assert!(read_res.unwrap().contains("Hello Spindle!"));
-
-        let edit_res = tool_edit_file(test_path, "Line 2", "Modified Line 2");
-        assert!(edit_res.is_ok());
-
-        let read_res2 = tool_read_file(test_path, None, None).unwrap();
-        assert!(read_res2.contains("Modified Line 2"));
-
-        let _ = fs::remove_file(test_path);
+    fn parses_qwen_tool_calls_and_strips_them() {
+        let text = "I'll look first.\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"src/main.rs\", \"offset\": 10, \"limit\": 20}}\n</tool_call>\n<tool_call>\n{\"name\": \"grep\", \"arguments\": {\"pattern\": \"fn main\"}}\n</tool_call>";
+        let (calls, visible) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].str_arg(&["path"]), Some("src/main.rs"));
+        assert_eq!(calls[0].num_arg(&["offset"]), Some(10));
+        assert_eq!(calls[1].str_arg(&["pattern"]), Some("fn main"));
+        assert_eq!(visible, "I'll look first.");
     }
 
     #[test]
-    fn test_undo_functionality() {
-        let test_path = "target/test_undo_file.txt";
-        let _ = fs::remove_file(test_path);
-
-        // 1. Initial write
-        tool_write_file(test_path, "Version 1").unwrap();
-        // 2. Edit
-        tool_edit_file(test_path, "Version 1", "Version 2").unwrap();
-        assert_eq!(fs::read_to_string(test_path).unwrap(), "Version 2");
-
-        // 3. Undo edit
-        let undo1 = pop_undo_path(test_path).expect("has undo");
-        assert!(undo1.is_ok());
-        assert_eq!(fs::read_to_string(test_path).unwrap(), "Version 1");
-
-        // 4. Undo initial creation
-        let undo2 = pop_undo_path(test_path).expect("has undo");
-        assert!(undo2.is_ok());
-        assert!(!Path::new(test_path).exists());
+    fn tolerates_model_slips() {
+        // Missing closing tag, single quotes, args as a JSON string, flat form, code fence.
+        let c = parse_tool_call("<tool_call>{'name': 'delete_file', 'arguments': {'path': 'a.py'}}").unwrap();
+        assert_eq!((c.name.as_str(), c.str_arg(&["path"])), ("delete_file", Some("a.py")));
+        let c = parse_tool_call("<tool_call>{\"name\":\"list_dir\",\"arguments\":\"{\\\"path\\\": \\\"src\\\"}\"}</tool_call>").unwrap();
+        assert_eq!(c.str_arg(&["path"]), Some("src"));
+        let c = parse_tool_call("```json\n<tool_call>\n{\"name\": \"list_dir\", \"path\": \".\"}\n</tool_call>\n```").unwrap();
+        assert_eq!(c.str_arg(&["path"]), Some("."));
+        // Content containing ``` and quotes must survive intact (the old parser cut it).
+        let c = parse_tool_call("<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"R.md\",\"content\":\"# T\\n```sh\\necho \\\"hi\\\"\\n```\\n\"}}</tool_call>").unwrap();
+        assert_eq!(c.str_arg(&["content"]), Some("# T\n```sh\necho \"hi\"\n```\n"));
+        // Bare call without tags is accepted only for known tools.
+        assert!(parse_tool_call("{\"name\": \"grep\", \"arguments\": {\"pattern\": \"x\"}}").is_some());
+        assert!(parse_tool_call("{\"name\": \"Alice\", \"age\": 3}").is_none());
     }
 
     #[test]
-    fn test_search_symbols_tool() {
-        let res = tool_search_symbols("SmolLm2Engine", Some("src"), Some("struct")).expect("search succeeds");
-        assert!(res.contains("smollm_chat.rs"), "Expected result to contain smollm_chat.rs, got:\n{}", res);
-        assert!(res.contains("pub struct SmolLm2Engine"), "Expected result to contain struct SmolLm2Engine, got:\n{}", res);
-
-        let res_call = parse_tool_call(r#"
-<tool_call>
-{"name": "search_symbols", "arguments": {"pattern": "tool_read_file", "symbol_type": "fn"}}
-</tool_call>
-"#).expect("parsed search_symbols call");
-        assert_eq!(res_call.name, "search_symbols");
-        assert_eq!(res_call.pattern.as_deref(), Some("tool_read_file"));
-        assert_eq!(res_call.symbol_type.as_deref(), Some("fn"));
+    fn file_tools_roundtrip_with_unique_edit_and_crlf() {
+        let p = "target/test_tools_roundtrip.txt";
+        let mut yes = ctx_yes();
+        let mut ctx = ToolCtx { confirm: &mut yes, max_chars: 8000 };
+        let w = execute(&ToolCall { name: "write_file".into(), args: json::parse(&format!("{{\"path\":\"{p}\",\"content\":\"a\\r\\nb\\r\\nb\\r\\n\"}}")).unwrap() }, &mut ctx);
+        assert!(w.ok, "{}", w.output);
+        // `\n` from the model matches the file's CRLF; ambiguous match is refused.
+        let e = execute(&ToolCall { name: "edit_file".into(), args: json::parse(&format!("{{\"path\":\"{p}\",\"old_string\":\"b\",\"new_string\":\"c\"}}")).unwrap() }, &mut ctx);
+        assert!(!e.ok && e.output.contains("2 times"), "{}", e.output);
+        let e = execute(&ToolCall { name: "edit_file".into(), args: json::parse(&format!("{{\"path\":\"{p}\",\"old_string\":\"a\\nb\",\"new_string\":\"x\\ny\"}}")).unwrap() }, &mut ctx);
+        assert!(e.ok, "{}", e.output);
+        assert_eq!(fs::read_to_string(p).unwrap(), "x\r\ny\r\nb\r\n");
+        let r = execute(&ToolCall { name: "read_file".into(), args: json::parse(&format!("{{\"path\":\"{p}\"}}")).unwrap() }, &mut ctx);
+        assert!(r.output.contains("    1\tx") && r.output.contains("    3\tb"), "{}", r.output);
+        // Undo both edits back to nothing.
+        pop_undo_path(p).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "a\r\nb\r\nb\r\n");
+        pop_undo_path(p).unwrap().unwrap();
+        assert!(!Path::new(p).exists());
     }
 
     #[test]
-    fn test_delete_file_tool() {
-        let test_path = "target/test_delete_me.txt";
-        tool_write_file(test_path, "temporary content").unwrap();
-        assert!(Path::new(test_path).exists());
-
-        let del_res = tool_delete_file(test_path);
-        assert!(del_res.is_ok());
-        assert!(!Path::new(test_path).exists());
-
-        // Test that undo can restore the deleted file
-        let undo = pop_undo_path(test_path).expect("has undo");
-        assert!(undo.is_ok());
-        assert!(Path::new(test_path).exists());
-        assert_eq!(fs::read_to_string(test_path).unwrap(), "temporary content");
-
-        let _ = fs::remove_file(test_path);
+    fn delete_requires_confirmation() {
+        let p = "target/test_tools_delete.txt";
+        fs::write(p, "keep me").unwrap();
+        let mut no = |_: &str| false;
+        let mut ctx = ToolCtx { confirm: &mut no, max_chars: 8000 };
+        let d = execute(&ToolCall { name: "delete_file".into(), args: json::parse(&format!("{{\"path\":\"{p}\"}}")).unwrap() }, &mut ctx);
+        assert!(!d.ok && Path::new(p).exists());
+        let mut yes = ctx_yes();
+        let mut ctx = ToolCtx { confirm: &mut yes, max_chars: 8000 };
+        let d = execute(&ToolCall { name: "delete_file".into(), args: json::parse(&format!("{{\"path\":\"{p}\"}}")).unwrap() }, &mut ctx);
+        assert!(d.ok && !Path::new(p).exists());
+        pop_undo_path(p).unwrap().unwrap();
+        assert_eq!(fs::read_to_string(p).unwrap(), "keep me");
+        let _ = fs::remove_file(p);
     }
 
     #[test]
-    fn test_robust_parse_tool_call_variations() {
-        // Variation 1: Extra whitespace in opening tag and closing tag
-        let v1 = "<tool_call >\n{\"name\": \"delete_file\", \"arguments\": {\"path\": \"hello.py\"}}\n</tool_call >";
-        let c1 = parse_tool_call(v1).expect("v1 parsed");
-        assert_eq!(c1.name, "delete_file");
-        assert_eq!(c1.path.as_deref(), Some("hello.py"));
+    fn glob_and_grep_search_the_tree() {
+        assert!(glob_match("*.rs", "src/tools.rs"));
+        assert!(glob_match("src/**/*.rs", "src/a/b/c.rs"));
+        assert!(glob_match("src/**/*.rs", "src/c.rs"));
+        assert!(!glob_match("src/*.rs", "src/a/c.rs"));
+        let mut yes = ctx_yes();
+        let mut ctx = ToolCtx { confirm: &mut yes, max_chars: 8000 };
+        let g = execute(&ToolCall { name: "glob".into(), args: json::parse(r#"{"pattern":"src/*.rs"}"#).unwrap() }, &mut ctx);
+        assert!(g.output.contains("src/tools.rs"), "{}", g.output);
+        let g = execute(&ToolCall { name: "grep".into(), args: json::parse(r#"{"pattern":"fn glob_match","path":"src","include":"*.rs"}"#).unwrap() }, &mut ctx);
+        assert!(g.ok && g.output.contains("src/tools.rs:"), "{}", g.output);
+        assert!(g.title.contains("match"));
+    }
 
-        // Variation 2: Missing closing tag (model stopped at EOS)
-        let v2 = "<tool_call>\n{\"name\": \"delete_file\", \"arguments\": {\"path\": \"hello.py\"}}";
-        let c2 = parse_tool_call(v2).expect("v2 parsed without closing tag");
-        assert_eq!(c2.name, "delete_file");
-        assert_eq!(c2.path.as_deref(), Some("hello.py"));
+    #[test]
+    fn symbol_search_finds_declarations() {
+        let res = tool_search_symbols("SmolLm2Engine", Some("src"), Some("struct")).unwrap();
+        assert!(res.contains("pub struct SmolLm2Engine"), "{res}");
+    }
 
-        // Variation 3: Single quotes
-        let v3 = "<tool_call>{'name': 'delete_file', 'arguments': {'path': 'hello.py'}}</tool_call>";
-        let c3 = parse_tool_call(v3).expect("v3 parsed with single quotes");
-        assert_eq!(c3.name, "delete_file");
-        assert_eq!(c3.path.as_deref(), Some("hello.py"));
+    #[test]
+    fn streaming_filter_hides_spelled_out_tags() {
+        let mut f = ToolMarkupFilter::default();
+        let pieces = ["Reading", " now.\n", "<", "tool", "_call", ">\n{\"name\": ", "\"read_file\"}", "\n</", "tool_call", ">", " Done", " <b>"];
+        let shown: String = pieces.iter().map(|p| f.push(p)).collect();
+        assert_eq!(shown, "Reading now.\n Done <b>");
+        assert_eq!(partial_tag_suffix("abc <tool", "<tool_call>"), 5);
+        assert_eq!(partial_tag_suffix("x <", "<tool_call>"), 1);
+        assert_eq!(partial_tag_suffix("x", "<tool_call>"), 0);
+    }
 
-        // Variation 4: Markdown codeblock wrapped
-        let v4 = "```json\n<tool_call>\n{\"name\": \"list_dir\", \"path\": \".\"}\n</tool_call>\n```";
-        let c4 = parse_tool_call(v4).expect("v4 parsed with markdown fences");
-        assert_eq!(c4.name, "list_dir");
-        assert_eq!(c4.path.as_deref(), Some("."));
+    #[test]
+    fn truncation_is_char_safe() {
+        let s = "ñ".repeat(5000);
+        let t = truncate_middle(&s, 1001);
+        assert!(t.len() < 1200 && t.contains("omitted"));
+    }
+
+    #[test]
+    fn tools_prompt_is_valid_json_per_line() {
+        let p = tools_system_prompt();
+        let body = &p[p.find("<tools>\n").unwrap() + 8..p.rfind("</tools>").unwrap()];
+        for line in body.lines() {
+            let v = json::parse(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+            assert!(v.get("function").and_then(|f| f.get("name")).is_some());
+        }
     }
 }
-

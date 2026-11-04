@@ -43,6 +43,7 @@ struct Render {
     wrote: bool,
     think_start: Option<std::time::Instant>,
     line_has_prefix: bool,
+    tool_filter: crate::tools::ToolMarkupFilter,
 }
 
 impl Render {
@@ -54,11 +55,18 @@ impl Render {
             wrote: false,
             think_start: None,
             line_has_prefix: false,
+            tool_filter: Default::default(),
         }
     }
 
     fn push(&mut self, piece: &str) {
         let mut out = std::io::stdout();
+        // Tool calls are shown as tool rows by the agent loop, not as raw JSON.
+        let filtered = self.tool_filter.push(piece);
+        let piece = filtered.as_str();
+        if piece.is_empty() {
+            return;
+        }
         if piece.contains("<think>") {
             self.in_think = true;
             self.think_start = Some(std::time::Instant::now());
@@ -120,6 +128,17 @@ impl Render {
             let _ = write!(out, "{text}");
         }
         let _ = out.flush();
+    }
+}
+
+/// What a `moe_prune` value does, in words (integer = expert count, fraction = mass cut).
+pub fn describe_prune(p: f32) -> String {
+    if p <= 0.0 {
+        "MoE pruning off: every routed expert runs".to_string()
+    } else if p >= 1.0 {
+        format!("MoE pruning: top {} experts per token (never below half of the routed experts)", p as usize)
+    } else {
+        format!("MoE pruning: keep experts covering {:.0}% of router probability (never below half)", (1.0 - p) * 100.0)
     }
 }
 
@@ -255,114 +274,53 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
     };
 
     let reply = |engine: &mut SmolLm2Engine, text: &str, allow_think: bool, show_think: bool, detailed: bool, max: usize| {
-        let mut current_input = text.to_string();
-        let mut steps = 0;
-        let mut last_call_sig = None;
-        const MAX_STEPS: usize = 5;
-
-        loop {
-            let mut r = Render::new(show_think);
-            let (out_text, secs, tokens) = unsafe { engine.generate_reply(&current_input, max, allow_think, &mut |p| r.push(p)) };
-            if r.wrote {
-                println!();
-            } else {
-                println!("{}", dim("(no answer)"));
-            }
-            println!("{}", dim(&format!("  [*] {}", stats_line(secs, tokens, engine, governor, detailed))));
-
-            // Check if model emitted a tool call
-            if engine.enable_tools && steps < MAX_STEPS {
-                if let Some(call) = crate::tools::parse_tool_call(&out_text) {
-                    let call_sig = format!("{}:{:?}:{:?}", call.name, call.path, call.command);
-                    if last_call_sig.as_ref() == Some(&call_sig) {
-                        println!("\n{}", dim("┌ Tool Call ────────────────────────────────────────────────────────"));
-                        println!("{}  {} {} (duplicate query skipped, completing turn)", dim("│"), bold("Action:"), accent(&call.name));
-                        println!("{}\n", dim("└ Result: Done"));
-                        current_input = "<tool_response>\nAction already completed. Please provide your final answer to the user.\n</tool_response>".to_string();
-                        steps += 1;
-                        continue;
+        let mut r = Render::new(show_think);
+        let opts = crate::agent::AgentOpts { max_tokens: max, allow_think, ..Default::default() };
+        let mut confirm = |what: &str| -> bool {
+            print!("\n{}  {} {what} [y/N]: ", dim("│"), crate::ui::bold_magenta("Permission:"));
+            let _ = std::io::stdout().flush();
+            let mut resp = String::new();
+            let _ = std::io::stdin().read_line(&mut resp);
+            matches!(resp.trim().to_lowercase().as_str(), "y" | "yes")
+        };
+        let stats = crate::agent::run_turn(
+            engine,
+            text,
+            opts,
+            None,
+            &mut |ev| match ev {
+                crate::agent::AgentEvent::Token(p) => r.push(&p),
+                crate::agent::AgentEvent::ReplyDone { .. } => {
+                    if r.wrote {
+                        println!();
                     }
-                    last_call_sig = Some(call_sig);
-
-                    steps += 1;
-                    println!("\n{}", dim("┌ Tool Call ────────────────────────────────────────────────────────"));
-                    println!("{}  {} {}", dim("│"), bold("Action:"), accent(&call.name));
-
-                    let confirm_prompt = |action_desc: &str| -> bool {
-                        print!("{}  {} {} [Y/n]: ", dim("│"), crate::ui::bold_magenta("Security Guard:"), action_desc);
-                        let _ = std::io::stdout().flush();
-                        let mut resp = String::new();
-                        let _ = std::io::stdin().read_line(&mut resp);
-                        let trimmed = resp.trim().to_lowercase();
-                        trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
-                    };
-
-                    let tool_result = match call.name.as_str() {
-                        "read_file" => {
-                            let p = call.path.as_deref().unwrap_or("");
-                            println!("{}  reading: {p}", dim("│"));
-                            crate::tools::tool_read_file(p, call.start_line, call.limit)
-                        }
-                        "write_file" => {
-                            let p = call.path.as_deref().unwrap_or("");
-                            let c = call.content.as_deref().unwrap_or("");
-                            println!("{}  writing: {p} ({} bytes)", dim("│"), c.len());
-                            crate::tools::tool_write_file(p, c)
-                        }
-                        "edit_file" => {
-                            let p = call.path.as_deref().unwrap_or("");
-                            let t = call.target.as_deref().unwrap_or("");
-                            let r = call.replacement.as_deref().unwrap_or("");
-                            println!("{}  editing: {p}", dim("│"));
-                            crate::tools::tool_edit_file(p, t, r)
-                        }
-                        "delete_file" => {
-                            let p = call.path.as_deref().unwrap_or("");
-                            println!("{}  deleting: {p}", dim("│"));
-                            crate::tools::tool_delete_file(p)
-                        }
-                        "list_dir" => {
-                            let p = call.path.as_deref().unwrap_or(".");
-                            println!("{}  listing directory: {p}", dim("│"));
-                            crate::tools::tool_list_dir(p)
-                        }
-                        "run_command" => {
-                            let cmd = call.command.as_deref().unwrap_or("");
-                            println!("{}  executing: {cmd}", dim("│"));
-                            crate::tools::tool_run_command(cmd, confirm_prompt)
-                        }
-                        "search_web" => {
-                            let q = call.query.as_deref().unwrap_or("");
-                            println!("{}  searching web: {q}", dim("│"));
-                            crate::tools::tool_search_web(q)
-                        }
-                        "search_symbols" => {
-                            let pat = call.pattern.as_deref().unwrap_or(call.query.as_deref().unwrap_or(""));
-                            let p = call.path.as_deref();
-                            let st = call.symbol_type.as_deref();
-                            println!("{}  searching symbols: '{pat}' (type: {:?})", dim("│"), st);
-                            crate::tools::tool_search_symbols(pat, p, st)
-                        }
-                        other => Err(format!("Unknown tool: '{other}'")),
-                    };
-
-                    match tool_result {
-                        Ok(res) => {
-                            println!("{}\n", dim("└ Result: Success"));
-                            current_input = format!("<tool_response>\n{}\n</tool_response>", res);
-                            continue;
-                        }
-                        Err(err) => {
-                            println!("{}  Error: {err}", dim("│"));
-                            println!("{}\n", dim("└ Result: Error returned to model"));
-                            current_input = format!("<tool_response>\nError: {}\n</tool_response>", err);
-                            continue;
+                    r = Render::new(show_think);
+                }
+                crate::agent::AgentEvent::ToolStart { icon, title } => {
+                    print!("  {} {}", dim(icon), dim(&title));
+                    let _ = std::io::stdout().flush();
+                }
+                crate::agent::AgentEvent::ToolEnd(o) => {
+                    if o.ok {
+                        println!("  {}", green("ok"));
+                    } else {
+                        let first = o.output.lines().next().unwrap_or("").trim_start_matches("Error: ");
+                        println!("  {}", crate::ui::bold_magenta(first));
+                    }
+                    if let Some(p) = &o.preview {
+                        for l in p.lines().take(12) {
+                            println!("    {}", dim(l));
                         }
                     }
                 }
-            }
-            break;
+            },
+            &mut confirm,
+        );
+        let mut line = stats_line(stats.gen_secs.max(1e-3), stats.tokens, engine, governor, detailed);
+        if stats.tool_calls > 0 {
+            line.push_str(&format!(" · {} tool call(s)", stats.tool_calls));
         }
+        println!("{}", dim(&format!("  [*] {line}")));
     };
 
     if engine.n_keep == 0 {
@@ -395,9 +353,16 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
         }
         // PowerShell pipes may prepend a UTF-8 BOM to the first line.
         let input = line.trim_start_matches('\u{feff}').trim();
-        match input.to_ascii_lowercase().as_str() {
+        // Only the command word is case-insensitive; arguments (system prompts, git args,
+        // branch names, test commands) keep the case the user typed.
+        let cmd_norm = match input.split_once(char::is_whitespace) {
+            Some((head, rest)) if head.starts_with('/') => format!("{} {}", head.to_ascii_lowercase(), rest.trim()),
+            _ if input.starts_with('/') => input.to_ascii_lowercase(),
+            _ => input.to_string(),
+        };
+        match cmd_norm.as_str() {
             "" => continue,
-            "exit" | "quit" | "/exit" | "/quit" => break,
+            "exit" | "quit" | "/exit" | "/quit" | "/q" => break,
             "/help" | "/?" => println!("{}", dim(HELP)),
             "/clear" | "/reset" => {
                 engine.reset_kv();
@@ -495,16 +460,13 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
             "/moe-prune" => {
                 let p = engine.moe_prune();
                 println!("{}  {:.3} ({})", bold("MoE Pruning Cutoff:"), p, if p > 0.0 { "active" } else { "disabled" });
-                println!("{}", dim("  use '/moe-prune <threshold>' (e.g. 0.03) or '0.0' to disable"));
+                println!("{}", dim(&format!("  {}", describe_prune(p))));
+                println!("{}", dim("  '/moe-prune 4' keeps the top 4 experts, '/moe-prune 0.1' keeps 90% of router mass, '0' disables"));
             }
             cmd if cmd.starts_with("/moe-prune ") => {
                 if let Ok(p) = cmd[11..].trim().parse::<f32>() {
                     engine.set_moe_prune(p);
-                    if p > 0.0 {
-                        println!("{}", dim(&format!("[*] Dynamic MoE pruning set to {:.3} ({:.1}% energy cutoff)", p, p * 100.0)));
-                    } else {
-                        println!("{}", dim("[*] Dynamic MoE pruning disabled (all 8 experts active)"));
-                    }
+                    println!("{}", dim(&format!("[*] {}", describe_prune(p))));
                 } else {
                     println!("{}", dim("usage: /moe-prune <threshold, e.g. 0.03>"));
                 }
@@ -575,7 +537,7 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
                             "Autonomous Self-Healing Loop (Attempt {attempt}/3):\n\
                             The command `{test_cmd}` failed with the following diagnostics:\n\n\
                             ```\n{snippet}\n```\n\n\
-                            Please inspect the code with `search_symbols` or `read_file`, and use `edit_file` to fix the error. Make only necessary, minimal surgical corrections."
+                            Inspect the code with `grep` and `read_file`, then fix the error with `edit_file`. Make only necessary, minimal surgical corrections."
                         );
 
                         reply(engine, &heal_prompt, allow_think, show_think, detailed, max_tokens);
@@ -646,11 +608,7 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
                         if trimmed.is_empty() {
                             println!("{} No uncommitted changes found to review.", bold_accent("[OK]"));
                         } else {
-                            let max_diff = if trimmed.len() > 8000 {
-                                &trimmed[..8000]
-                            } else {
-                                trimmed
-                            };
+                            let max_diff = crate::tools::truncate_middle(trimmed, 8000);
                             let review_prompt = format!(
                                 "Please provide a rigorous, concise code review of the following git diff. Analyze:\n\
                                 1. Correctness, bugs, and edge cases\n\
@@ -731,10 +689,12 @@ This repository uses Spindle as its local high-performance inference engine and 
                 println!("{}", dim("[*] Compacting conversation memory..."));
                 let prompt = "Please provide a concise 3-sentence summary of the key tasks, accomplishments, and decisions made in our conversation so far.";
                 let (summary, _, _) = unsafe { engine.generate_reply(prompt, 256, false, &mut |_| {}) };
+                // Re-seed a fresh context with the summary, in the model's own chat format.
+                let base = engine.system_prompt.clone();
+                engine.set_system_prompt(&format!("{base}\n\n# Summary of the conversation so far\n{}", summary.trim()));
                 engine.reset_kv();
-                unsafe {
-                    engine.feed_text(&format!("<|im_start|>system\nConversation summary:\n{summary}\n<|im_end|>\n"));
-                }
+                unsafe { engine.prefill_system(); }
+                engine.set_system_prompt(&base);
                 println!("{} Conversation compacted. KV-cache reset and context restored.", bold_accent("[OK]"));
             }
             "/think" | "/think toggle" => {

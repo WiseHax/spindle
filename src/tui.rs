@@ -1538,7 +1538,6 @@ fn execute_tui_turn(
             crate::pin_current_thread_to_pcore();
             let mut current_input = prompt.to_string();
             let mut steps = 0;
-            let mut last_call_sig = None;
             const MAX_STEPS: usize = 5;
 
             loop {
@@ -1579,77 +1578,25 @@ fn execute_tui_turn(
                     format!("{tok_per_sec:.1} tok/s · {tokens} tokens · {secs:.1} s{timing_str}")
                 };
 
-                // Check if model emitted an agentic tool call
+                // Tool calls go through the shared executor (`tools::execute`).
                 if engine_ref.enable_tools && steps < MAX_STEPS {
-                    if let Some(call) = crate::tools::parse_tool_call(&out_text) {
-                        let call_sig = format!("{}:{:?}:{:?}", call.name, call.path, call.command);
-                        if last_call_sig.as_ref() == Some(&call_sig) {
-                            let _ = tx.send(WorkerEvent::ToolStart(format!("Action: {} (duplicate skipped)", call.name)));
-                            current_input = "<tool_response>\nAction already completed. Please provide your final answer to the user.\n</tool_response>".to_string();
-                            steps += 1;
-                            continue;
-                        }
-                        last_call_sig = Some(call_sig);
+                    let (calls, _) = crate::tools::parse_tool_calls(&out_text);
+                    if !calls.is_empty() {
                         steps += 1;
-
-                        let action_summary = match (&call.path, &call.command) {
-                            (Some(p), _) => format!("Action: {} (path: {p})", call.name),
-                            (_, Some(c)) => format!("Action: {} (cmd: {c})", call.name),
-                            _ => format!("Action: {}", call.name),
-                        };
-                        let _ = tx.send(WorkerEvent::ToolStart(action_summary));
-
-                        let tool_result = match call.name.as_str() {
-                            "read_file" => {
-                                let p = call.path.as_deref().unwrap_or("");
-                                crate::tools::tool_read_file(p, call.start_line, call.limit)
-                            }
-                            "write_file" => {
-                                let p = call.path.as_deref().unwrap_or("");
-                                let c = call.content.as_deref().unwrap_or("");
-                                crate::tools::tool_write_file(p, c)
-                            }
-                            "edit_file" => {
-                                let p = call.path.as_deref().unwrap_or("");
-                                let t = call.target.as_deref().unwrap_or("");
-                                let r = call.replacement.as_deref().unwrap_or("");
-                                crate::tools::tool_edit_file(p, t, r)
-                            }
-                            "delete_file" => {
-                                let p = call.path.as_deref().unwrap_or("");
-                                crate::tools::tool_delete_file(p)
-                            }
-                            "list_dir" => {
-                                let p = call.path.as_deref().unwrap_or(".");
-                                crate::tools::tool_list_dir(p)
-                            }
-                            "run_command" => {
-                                let cmd = call.command.as_deref().unwrap_or("");
-                                crate::tools::tool_run_command(cmd, |_| true)
-                            }
-                            "search_web" => {
-                                let q = call.query.as_deref().unwrap_or("");
-                                crate::tools::tool_search_web(q)
-                            }
-                            "search_symbols" => {
-                                let pat = call.pattern.as_deref().unwrap_or(call.query.as_deref().unwrap_or(""));
-                                let p = call.path.as_deref();
-                                let st = call.symbol_type.as_deref();
-                                crate::tools::tool_search_symbols(pat, p, st)
-                            }
-                            other => Err(format!("Unknown tool: '{other}'")),
-                        };
-
-                        match tool_result {
-                            Ok(res) => {
-                                current_input = format!("<tool_response>\n{}\n</tool_response>", res);
-                                continue;
-                            }
-                            Err(err) => {
-                                current_input = format!("<tool_response>\nError: {}\n</tool_response>", err);
-                                continue;
-                            }
+                        let mut responses = Vec::new();
+                        for call in &calls {
+                            let (_, title) = crate::agent::call_title(call);
+                            let _ = tx.send(WorkerEvent::ToolStart(format!("Action: {title}")));
+                            let mut confirm = |_: &str| true;
+                            let mut ctx = crate::tools::ToolCtx { confirm: &mut confirm, max_chars: 8000 };
+                            responses.push(crate::tools::execute(call, &mut ctx).output);
                         }
+                        current_input = responses
+                            .iter()
+                            .map(|r| format!("<tool_response>\n{r}\n</tool_response>"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        continue;
                     }
                 }
 
