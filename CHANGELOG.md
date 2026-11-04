@@ -56,6 +56,18 @@ First release. Spindle runs Qwen3-30B-A3B across two PCs on a home network (7–
   read, `✎` edit, `⌕` search, `❯` shell) or as diff and output blocks. It also has a
   permission dialog, a session sidebar, command completion and multi-line input.
 - Rewrote the interface text, help and messages to be plain and specific.
+- Fixed: scrolling with the mouse wheel recalled earlier messages into the prompt (the
+  terminal turned wheel steps into ↑/↓). The wheel now scrolls the conversation only.
+  Separately, ↑ only browses history from an empty prompt, and editing a recalled message
+  keeps it.
+- Fixed: emoji and CJK text pushed the rest of the row one column to the right, which
+  misaligned the sidebar.
+- Fixed: a burst of keys or wheel steps was drawn one frame per key, so the screen lagged
+  behind. All pending input is now handled before each frame, and frames are drawn as one
+  synchronized update.
+- New keys: ctrl+a/e, ctrl+←/→, ctrl+w, ctrl+u/k, ctrl+z (undo), ctrl+home/end, ctrl+l,
+  alt+enter. ↑/↓ move between lines of a multi-line prompt. Page up/down scrolls a full
+  screen. While scrolled up, streaming text no longer moves the view.
 
 ### Fixes
 

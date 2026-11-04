@@ -97,12 +97,23 @@ Keys in the full-screen interface:
 | Key | |
 |---|---|
 | enter | send |
-| ctrl+j | new line |
+| ctrl+j, alt+enter | new line |
 | tab | complete a slash command |
-| ↑ / ↓ | prompt history |
-| pgup / pgdn, mouse wheel | scroll |
-| esc | interrupt the reply, or clear the prompt |
-| ctrl+c | quit when the prompt is empty |
+| ↑ / ↓ | move between lines of a multi-line prompt; from an empty prompt, browse earlier messages (↓ past the newest brings back what you had typed) |
+| ctrl+a / ctrl+e, home / end | start / end of the line |
+| ctrl+← / ctrl+→, alt+b / alt+f | previous / next word |
+| ctrl+w, alt+backspace | delete the word before the cursor |
+| ctrl+u / ctrl+k | delete to the start / end of the line |
+| ctrl+z | undo the last edit to the prompt |
+| esc | interrupt the reply; when idle, clear the prompt (ctrl+z brings it back) |
+| mouse wheel, pgup / pgdn | scroll the conversation |
+| ctrl+home / ctrl+end | jump to the top / bottom |
+| ctrl+l | redraw the screen |
+| ctrl+c | quit when the prompt is empty, otherwise clear it |
+| shift+drag | select text with the mouse |
+
+While you are scrolled up, new text arriving at the bottom doesn't move what you are
+reading.
 
 You can type while a reply is being generated. The message is queued and sent when the
 reply ends. Pasted text keeps its line breaks.

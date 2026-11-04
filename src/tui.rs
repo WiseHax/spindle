@@ -87,11 +87,18 @@ impl TerminalGuard {
             GetConsoleMode(out_handle, &mut orig_out_mode).map_err(e)?;
             let _ = SetConsoleMode(out_handle, CONSOLE_MODE(orig_out_mode.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0));
             // Raw VT input: no line buffering/echo, and Ctrl+C arrives as a key (byte 3).
-            let new_in = (orig_in_mode.0 | ENABLE_VIRTUAL_TERMINAL_INPUT.0) & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0);
+            // Quick-edit mode off (with the extended-flags bit that makes that stick), so the
+            // classic console passes mouse events to us instead of starting a selection.
+            const QUICK_EDIT: u32 = 0x0040;
+            const EXTENDED_FLAGS: u32 = 0x0080;
+            let new_in = ((orig_in_mode.0 | ENABLE_VIRTUAL_TERMINAL_INPUT.0 | EXTENDED_FLAGS) & !QUICK_EDIT)
+                & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0);
             let _ = SetConsoleMode(in_handle, CONSOLE_MODE(new_in));
             let mut out = io::stdout();
-            // Alternate screen, hidden cursor, no autowrap, SGR mouse wheel, bracketed paste.
-            let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1006h\x1b[?1007h\x1b[?2004h");
+            // Alternate screen, hidden cursor, no autowrap, mouse reporting in SGR form (so the
+            // wheel arrives as wheel events, not as arrow keys that would recall prompt
+            // history), bracketed paste. Hold Shift to select text with the mouse.
+            let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h\x1b[?2004h");
             let _ = out.flush();
             Ok(Self { in_handle, out_handle, orig_in_mode, orig_out_mode })
         }
@@ -154,6 +161,40 @@ impl Default for Cell {
     }
 }
 
+/// Columns a character takes in the terminal: 2 for CJK and most emoji, 0 for combining
+/// marks and zero-width joiners, 1 otherwise.
+pub fn char_width(c: char) -> u16 {
+    let u = c as u32;
+    match u {
+        0x0300..=0x036F | 0x200B..=0x200F | 0xFE00..=0xFE0F | 0x20D0..=0x20FF => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F680..=0x1F6FF
+        | 0x1F900..=0x1F9FF
+        | 0x1FA70..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Display width of a string in terminal columns.
+pub fn str_width(s: &str) -> usize {
+    s.chars().map(|c| char_width(c) as usize).sum()
+}
+
+/// Marks the second cell of a double-width character; never written to the terminal.
+const WIDE_TAIL: char = '\0';
+
 /// Cell grid flushed to the terminal in a single write.
 pub struct Canvas {
     pub width: u16,
@@ -165,6 +206,11 @@ pub struct Canvas {
 impl Canvas {
     pub fn new(width: u16, height: u16) -> Self {
         Self { width, height, needs_clear: true, grid: vec![Cell::default(); width as usize * height as usize] }
+    }
+
+    /// Repaints the whole screen on the next flush (ctrl+l).
+    pub fn force_clear(&mut self) {
+        self.needs_clear = true;
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
@@ -190,14 +236,23 @@ impl Canvas {
     }
 
     /// Prints `text` from `x`, clipped at `max_x` (exclusive). Returns the next column.
+    /// Double-width characters (emoji, CJK) take two cells, so later columns stay aligned.
     pub fn text(&mut self, mut x: u16, y: u16, max_x: u16, text: &str, fg: Rgb, bg: Rgb, bold: bool) -> u16 {
+        let limit = max_x.min(self.width);
         for ch in text.chars() {
-            if x >= max_x.min(self.width) {
+            let ch = if ch == '\t' || ch.is_control() { ' ' } else { ch };
+            let w = char_width(ch);
+            if w == 0 {
+                continue;
+            }
+            if x + w > limit {
                 break;
             }
-            let ch = if ch == '\t' || ch.is_control() { ' ' } else { ch };
             self.put(x, y, ch, fg, bg, bold);
-            x += 1;
+            if w == 2 {
+                self.put(x + 1, y, WIDE_TAIL, fg, bg, bold);
+            }
+            x += w;
         }
         x
     }
@@ -213,6 +268,8 @@ impl Canvas {
     pub fn flush(&mut self) -> io::Result<()> {
         use std::fmt::Write as _;
         let mut buf = String::with_capacity(self.grid.len() * 4);
+        // Synchronized update: terminals that support it show the frame all at once.
+        buf.push_str("\x1b[?2026h");
         buf.push_str(if self.needs_clear { "\x1b[2J\x1b[H" } else { "\x1b[H" });
         self.needs_clear = false;
         let mut cur: Option<(Rgb, Rgb, bool, bool)> = None;
@@ -220,6 +277,9 @@ impl Canvas {
             let row = &self.grid[y as usize * self.width as usize..(y as usize + 1) * self.width as usize];
             let last = row.iter().rposition(|c| c.ch != ' ' || c.bg != BG).map_or(0, |i| i + 1);
             for c in &row[..last] {
+                if c.ch == WIDE_TAIL {
+                    continue;
+                }
                 let style = (c.fg, c.bg, c.bold, c.italic);
                 if cur != Some(style) {
                     let _ = write!(buf, "\x1b[0;38;2;{};{};{};48;2;{};{};{}m", c.fg.0, c.fg.1, c.fg.2, c.bg.0, c.bg.1, c.bg.2);
@@ -239,6 +299,7 @@ impl Canvas {
                 buf.push_str("\r\n");
             }
         }
+        buf.push_str("\x1b[?2026l");
         let mut out = io::stdout();
         out.write_all(buf.as_bytes())?;
         out.flush()
@@ -270,7 +331,25 @@ pub enum KeyAction {
     CtrlC,
     CtrlD,
     CtrlP,
+    /// Delete from the cursor to the start of the line.
     CtrlU,
+    /// Delete from the cursor to the end of the line.
+    CtrlK,
+    /// Delete the word before the cursor (also alt+backspace).
+    CtrlW,
+    /// Undo the last edit to the prompt.
+    CtrlZ,
+    /// Repaint the screen.
+    CtrlL,
+    /// Start / end of the current line (ctrl+a / ctrl+e).
+    LineStart,
+    LineEnd,
+    /// Word left / right (ctrl+←/→, alt+b/f).
+    WordLeft,
+    WordRight,
+    /// Jump to the top / bottom of the conversation (ctrl+home / ctrl+end).
+    ScrollTop,
+    ScrollBottom,
     Escape,
     None,
 }
@@ -367,12 +446,17 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 out.push(KeyAction::Tab);
                 i += 1;
             }
-            16 => {
-                out.push(KeyAction::CtrlP);
-                i += 1;
-            }
-            21 => {
-                out.push(KeyAction::CtrlU);
+            1 | 5 | 11 | 12 | 16 | 21 | 23 | 26 => {
+                out.push(match b {
+                    1 => KeyAction::LineStart,
+                    5 => KeyAction::LineEnd,
+                    11 => KeyAction::CtrlK,
+                    12 => KeyAction::CtrlL,
+                    16 => KeyAction::CtrlP,
+                    21 => KeyAction::CtrlU,
+                    23 => KeyAction::CtrlW,
+                    _ => KeyAction::CtrlZ,
+                });
                 i += 1;
             }
             27 => {
@@ -382,6 +466,19 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                     continue;
                 }
                 let next = buf[i + 1];
+                // Alt+key arrives as ESC followed by the key.
+                let alt = match next {
+                    127 | 8 => Some(KeyAction::CtrlW),
+                    13 => Some(KeyAction::Newline),
+                    b'b' => Some(KeyAction::WordLeft),
+                    b'f' => Some(KeyAction::WordRight),
+                    _ => None,
+                };
+                if let Some(a) = alt {
+                    out.push(a);
+                    i += 2;
+                    continue;
+                }
                 if next != b'[' && next != b'O' {
                     out.push(KeyAction::Escape);
                     i += 1;
@@ -419,12 +516,24 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                     match fin {
                         b'A' if modified => KeyAction::ScrollUp(2),
                         b'B' if modified => KeyAction::ScrollDown(2),
+                        b'C' if modified => KeyAction::WordRight,
+                        b'D' if modified => KeyAction::WordLeft,
+                        b'H' if modified => KeyAction::ScrollTop,
+                        b'F' if modified => KeyAction::ScrollBottom,
                         b'A' => KeyAction::Up,
                         b'B' => KeyAction::Down,
                         b'C' => KeyAction::Right,
                         b'D' => KeyAction::Left,
                         b'H' => KeyAction::Home,
                         b'F' => KeyAction::End,
+                        b'~' if modified => match params.split(';').next() {
+                            Some("1") | Some("7") => KeyAction::ScrollTop,
+                            Some("4") | Some("8") => KeyAction::ScrollBottom,
+                            Some("3") => KeyAction::Delete,
+                            Some("5") => KeyAction::PageUp,
+                            Some("6") => KeyAction::PageDown,
+                            _ => KeyAction::None,
+                        },
                         b'~' => match params {
                             "1" | "7" => KeyAction::Home,
                             "4" | "8" => KeyAction::End,
@@ -484,29 +593,66 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
     (out, i)
 }
 
-/// Prompt text with a cursor (in chars). May hold newlines.
+/// Prompt text with a cursor (in chars). May hold newlines. Keeps an undo history of
+/// earlier states for ctrl+z.
 #[derive(Default)]
 pub struct InputBuffer {
     pub text: String,
     pub cursor: usize,
+    undo: Vec<(String, usize)>,
+    /// True while a run of typed characters continues (one undo step per word).
+    typing: bool,
 }
 
 impl InputBuffer {
     fn byte_at(&self, char_idx: usize) -> usize {
         self.text.char_indices().nth(char_idx).map_or(self.text.len(), |(i, _)| i)
     }
+    fn chars(&self) -> Vec<char> {
+        self.text.chars().collect()
+    }
+    /// Saves the current state as an undo step (skipped if nothing changed).
+    pub fn snapshot(&mut self) {
+        self.typing = false;
+        if self.undo.last().map_or(true, |(t, _)| *t != self.text) {
+            self.undo.push((self.text.clone(), self.cursor));
+            if self.undo.len() > 200 {
+                self.undo.remove(0);
+            }
+        }
+    }
+    pub fn undo(&mut self) {
+        self.typing = false;
+        while let Some((t, c)) = self.undo.pop() {
+            if t != self.text {
+                self.text = t;
+                self.cursor = c;
+                return;
+            }
+        }
+    }
     pub fn insert(&mut self, ch: char) {
+        // A new undo step at the start of each word.
+        if !self.typing || ch.is_whitespace() {
+            self.snapshot();
+            self.typing = true;
+        }
         let b = self.byte_at(self.cursor);
         self.text.insert(b, ch);
         self.cursor += 1;
     }
     pub fn insert_str(&mut self, s: &str) {
+        self.snapshot();
         let b = self.byte_at(self.cursor);
         self.text.insert_str(b, s);
         self.cursor += s.chars().count();
     }
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
+            if !self.typing {
+                self.snapshot();
+                self.typing = true;
+            }
             self.cursor -= 1;
             let b = self.byte_at(self.cursor);
             self.text.remove(b);
@@ -514,27 +660,134 @@ impl InputBuffer {
     }
     pub fn delete(&mut self) {
         if self.cursor < self.text.chars().count() {
+            self.snapshot();
             let b = self.byte_at(self.cursor);
             self.text.remove(b);
         }
     }
+    /// Removes chars `from..to` (char indices) and leaves the cursor at `from`.
+    fn remove_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        self.snapshot();
+        let (a, b) = (self.byte_at(from), self.byte_at(to));
+        self.text.replace_range(a..b, "");
+        self.cursor = from;
+    }
+    fn word_start_before(&self, mut i: usize) -> usize {
+        let c = self.chars();
+        while i > 0 && c[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !c[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+    fn word_end_after(&self, mut i: usize) -> usize {
+        let c = self.chars();
+        while i < c.len() && c[i].is_whitespace() {
+            i += 1;
+        }
+        while i < c.len() && !c[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+    pub fn delete_word_back(&mut self) {
+        let start = self.word_start_before(self.cursor);
+        self.remove_range(start, self.cursor);
+    }
+    /// Start and end (char indices) of the line the cursor is on.
+    fn line_bounds(&self) -> (usize, usize) {
+        let c = self.chars();
+        let mut s = self.cursor.min(c.len());
+        while s > 0 && c[s - 1] != '\n' {
+            s -= 1;
+        }
+        let mut e = self.cursor.min(c.len());
+        while e < c.len() && c[e] != '\n' {
+            e += 1;
+        }
+        (s, e)
+    }
+    pub fn kill_to_line_start(&mut self) {
+        let (s, _) = self.line_bounds();
+        self.remove_range(s, self.cursor);
+    }
+    pub fn kill_to_line_end(&mut self) {
+        let (_, e) = self.line_bounds();
+        self.remove_range(self.cursor, e);
+    }
     pub fn move_left(&mut self) {
+        self.typing = false;
         self.cursor = self.cursor.saturating_sub(1);
     }
     pub fn move_right(&mut self) {
+        self.typing = false;
         self.cursor = (self.cursor + 1).min(self.text.chars().count());
     }
+    pub fn move_word_left(&mut self) {
+        self.typing = false;
+        self.cursor = self.word_start_before(self.cursor);
+    }
+    pub fn move_word_right(&mut self) {
+        self.typing = false;
+        self.cursor = self.word_end_after(self.cursor);
+    }
+    pub fn move_line_start(&mut self) {
+        self.typing = false;
+        self.cursor = self.line_bounds().0;
+    }
+    pub fn move_line_end(&mut self) {
+        self.typing = false;
+        self.cursor = self.line_bounds().1;
+    }
     pub fn move_home(&mut self) {
-        self.cursor = 0;
+        self.move_line_start();
     }
     pub fn move_end(&mut self) {
-        self.cursor = self.text.chars().count();
+        self.move_line_end();
+    }
+    pub fn on_first_line(&self) -> bool {
+        !self.chars()[..self.cursor.min(self.text.chars().count())].contains(&'\n')
+    }
+    pub fn on_last_line(&self) -> bool {
+        let c = self.chars();
+        !c[self.cursor.min(c.len())..].contains(&'\n')
+    }
+    /// Moves the cursor to the same column on the previous (`up`) or next logical line.
+    pub fn move_line(&mut self, up: bool) {
+        self.typing = false;
+        let (s, e) = self.line_bounds();
+        let col = self.cursor - s;
+        let c = self.chars();
+        if up && s > 0 {
+            let prev_end = s - 1;
+            let mut prev_start = prev_end;
+            while prev_start > 0 && c[prev_start - 1] != '\n' {
+                prev_start -= 1;
+            }
+            self.cursor = prev_start + col.min(prev_end - prev_start);
+        } else if !up && e < c.len() {
+            let next_start = e + 1;
+            let mut next_end = next_start;
+            while next_end < c.len() && c[next_end] != '\n' {
+                next_end += 1;
+            }
+            self.cursor = next_start + col.min(next_end - next_start);
+        }
     }
     pub fn clear(&mut self) {
+        if !self.text.is_empty() {
+            self.snapshot();
+        }
         self.text.clear();
         self.cursor = 0;
     }
     pub fn set_text(&mut self, s: &str) {
+        self.snapshot();
         self.text = s.to_string();
         self.cursor = self.text.chars().count();
     }
@@ -556,7 +809,7 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
         let mut cur = indent.clone();
         let mut cur_len = indent.chars().count();
         for word in line.split_whitespace() {
-            let wl = word.chars().count();
+            let wl = str_width(word);
             if cur_len > indent.len() && cur_len + 1 + wl > w {
                 out.push(std::mem::take(&mut cur));
                 cur = indent.clone();
@@ -568,12 +821,13 @@ pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
             }
             if wl > w.saturating_sub(cur_len) && wl > w / 2 {
                 for ch in word.chars() {
-                    if cur_len >= w {
+                    let cw = char_width(ch) as usize;
+                    if cur_len + cw > w {
                         out.push(std::mem::take(&mut cur));
                         cur_len = 0;
                     }
                     cur.push(ch);
-                    cur_len += 1;
+                    cur_len += cw;
                 }
             } else {
                 cur.push_str(word);
@@ -944,7 +1198,7 @@ impl Entry {
             Entry::Notice { text, error } => {
                 out.push(Line::blank());
                 for l in text.lines() {
-                    for part in hard_wrap(l, w.saturating_sub(4)) {
+                    for part in wrap_text(l, w.saturating_sub(4)) {
                         out.push(Line::of(vec![span(format!("   {part}"), if *error { ERROR } else { MUTED })]));
                     }
                 }
@@ -956,6 +1210,18 @@ impl Entry {
 // --------------------------------------------------------------------- slash commands
 
 /// `(command, description)`, shown in `/help` and the autocomplete popup.
+/// Key reference shown by /help.
+const KEYS_HELP: &str = "
+Keys
+  enter              send                 ctrl+j / alt+enter  new line
+  tab                complete a command   ↑ / ↓               history (from an empty prompt)
+  ctrl+a / ctrl+e    start / end of line  ctrl+← / ctrl+→     previous / next word
+  ctrl+w             delete word          ctrl+u / ctrl+k     delete to line start / end
+  ctrl+z             undo an edit         esc                 interrupt reply / clear prompt
+  wheel, pgup/pgdn   scroll               ctrl+home / ctrl+end  top / bottom
+  ctrl+l             redraw               ctrl+c              quit (on an empty prompt)
+  shift+drag         select text with the mouse";
+
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
     ("/new", "start a new conversation (clears the KV-cache)"),
@@ -1028,6 +1294,12 @@ pub struct SpindleTui {
     generating: bool,
     /// A prompt typed while the model was busy; sent when the turn ends.
     queued: Option<String>,
+    /// What was in the prompt before ↑ started browsing history (restored by ↓).
+    draft: String,
+    /// Transcript rows visible last frame (page size for pgup/pgdn).
+    view_h: usize,
+    /// Transcript length last frame, to keep a scrolled-up view still while text streams in.
+    last_lines: usize,
 }
 
 impl SpindleTui {
@@ -1049,6 +1321,9 @@ impl SpindleTui {
             confirm: None,
             generating: false,
             queued: None,
+            draft: String::new(),
+            view_h: 20,
+            last_lines: 0,
         }
     }
 
@@ -1461,6 +1736,12 @@ impl SpindleTui {
         let view_h = prompt_y.saturating_sub(1) as usize;
 
         let lines = self.transcript(col_w as usize);
+        // Scrolled up while new text arrives below: keep the same rows on screen.
+        if self.scroll_offset > 0 && lines.len() > self.last_lines {
+            self.scroll_offset += lines.len() - self.last_lines;
+        }
+        self.last_lines = lines.len();
+        self.view_h = view_h;
         let max_scroll = lines.len().saturating_sub(view_h);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let end = lines.len() - self.scroll_offset;
@@ -1469,7 +1750,7 @@ impl SpindleTui {
             self.draw_line(x0, i as u16, col_w, line);
         }
         if self.scroll_offset > 0 {
-            let s = format!(" ↓ {} more · pgdn ", self.scroll_offset);
+            let s = format!(" ↓ {} more lines · ctrl+end to jump back ", self.scroll_offset);
             let sx = (x0 + col_w).saturating_sub(s.chars().count() as u16);
             self.canvas.text(sx, 0, x0 + col_w, &s, BG, MUTED, false);
         }
@@ -1483,6 +1764,23 @@ impl SpindleTui {
     /// Applies a key to the prompt editor. Returns `Some(text)` when the user submits.
     fn handle_key(&mut self, key: KeyAction) -> Option<String> {
         let popup = command_matches(&self.input.text);
+        let page = self.view_h.saturating_sub(2).max(1);
+        // Any edit makes the text the user's own: ↓ no longer replaces it with history.
+        let edits = matches!(
+            key,
+            KeyAction::Char(_)
+                | KeyAction::Paste(_)
+                | KeyAction::Newline
+                | KeyAction::Backspace
+                | KeyAction::Delete
+                | KeyAction::CtrlU
+                | KeyAction::CtrlK
+                | KeyAction::CtrlW
+                | KeyAction::CtrlZ
+        );
+        if edits {
+            self.history_idx = None;
+        }
         match key {
             KeyAction::Char(c) => {
                 self.input.insert(c);
@@ -1494,13 +1792,21 @@ impl SpindleTui {
             KeyAction::Delete => self.input.delete(),
             KeyAction::Left => self.input.move_left(),
             KeyAction::Right => self.input.move_right(),
-            KeyAction::Home => self.input.move_home(),
-            KeyAction::End => self.input.move_end(),
-            KeyAction::CtrlU => self.input.clear(),
+            KeyAction::Home | KeyAction::LineStart => self.input.move_line_start(),
+            KeyAction::End | KeyAction::LineEnd => self.input.move_line_end(),
+            KeyAction::WordLeft => self.input.move_word_left(),
+            KeyAction::WordRight => self.input.move_word_right(),
+            KeyAction::CtrlU => self.input.kill_to_line_start(),
+            KeyAction::CtrlK => self.input.kill_to_line_end(),
+            KeyAction::CtrlW => self.input.delete_word_back(),
+            KeyAction::CtrlZ => self.input.undo(),
+            KeyAction::CtrlL => self.canvas.force_clear(),
             KeyAction::ScrollUp(n) => self.scroll_offset += n,
             KeyAction::ScrollDown(n) => self.scroll_offset = self.scroll_offset.saturating_sub(n),
-            KeyAction::PageUp => self.scroll_offset += 10,
-            KeyAction::PageDown => self.scroll_offset = self.scroll_offset.saturating_sub(10),
+            KeyAction::PageUp => self.scroll_offset += page,
+            KeyAction::PageDown => self.scroll_offset = self.scroll_offset.saturating_sub(page),
+            KeyAction::ScrollTop => self.scroll_offset = usize::MAX / 2,
+            KeyAction::ScrollBottom => self.scroll_offset = 0,
             KeyAction::Tab => {
                 if let Some((cmd, _)) = popup.get(self.popup_sel) {
                     self.input.set_text(&format!("{cmd} "));
@@ -1511,16 +1817,28 @@ impl SpindleTui {
                     self.input.set_text("/");
                 }
             }
-            KeyAction::Up if !popup.is_empty() => self.popup_sel = self.popup_sel.saturating_sub(1),
-            KeyAction::Down if !popup.is_empty() => self.popup_sel = (self.popup_sel + 1).min(popup.len() - 1),
+            KeyAction::Up if !popup.is_empty() && self.history_idx.is_none() => {
+                self.popup_sel = self.popup_sel.saturating_sub(1)
+            }
+            KeyAction::Down if !popup.is_empty() && self.history_idx.is_none() => {
+                self.popup_sel = (self.popup_sel + 1).min(popup.len() - 1)
+            }
+            // In a multi-line prompt, ↑/↓ move between its lines first.
+            KeyAction::Up if !self.input.on_first_line() => self.input.move_line(true),
+            KeyAction::Down if !self.input.on_last_line() => self.input.move_line(false),
             KeyAction::Up => {
-                if self.prompt_history.is_empty() || (!self.input.text.is_empty() && self.history_idx.is_none()) {
-                    self.scroll_offset += 2;
-                } else {
+                // History only from an empty prompt (or while already browsing), so ↑ never
+                // throws away something you typed.
+                let browsing = self.history_idx.is_some();
+                if !self.prompt_history.is_empty() && (browsing || self.input.text.is_empty()) {
+                    if !browsing {
+                        self.draft = self.input.text.clone();
+                    }
                     let i = self.history_idx.map_or(self.prompt_history.len() - 1, |i| i.saturating_sub(1));
                     self.history_idx = Some(i);
                     let t = self.prompt_history[i].clone();
                     self.input.set_text(&t);
+                    self.popup_sel = 0;
                 }
             }
             KeyAction::Down => match self.history_idx {
@@ -1531,11 +1849,13 @@ impl SpindleTui {
                 }
                 Some(_) => {
                     self.history_idx = None;
-                    self.input.clear();
+                    let d = std::mem::take(&mut self.draft);
+                    self.input.set_text(&d);
                 }
-                None => self.scroll_offset = self.scroll_offset.saturating_sub(2),
+                None => {}
             },
             KeyAction::Escape => {
+                // Clears the prompt (ctrl+z brings it back).
                 self.input.clear();
                 self.history_idx = None;
             }
@@ -1553,6 +1873,7 @@ impl SpindleTui {
                         self.prompt_history.push(text.clone());
                     }
                     self.history_idx = None;
+                    self.draft.clear();
                     self.input.clear();
                     self.scroll_offset = 0;
                     return Some(text);
@@ -1577,13 +1898,21 @@ impl SpindleTui {
         }
         let mut last = Instant::now() - Duration::from_secs(1);
         loop {
-            let key = self.reader.poll();
-            let changed = key != KeyAction::None;
-            if let Some(text) = self.handle_key(key) {
-                return Some(text);
-            }
-            if !self.running {
-                return None;
+            // Handle everything that is waiting (fast typing, a burst of wheel events) before
+            // drawing, so the screen never falls behind the keyboard.
+            let mut changed = false;
+            for _ in 0..512 {
+                let key = self.reader.poll();
+                if key == KeyAction::None {
+                    break;
+                }
+                changed = true;
+                if let Some(text) = self.handle_key(key) {
+                    return Some(text);
+                }
+                if !self.running {
+                    return None;
+                }
             }
             if changed || last.elapsed() >= Duration::from_millis(250) {
                 self.render();
@@ -1711,33 +2040,41 @@ fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts
                 break;
             }
 
-            let key = tui.reader.poll();
-            if key != KeyAction::None {
-                changed = true;
-            }
-            if let Some((_, reply)) = tui.confirm.as_ref() {
-                match key {
-                    KeyAction::Enter | KeyAction::Char('y') | KeyAction::Char('Y') => {
-                        let _ = reply.send(true);
-                        tui.confirm = None;
-                    }
-                    KeyAction::Escape | KeyAction::CtrlC | KeyAction::Char('n') | KeyAction::Char('N') => {
-                        let _ = reply.send(false);
-                        tui.confirm = None;
-                    }
-                    KeyAction::ScrollUp(_) | KeyAction::ScrollDown(_) | KeyAction::PageUp | KeyAction::PageDown => {
-                        tui.handle_key(key);
-                    }
-                    _ => {}
+            for _ in 0..512 {
+                let key = tui.reader.poll();
+                if key == KeyAction::None {
+                    break;
                 }
-            } else {
-                match key {
-                    KeyAction::Escape | KeyAction::CtrlC => abort.store(true, Ordering::SeqCst),
-                    other => {
-                        if let Some(text) = tui.handle_key(other) {
-                            tui.queued = Some(text);
+                changed = true;
+                if let Some((_, reply)) = tui.confirm.as_ref() {
+                    match key {
+                        KeyAction::Enter | KeyAction::Char('y') | KeyAction::Char('Y') => {
+                            let _ = reply.send(true);
+                            tui.confirm = None;
                         }
-                        tui.running = true; // ctrl+d during a turn does not quit
+                        KeyAction::Escape | KeyAction::CtrlC | KeyAction::Char('n') | KeyAction::Char('N') => {
+                            let _ = reply.send(false);
+                            tui.confirm = None;
+                        }
+                        KeyAction::ScrollUp(_)
+                        | KeyAction::ScrollDown(_)
+                        | KeyAction::PageUp
+                        | KeyAction::PageDown
+                        | KeyAction::ScrollTop
+                        | KeyAction::ScrollBottom => {
+                            tui.handle_key(key);
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match key {
+                        KeyAction::Escape | KeyAction::CtrlC => abort.store(true, Ordering::SeqCst),
+                        other => {
+                            if let Some(text) = tui.handle_key(other) {
+                                tui.queued = Some(text);
+                            }
+                            tui.running = true; // ctrl+d during a turn does not quit
+                        }
                     }
                 }
             }
@@ -1824,7 +2161,7 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
             for (c, d) in COMMANDS {
                 s.push_str(&format!("  {c:<12} {d}\n"));
             }
-            s.push_str("\nKeys\n  enter send · ctrl+j newline · tab complete · ↑/↓ history\n  pgup/pgdn or wheel scroll · esc interrupt / clear · ctrl+c quit");
+            s.push_str(KEYS_HELP);
             tui.notice(&s);
         }
         "/new" | "/clear" | "/reset" => {
@@ -2047,6 +2384,83 @@ mod tests {
         // Unfinished paste waits for more bytes.
         assert_eq!(parse_input_bytes(b"\x1b[200~partial").1, 0);
         assert_eq!(parse_input_bytes(&[3, 4, 10]).0, vec![KeyAction::CtrlC, KeyAction::CtrlD, KeyAction::Newline]);
+    }
+
+    #[test]
+    fn wheel_and_editing_keys() {
+        // Wheel events never become arrow keys (which would recall history).
+        assert_eq!(parse_input_bytes(b"\x1b[<65;7;7M").0, vec![KeyAction::ScrollDown(3)]);
+        assert_eq!(parse_input_bytes(&[1, 5, 11, 21, 23, 26, 12]).0, vec![
+            KeyAction::LineStart, KeyAction::LineEnd, KeyAction::CtrlK, KeyAction::CtrlU,
+            KeyAction::CtrlW, KeyAction::CtrlZ, KeyAction::CtrlL,
+        ]);
+        assert_eq!(parse_input_bytes(b"\x1b[1;5D\x1b[1;5C\x1b[1;5H\x1b[1;5F").0, vec![
+            KeyAction::WordLeft, KeyAction::WordRight, KeyAction::ScrollTop, KeyAction::ScrollBottom,
+        ]);
+        assert_eq!(parse_input_bytes(b"\x1b\x7f\x1b\r").0, vec![KeyAction::CtrlW, KeyAction::Newline]);
+    }
+
+    #[test]
+    fn history_never_replaces_typed_text() {
+        let mut tui = SpindleTui::new(info());
+        tui.prompt_history = vec!["Hi".into(), "/model".into()];
+        for c in "draft".chars() {
+            tui.handle_key(KeyAction::Char(c));
+        }
+        // ↑ with text in the prompt does nothing.
+        tui.handle_key(KeyAction::Up);
+        assert_eq!(tui.input.text, "draft");
+        // From an empty prompt ↑ browses, ↓ past the end restores what was there.
+        tui.input.clear();
+        tui.handle_key(KeyAction::Up);
+        assert_eq!(tui.input.text, "/model");
+        tui.handle_key(KeyAction::Up);
+        assert_eq!(tui.input.text, "Hi");
+        tui.handle_key(KeyAction::Down);
+        tui.handle_key(KeyAction::Down);
+        assert_eq!(tui.input.text, "");
+        // Editing a recalled entry makes it yours: ↓ no longer replaces it.
+        tui.handle_key(KeyAction::Up);
+        tui.handle_key(KeyAction::Char('!'));
+        tui.handle_key(KeyAction::Down);
+        assert_eq!(tui.input.text, "/model!");
+        // Wheel scrolling leaves the prompt alone.
+        tui.handle_key(KeyAction::ScrollUp(3));
+        assert_eq!(tui.input.text, "/model!");
+    }
+
+    #[test]
+    fn prompt_editing_shortcuts_and_undo() {
+        let mut b = InputBuffer::default();
+        for c in "hello big world".chars() {
+            b.insert(c);
+        }
+        b.delete_word_back();
+        assert_eq!(b.text, "hello big ");
+        b.move_word_left();
+        assert_eq!(b.cursor, 6);
+        b.kill_to_line_end();
+        assert_eq!(b.text, "hello ");
+        b.undo();
+        assert_eq!(b.text, "hello big ");
+        b.undo();
+        assert_eq!(b.text, "hello big world");
+        b.set_text("one\ntwo\nthree");
+        b.move_line(true);
+        assert!(!b.on_first_line() && !b.on_last_line());
+        b.move_line_start();
+        b.kill_to_line_end();
+        assert_eq!(b.text, "one\n\nthree");
+    }
+
+    #[test]
+    fn wide_characters_keep_columns_aligned() {
+        let mut c = Canvas::new(20, 1);
+        let end = c.text(0, 0, 20, "hi 😊 ok", TEXT, BG, false);
+        assert_eq!(end, 8);
+        assert_eq!(c.cell(4, 0).unwrap().ch, WIDE_TAIL);
+        assert_eq!(c.cell(6, 0).unwrap().ch, 'o');
+        assert_eq!(str_width("中文"), 4);
     }
 
     #[test]
