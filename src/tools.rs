@@ -107,6 +107,10 @@ Parameters: {"type": "object", "properties": {"path": {"type": "string"}, "conte
 Description: Perform exact search-and-replace edit in a file.
 Parameters: {"type": "object", "properties": {"path": {"type": "string"}, "target": {"type": "string"}, "replacement": {"type": "string"}}, "required": ["path", "target", "replacement"]}
 
+## `delete_file`
+Description: Delete a file from the workspace.
+Parameters: {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
 ## `list_dir`
 Description: List files and subdirectories in a folder.
 Parameters: {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
@@ -205,6 +209,23 @@ pub fn tool_edit_file(path_str: &str, target: &str, replacement: &str) -> Result
     push_undo_snapshot(path_str);
     fs::write(p, updated).map_err(|e| format!("Could not write updated '{path_str}': {e}"))?;
     Ok(format!("Successfully replaced {occurrences} occurrence(s) in '{path_str}'."))
+}
+
+/// Deletes a file on disk after saving a shadow undo snapshot.
+pub fn tool_delete_file(path_str: &str) -> Result<String, String> {
+    if let GuardDecision::Block(r) = guard::check_path(path_str, true) {
+        return Err(format!("[Blocked by Security Guard: {r}]"));
+    }
+    let p = Path::new(path_str);
+    if !p.exists() {
+        return Err(format!("File '{path_str}' does not exist."));
+    }
+    if p.is_dir() {
+        return Err(format!("'{path_str}' is a directory, not a file. Use run_command with rmdir to delete directories."));
+    }
+    push_undo_snapshot(path_str);
+    fs::remove_file(p).map_err(|e| format!("Failed to delete '{path_str}': {e}"))?;
+    Ok(format!("Successfully deleted '{path_str}'."))
 }
 
 /// Lists files and subdirectories with sizes.
@@ -654,6 +675,25 @@ I will now read the file.
         assert_eq!(res_call.name, "search_symbols");
         assert_eq!(res_call.pattern.as_deref(), Some("tool_read_file"));
         assert_eq!(res_call.symbol_type.as_deref(), Some("fn"));
+    }
+
+    #[test]
+    fn test_delete_file_tool() {
+        let test_path = "target/test_delete_me.txt";
+        tool_write_file(test_path, "temporary content").unwrap();
+        assert!(Path::new(test_path).exists());
+
+        let del_res = tool_delete_file(test_path);
+        assert!(del_res.is_ok());
+        assert!(!Path::new(test_path).exists());
+
+        // Test that undo can restore the deleted file
+        let undo = pop_undo_path(test_path).expect("has undo");
+        assert!(undo.is_ok());
+        assert!(Path::new(test_path).exists());
+        assert_eq!(fs::read_to_string(test_path).unwrap(), "temporary content");
+
+        let _ = fs::remove_file(test_path);
     }
 }
 

@@ -2212,6 +2212,21 @@ impl SmolLm2Engine {
         [&f.system_open[..], &self.encode_bpe_segment(&self.system_prompt), &f.system_close].concat()
     }
 
+    /// Pre-warms and feeds the system prompt into the KV-cache so initial turns respond instantly.
+    pub unsafe fn prefill_system(&mut self) {
+        if self.n_keep == 0 {
+            let sys = self.encode_system();
+            if !sys.is_empty() {
+                self.feed(&sys);
+                if let Some(draft) = self.draft_engine.as_mut() {
+                    draft.feed(&sys);
+                    draft.n_keep = self.cur_pos;
+                }
+                self.n_keep = self.cur_pos;
+            }
+        }
+    }
+
     /// A user message followed by the opening of the assistant's reply.
     fn encode_user_turn(&self, user_prompt: &str, allow_think: bool) -> Vec<usize> {
         let f = &self.format;

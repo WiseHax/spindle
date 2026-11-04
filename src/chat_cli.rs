@@ -293,6 +293,11 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
                             println!("{}  editing: {p}", dim("│"));
                             crate::tools::tool_edit_file(p, t, r)
                         }
+                        "delete_file" => {
+                            let p = call.path.as_deref().unwrap_or("");
+                            println!("{}  deleting: {p}", dim("│"));
+                            crate::tools::tool_delete_file(p)
+                        }
                         "list_dir" => {
                             let p = call.path.as_deref().unwrap_or(".");
                             println!("{}  listing directory: {p}", dim("│"));
@@ -336,6 +341,15 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
             break;
         }
     };
+
+    if engine.n_keep == 0 {
+        print!("{}", dim("[*] Pre-warming system prompt and tools KV-cache... "));
+        let _ = std::io::stdout().flush();
+        let t_warm = std::time::Instant::now();
+        unsafe { engine.prefill_system(); }
+        let dt = t_warm.elapsed().as_secs_f64();
+        println!("{}", dim(&format!("ready ({dt:.1}s, {} tokens cached)", engine.cur_pos)));
+    }
 
     if let Some(p) = &opts.first_prompt {
         if opts.interactive {
