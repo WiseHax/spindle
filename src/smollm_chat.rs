@@ -429,14 +429,20 @@ unsafe fn moe_forward_batch(
 
         let mut num_keep = m.n_used;
         if m.moe_prune > 0.0 && m.n_used > 2 {
-            let max_p = probs[chosen[0]];
             let min_keep = 2.max(m.n_used / 2);
-            let cutoff = max_p * m.moe_prune;
-            let mut k = min_keep;
-            while k < m.n_used && probs[chosen[k]] >= cutoff {
-                k += 1;
+            if m.moe_prune >= 1.0 {
+                num_keep = (m.moe_prune as usize).clamp(min_keep, m.n_used);
+            } else {
+                let top_sum: f32 = chosen.iter().map(|&e| probs[e]).sum();
+                let target_mass = top_sum * (1.0 - m.moe_prune);
+                let mut cum = 0.0f32;
+                let mut k = 0;
+                while k < m.n_used && (k < min_keep || cum < target_mass) {
+                    cum += probs[chosen[k]];
+                    k += 1;
+                }
+                num_keep = k;
             }
-            num_keep = k;
         }
         chosen.truncate(num_keep);
         wsum_batch[b] = chosen.iter().map(|&e| probs[e]).sum();
@@ -632,14 +638,20 @@ unsafe fn moe_forward(
 
     let mut num_keep = m.n_used;
     if m.moe_prune > 0.0 && m.n_used > 2 {
-        let max_p = probs[top_chosen[0]];
         let min_keep = 2.max(m.n_used / 2);
-        let cutoff = max_p * m.moe_prune;
-        let mut k = min_keep;
-        while k < m.n_used && probs[top_chosen[k]] >= cutoff {
-            k += 1;
+        if m.moe_prune >= 1.0 {
+            num_keep = (m.moe_prune as usize).clamp(min_keep, m.n_used);
+        } else {
+            let top_sum: f32 = top_chosen.iter().map(|&e| probs[e]).sum();
+            let target_mass = top_sum * (1.0 - m.moe_prune);
+            let mut cum = 0.0f32;
+            let mut k = 0;
+            while k < m.n_used && (k < min_keep || cum < target_mass) {
+                cum += probs[top_chosen[k]];
+                k += 1;
+            }
+            num_keep = k;
         }
-        num_keep = k;
     }
     let chosen = &top_chosen[..num_keep];
     let wsum: f32 = chosen.iter().map(|&e| probs[e]).sum();
