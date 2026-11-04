@@ -210,6 +210,40 @@ unsafe fn fma_u8x16_pair(
     *sqx1 = _mm256_fmadd_ps(b1, x1, _mm256_fmadd_ps(a1, x0, *sqx1));
 }
 
+/// Accumulates 16 unsigned 4-bit values for 4 independent rows times shared `x[0..16]` into `sqx0`..`sqx3`.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn fma_u8x16_quad(
+    v0: __m128i,
+    v1: __m128i,
+    v2: __m128i,
+    v3: __m128i,
+    x: *const f32,
+    sqx0: &mut __m256,
+    sqx1: &mut __m256,
+    sqx2: &mut __m256,
+    sqx3: &mut __m256,
+) {
+    let x0 = _mm256_loadu_ps(x);
+    let x1 = _mm256_loadu_ps(x.add(8));
+
+    let a0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(v0));
+    let b0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(v0)));
+    *sqx0 = _mm256_fmadd_ps(b0, x1, _mm256_fmadd_ps(a0, x0, *sqx0));
+
+    let a1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(v1));
+    let b1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(v1)));
+    *sqx1 = _mm256_fmadd_ps(b1, x1, _mm256_fmadd_ps(a1, x0, *sqx1));
+
+    let a2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(v2));
+    let b2 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(v2)));
+    *sqx2 = _mm256_fmadd_ps(b2, x1, _mm256_fmadd_ps(a2, x0, *sqx2));
+
+    let a3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(v3));
+    let b3 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(v3)));
+    *sqx3 = _mm256_fmadd_ps(b3, x1, _mm256_fmadd_ps(a3, x0, *sqx3));
+}
+
 /// Single-row AVX2 dot product for `Q4_K` using precomputed activation subblock sums.
 #[target_feature(enable = "avx2,fma,f16c")]
 #[inline]
@@ -344,6 +378,164 @@ unsafe fn dot_q4_k_2rows_avx2_presum(
     }
 
     (hsum_avx2(acc0) - total_min0, hsum_avx2(acc1) - total_min1)
+}
+
+/// Interleaved 4-row AVX2 dot product for `Q4_K` with precomputed activation sums.
+/// Maximizes AVX2 FMA execution unit saturation (ports 0 & 1) and amortizes activation loads by 4x.
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn dot_q4_k_4rows_avx2_presum(
+    row0_ptr: *const u8,
+    row1_ptr: *const u8,
+    row2_ptr: *const u8,
+    row3_ptr: *const u8,
+    x: *const f32,
+    act_sums: *const f32,
+    n_cols: usize,
+) -> (f32, f32, f32, f32) {
+    let n_blocks = n_cols / 256;
+    let m4 = _mm_set1_epi8(0x0F);
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut total_min0 = 0.0f32;
+    let mut total_min1 = 0.0f32;
+    let mut total_min2 = 0.0f32;
+    let mut total_min3 = 0.0f32;
+
+    for b in 0..n_blocks {
+        let blk0 = &*(row0_ptr.add(b * 144) as *const BlockQ4K);
+        let blk1 = &*(row1_ptr.add(b * 144) as *const BlockQ4K);
+        let blk2 = &*(row2_ptr.add(b * 144) as *const BlockQ4K);
+        let blk3 = &*(row3_ptr.add(b * 144) as *const BlockQ4K);
+
+        let d0 = f16_to_f32_fast(blk0.d);
+        let dmin0 = f16_to_f32_fast(blk0.dmin);
+        let (sc0, mn0) = crate::q4k_gemv::unpack_q4k_scales(&blk0.scales);
+
+        let d1 = f16_to_f32_fast(blk1.d);
+        let dmin1 = f16_to_f32_fast(blk1.dmin);
+        let (sc1, mn1) = crate::q4k_gemv::unpack_q4k_scales(&blk1.scales);
+
+        let d2 = f16_to_f32_fast(blk2.d);
+        let dmin2 = f16_to_f32_fast(blk2.dmin);
+        let (sc2, mn2) = crate::q4k_gemv::unpack_q4k_scales(&blk2.scales);
+
+        let d3 = f16_to_f32_fast(blk3.d);
+        let dmin3 = f16_to_f32_fast(blk3.dmin);
+        let (sc3, mn3) = crate::q4k_gemv::unpack_q4k_scales(&blk3.scales);
+
+        let xb = x.add(b * 256);
+        let sb_base = b * 8;
+
+        let mut min0 = 0.0f32;
+        let mut min1 = 0.0f32;
+        let mut min2 = 0.0f32;
+        let mut min3 = 0.0f32;
+        for k in 0..8 {
+            let s = *act_sums.add(sb_base + k);
+            min0 += mn0[k] as f32 * s;
+            min1 += mn1[k] as f32 * s;
+            min2 += mn2[k] as f32 * s;
+            min3 += mn3[k] as f32 * s;
+        }
+        total_min0 += min0 * dmin0;
+        total_min1 += min1 * dmin1;
+        total_min2 += min2 * dmin2;
+        total_min3 += min3 * dmin3;
+
+        for chunk in 0..4 {
+            let qp0 = blk0.qs.as_ptr().add(chunk * 32);
+            let qp1 = blk1.qs.as_ptr().add(chunk * 32);
+            let qp2 = blk2.qs.as_ptr().add(chunk * 32);
+            let qp3 = blk3.qs.as_ptr().add(chunk * 32);
+
+            let q0_0 = _mm_loadu_si128(qp0 as *const __m128i);
+            let q0_1 = _mm_loadu_si128(qp0.add(16) as *const __m128i);
+
+            let q1_0 = _mm_loadu_si128(qp1 as *const __m128i);
+            let q1_1 = _mm_loadu_si128(qp1.add(16) as *const __m128i);
+
+            let q2_0 = _mm_loadu_si128(qp2 as *const __m128i);
+            let q2_1 = _mm_loadu_si128(qp2.add(16) as *const __m128i);
+
+            let q3_0 = _mm_loadu_si128(qp3 as *const __m128i);
+            let q3_1 = _mm_loadu_si128(qp3.add(16) as *const __m128i);
+
+            let a1 = xb.add(chunk * 64);
+            let a2 = xb.add(chunk * 64 + 32);
+
+            let mut sqx0 = _mm256_setzero_ps();
+            let mut sqx1 = _mm256_setzero_ps();
+            let mut sqx2 = _mm256_setzero_ps();
+            let mut sqx3 = _mm256_setzero_ps();
+            fma_u8x16_quad(
+                _mm_and_si128(q0_0, m4),
+                _mm_and_si128(q1_0, m4),
+                _mm_and_si128(q2_0, m4),
+                _mm_and_si128(q3_0, m4),
+                a1,
+                &mut sqx0,
+                &mut sqx1,
+                &mut sqx2,
+                &mut sqx3,
+            );
+            fma_u8x16_quad(
+                _mm_and_si128(q0_1, m4),
+                _mm_and_si128(q1_1, m4),
+                _mm_and_si128(q2_1, m4),
+                _mm_and_si128(q3_1, m4),
+                a1.add(16),
+                &mut sqx0,
+                &mut sqx1,
+                &mut sqx2,
+                &mut sqx3,
+            );
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0 * sc0[chunk * 2] as f32), sqx0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1 * sc1[chunk * 2] as f32), sqx1, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2 * sc2[chunk * 2] as f32), sqx2, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_set1_ps(d3 * sc3[chunk * 2] as f32), sqx3, acc3);
+
+            let mut sqx0 = _mm256_setzero_ps();
+            let mut sqx1 = _mm256_setzero_ps();
+            let mut sqx2 = _mm256_setzero_ps();
+            let mut sqx3 = _mm256_setzero_ps();
+            fma_u8x16_quad(
+                _mm_and_si128(_mm_srli_epi16::<4>(q0_0), m4),
+                _mm_and_si128(_mm_srli_epi16::<4>(q1_0), m4),
+                _mm_and_si128(_mm_srli_epi16::<4>(q2_0), m4),
+                _mm_and_si128(_mm_srli_epi16::<4>(q3_0), m4),
+                a2,
+                &mut sqx0,
+                &mut sqx1,
+                &mut sqx2,
+                &mut sqx3,
+            );
+            fma_u8x16_quad(
+                _mm_and_si128(_mm_srli_epi16::<4>(q0_1), m4),
+                _mm_and_si128(_mm_srli_epi16::<4>(q1_1), m4),
+                _mm_and_si128(_mm_srli_epi16::<4>(q2_1), m4),
+                _mm_and_si128(_mm_srli_epi16::<4>(q3_1), m4),
+                a2.add(16),
+                &mut sqx0,
+                &mut sqx1,
+                &mut sqx2,
+                &mut sqx3,
+            );
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0 * sc0[chunk * 2 + 1] as f32), sqx0, acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1 * sc1[chunk * 2 + 1] as f32), sqx1, acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_set1_ps(d2 * sc2[chunk * 2 + 1] as f32), sqx2, acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_set1_ps(d3 * sc3[chunk * 2 + 1] as f32), sqx3, acc3);
+        }
+    }
+
+    (
+        hsum_avx2(acc0) - total_min0,
+        hsum_avx2(acc1) - total_min1,
+        hsum_avx2(acc2) - total_min2,
+        hsum_avx2(acc3) - total_min3,
+    )
 }
 
 /// Fallback single-row dot product for `Q4_K` (computes activation sums on the fly).
@@ -657,6 +849,18 @@ pub(crate) unsafe fn matvec_rows_avx2(base_ptr: *const u8, m: &Mat, x: &[f32], o
 
             let row_bytes = (n_cols / 256) * 144;
             let mut i = 0;
+            while i + 3 < n_rows {
+                let p0 = tensor_ptr.add((r0 + i) * row_bytes);
+                let p1 = tensor_ptr.add((r0 + i + 1) * row_bytes);
+                let p2 = tensor_ptr.add((r0 + i + 2) * row_bytes);
+                let p3 = tensor_ptr.add((r0 + i + 3) * row_bytes);
+                let (v0, v1, v2, v3) = dot_q4_k_4rows_avx2_presum(p0, p1, p2, p3, xp, act_sums_ptr, n_cols);
+                out[i] = v0;
+                out[i + 1] = v1;
+                out[i + 2] = v2;
+                out[i + 3] = v3;
+                i += 4;
+            }
             while i + 1 < n_rows {
                 let p0 = tensor_ptr.add((r0 + i) * row_bytes);
                 let p1 = tensor_ptr.add((r0 + i + 1) * row_bytes);
