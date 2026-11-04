@@ -1306,8 +1306,8 @@ impl SmolLm2Engine {
         } else if fits_in_ram {
             let mut ranges = Vec::new();
             for ly in &layers {
-                let (start, len, _) = layer_extent(ly, &c);
-                ranges.push((start, len));
+                let (start, end, _) = layer_extent(ly, &c);
+                ranges.push((start, end - start));
             }
             if layer_range.end == c.n_layers {
                 ranges.push((lm_head.offset, lm_head.rows * row_bytes(lm_head.dtype, lm_head.cols).unwrap_or(0)));
