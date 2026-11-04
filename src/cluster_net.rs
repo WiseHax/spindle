@@ -1,14 +1,18 @@
-//! spindle: cluster network transport (Spindle RIOT-Wire).
+//! Cluster transport: the framed TCP protocol between the client and a worker node.
 //!
-//! Ultra-low latency tensor streaming fabric for distributed asymmetric layer sharding
-//! between multiple machines (e.g. 16 GB Desktop + 8 GB Laptop = 24 GB pooled RAM).
+//! The model's layers are split between two machines (for example layers 0..35 on a 16 GB
+//! desktop and 35..48 on an 8 GB laptop). For every token, or batch of tokens during
+//! prefill and speculative verify, the client sends token ids to the worker, the worker
+//! runs its layers and sends back one hidden-state vector per token, and the client runs
+//! the remaining layers and the LM head.
 //!
-//! Features:
-//! - Sub-millisecond tensor frame serialization with 16-byte cache-aligned wire headers.
-//! - AVX2 / F16C hardware-accelerated FP16 vector compression (50% wire reduction, 0 quality loss).
-//! - Adaptive FP8 vector quantization option (75% wire reduction, 2 KiB payload for dim=2048).
-//! - Pure Rust TCP transport with `TCP_NODELAY`, zero-realloc buffers, and sub-100µs LAN round-trip.
-//! - Built-in XOR forward error correction (FEC) parity builder.
+//! - Frames have a 16-byte header (magic, type, wire format, payload length).
+//! - Hidden states travel as FP16 (half the bytes of FP32) or FP8 (a quarter), converted
+//!   with AVX2/F16C.
+//! - `TCP_NODELAY` is set and buffers are reused, so a round trip on a LAN costs well under
+//!   a millisecond of overhead beyond the network itself.
+//! - New frame types are only ever added, never changed, so an older worker fails clearly
+//!   instead of silently misreading a frame.
 
 use std::{
     arch::x86_64::*,
@@ -684,7 +688,7 @@ impl ClusterClient {
 fn check_kv_bounds(engine: &SmolLm2Engine, start: usize, n: usize) -> std::io::Result<()> {
     if start + n > engine.max_seq || n == 0 {
         eprintln!(
-            "[cluster:node] request for KV positions {start}..{} exceeds this worker's {} slots; master and worker are out of sync (update both binaries)",
+            "  client asked for KV positions {start}..{} but this worker has {} slots. The two PCs are probably running different spindle versions; update both.",
             start + n,
             engine.max_seq
         );
@@ -701,7 +705,7 @@ pub fn serve_worker_connection(
 ) -> std::io::Result<()> {
     let mut cs = ClusterStream::new(stream)?;
     let peer = cs.peer_addr()?;
-    println!("[cluster:node] Accepted connection from Master at {peer}");
+    println!("  Client connected from {peer}");
 
     // Wait for handshake
     let (hdr, payload) = cs.recv_frame()?;
@@ -718,7 +722,7 @@ pub fn serve_worker_connection(
 
     if master_hs.dim != engine.cfg.dim {
         eprintln!(
-            "[cluster:node] Dim mismatch: master dim {} != worker dim {}",
+            "  Rejected: the client's model has hidden size {}, this worker's has {}. Both PCs must load the same GGUF file.",
             master_hs.dim, engine.cfg.dim
         );
         return Err(std::io::Error::new(
@@ -728,7 +732,7 @@ pub fn serve_worker_connection(
     }
 
     println!(
-        "[cluster:node] Handshake OK: Master has layers {}..{} | Worker has layers {}..{}",
+        "  Session started: client runs layers {}..{}, this worker runs {}..{}",
         master_hs.layer_start, master_hs.layer_end, engine.layer_range.start, engine.layer_range.end
     );
 
@@ -749,14 +753,14 @@ pub fn serve_worker_connection(
         let hdr = match cs.recv_frame_into(&mut payload) {
             Ok(h) => h,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                println!("[cluster:node] Master disconnected gracefully.");
+                println!("  Client disconnected.");
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
                 continue;
             }
             Err(e) => {
-                eprintln!("[cluster:node] Worker connection closed: {e}");
+                eprintln!("  Connection lost: {e}");
                 return Err(e);
             }
         };
@@ -835,11 +839,11 @@ pub fn serve_worker_connection(
                 cs.send_frame(FRAME_STEP_RESP, wire_format, &pack_scratch)?;
             }
             FRAME_SHUTDOWN => {
-                println!("[cluster:node] Received shutdown frame from Master.");
+                println!("  Client ended the session.");
                 break;
             }
             other => {
-                eprintln!("[cluster:node] Unrecognized frame type: {other}");
+                eprintln!("  Ignoring unknown message type {other} (is the client running a newer spindle?)");
             }
         }
     }

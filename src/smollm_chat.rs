@@ -1330,7 +1330,7 @@ impl SmolLm2Engine {
         );
 
         // Preflight: the KV-cache is the one big private allocation. Size it to what's free
-        // (a quarter of available RAM at most) instead of letting a failed allocation abort
+        // (about half of available RAM at most) instead of letting a failed allocation abort
         // the process. 4096 positions is the default (`ctx` / `--ctx` / `$CHAT_CTX`).
         let wanted = std::env::var("CHAT_CTX")
             .ok()
@@ -1555,7 +1555,7 @@ impl SmolLm2Engine {
                 self.max_seq = peer;
             }
         } else {
-            crate::ui::note("worker did not report its KV size (old binary?); update both nodes");
+            crate::ui::note("the worker did not report its context size, so it is probably older than 1.0. Update spindle on both PCs.");
         }
         self.cluster_client = Some(client);
     }

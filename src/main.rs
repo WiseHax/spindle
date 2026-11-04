@@ -139,11 +139,8 @@ impl HybridTopology {
     }
 }
 
-/// Discovers both Performance Cores (`EfficiencyClass == 1`) and Efficiency Cores
-/// (`EfficiencyClass == 0`) on the i5-13420H:
-/// - P-Core #0 (`LP #0`) -> IOCP NVMe Producer
-/// - P-Cores #1..3 (`LP #2, #4, #6`) -> 3 AVX2 `Q4_K` Speculative Verifier Workers
-/// - E-Core #0 (`LP #8`) -> In-RAM Speculative Token Drafter
+/// Reads the CPU set information to tell performance cores (the highest `EfficiencyClass`)
+/// from efficiency cores, and lists one logical CPU per physical P-core for compute threads.
 unsafe fn detect_hybrid_topology() -> Result<HybridTopology> {
     let mut needed = 0u32;
     let _ = GetSystemCpuSetInformation(None, 0, &mut needed, GetCurrentProcess(), 0);
@@ -796,6 +793,56 @@ struct CliConfig {
     tui: bool,
 }
 
+fn help_text() -> String {
+    format!(
+        "spindle {version}
+Run GGUF language models on the CPU, on one PC or split across two.
+
+Usage:
+  spindle [model.gguf] [options]        chat (the default; settings from spindle.toml)
+  spindle node <model.gguf> [options]   serve a range of layers to another PC
+  spindle <model.gguf> --prompt \"...\"   answer one prompt and exit
+  spindle <file> --probe                measure RAM and disk read speed
+
+Cluster:
+  --peer <ip:port>            worker to connect to (client side)
+  --bind <ip:port>            address to listen on (worker side, e.g. 0.0.0.0:42424)
+  --layer-range <a..b>        layers this PC runs, e.g. 0..35 on the worker, 35..48 here
+  --wire-format <fp8|fp16|fp32>
+                              how activations are sent between PCs (default fp16)
+
+Model and speed:
+  --threads <n>               compute threads (default: one per physical core)
+  --ctx <n>                   context length in tokens (default 4096, limited by free RAM)
+  --moe-prune <x>             MoE models: run the top x experts (x >= 1) or drop the
+                              tail below a router-probability fraction (x < 1); 0 = off
+  --no-spec                   turn off prompt-lookup speculative decoding
+  --draft <model.gguf>        use a small model for speculative drafts instead
+  --draft-len <n>             draft tokens per verify step (1..16, default 4)
+
+Chat:
+  --tools                     let the model read and edit files and run commands
+  --think                     allow reasoning (<think>) before answering
+  --system-prompt <text>      replace the default system prompt
+  --no-tui                    line-based chat instead of the full-screen interface
+  --temp <t>  --top-k <k>  --top-p <p>  --min-p <p>  --repeat-penalty <r>  --seed <n>
+
+Memory:
+  --reserve <MiB>             RAM to leave free for other programs (default 512)
+  --ram-budget <MiB>          hard limit on spindle's resident memory
+  --stream-layers             read layers that don't fit with one large read each
+
+Other:
+  -v, --verbose               print load, memory and threading details
+  -V, --version               print the version
+  -h, --help                  print this help
+
+Settings in ./spindle.toml are read first; command-line options override them.
+",
+        version = env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn load_config_file(cfg: &mut CliConfig) {
     let content = match std::fs::read_to_string("spindle.toml") {
         Ok(s) => s,
@@ -1066,25 +1113,12 @@ fn parse_cli() -> CliConfig {
                 cfg.chat_mode = true;
                 i += 1;
             }
+            "--version" | "-V" => {
+                println!("spindle {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--help" | "-h" => {
-                println!("{}", crate::ui::bold("Spindle: Pure-Rust Distributed MoE Inference Engine"));
-                println!("\nUsage:");
-                println!("  spindle chat <model.gguf> [options]         Start interactive chat");
-                println!("  spindle node <model.gguf> [options]         Start worker node server");
-                println!("\nOptions:");
-                println!("  --peer <IP:PORT>             Connect to worker node in cluster");
-                println!("  --bind <IP:PORT>             Bind address for worker node");
-                println!("  --layer-range <start..end>   Partition layers (e.g. 35..48)");
-                println!("  --wire-format <fp8|fp16>     Tensor wire compression (default: fp16)");
-                println!("  --moe-prune <threshold>      Dynamic MoE expert pruning (e.g. 0.03)");
-                println!("  --threads <n>                CPU worker threadpool count");
-                println!("  --system-prompt <prompt>     Custom assistant system prompt");
-                println!("  --draft <draft.gguf>         Speculative decoding draft model");
-                println!("  --draft-len <n>              Speculative draft batch length (1..16)");
-                println!("  --no-spec                    Disable prompt-lookup speculative decoding");
-                println!("  --ctx <n>                    Context length in tokens (default 4096, capped by free RAM)");
-                println!("  --tools                      Enable agentic tools (files, web search, shell)");
-                println!("  --think                      Enable chain-of-thought reasoning");
+                print!("{}", help_text());
                 std::process::exit(0);
             }
             other => {

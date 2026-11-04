@@ -429,7 +429,7 @@ pub unsafe fn benchmark_rio_mesh(arena_ptr: *mut u8, arena_len: usize, iteration
     node_b.connect_peer(node_a.local_addr)?;
 
     println!(
-        "[rio] initialized RIO_EXTENSION_FUNCTION_TABLE | Node A ({}) <-> Node B ({})",
+        "[rio] extension function table loaded; node A {} <-> node B {}",
         node_a.local_addr, node_b.local_addr
     );
     println!(
