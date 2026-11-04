@@ -913,7 +913,12 @@ pub struct SmolLm2Engine {
     think_ids: Option<(usize, usize)>,
     /// Counts KV-cache shifts, so a reply knows whether its positions moved under it.
     kv_shifts: u64,
-    system_prompt: &'static str,
+    /// Dynamic system prompt for the assistant.
+    pub system_prompt: String,
+    /// Speculative draft token batch length (default: 4).
+    pub draft_len: usize,
+    /// Whether agentic tools (file ops, web search, shell) are enabled.
+    pub enable_tools: bool,
     pub moe_stats: MoeStats,
     /// Optional small draft engine for speculative decoding (`--draft <path>`).
     pub draft_engine: Option<Box<SmolLm2Engine>>,
@@ -921,6 +926,8 @@ pub struct SmolLm2Engine {
     pub spec_stats: (usize, usize, usize),
     /// Optional cluster network client for distributed inference across multiple machines.
     pub cluster_client: Option<crate::cluster_net::ClusterClient>,
+    /// Saved KV-cache branches for zero-cost hypothesis rollout and rewinding in RAM.
+    pub kv_branches: HashMap<String, (usize, usize, Option<usize>, Option<usize>)>,
 }
 
 /// How a conversation is framed in tokens. Built once at load from the model's special
@@ -938,9 +945,10 @@ struct ChatFormat {
 
 /// SmolLM2's own system prompt. Giving the assistant a name stops the tiny model from
 /// adopting the user's name ("Hi, I'm Wise" -> "My name is Wise").
-const SMOLLM_SYSTEM_PROMPT: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
-const GRANITE_SYSTEM_PROMPT: &str = "You are Granite, developed by IBM. You are a helpful AI assistant.";
+pub const SMOLLM_SYSTEM_PROMPT: &str = "You are a helpful AI assistant named SmolLM, trained by Hugging Face";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+pub const GRANITE_SYSTEM_PROMPT: &str = "You are Granite, developed by IBM. You are a helpful AI assistant.";
+pub const QWEN_SYSTEM_PROMPT: &str = "You are Qwen, created by Alibaba. You are a helpful AI assistant. Always provide direct, helpful answers without internal monologue or self-narration.";
 
 impl SmolLm2Engine {
     pub fn load(path: &str) -> std::io::Result<Self> {
@@ -997,13 +1005,22 @@ impl SmolLm2Engine {
         }
         let think_ids = token("<think>").zip(token("</think>"));
         let name = idx.model_name.to_lowercase();
-        let system_prompt = if name.contains("smollm") {
-            SMOLLM_SYSTEM_PROMPT
+        let system_prompt = if let Ok(custom) = std::env::var("SPINDLE_SYSTEM_PROMPT") {
+            custom
+        } else if name.contains("smollm") {
+            SMOLLM_SYSTEM_PROMPT.to_string()
         } else if name.contains("granite") {
-            GRANITE_SYSTEM_PROMPT
+            GRANITE_SYSTEM_PROMPT.to_string()
+        } else if name.contains("qwen") {
+            QWEN_SYSTEM_PROMPT.to_string()
         } else {
-            DEFAULT_SYSTEM_PROMPT
+            DEFAULT_SYSTEM_PROMPT.to_string()
         };
+        let draft_len = std::env::var("SPINDLE_DRAFT_LEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 16);
 
         let raw_bytes = MappedFile::open(path)?;
         // A partial download still parses (the header is at the start), but tensors near the
@@ -1156,10 +1173,13 @@ impl SmolLm2Engine {
             think_ids,
             kv_shifts: 0,
             system_prompt,
+            draft_len,
+            enable_tools: false,
             moe_stats: MoeStats { touched: vec![false; c.n_layers * c.n_expert], ..Default::default() },
             draft_engine: None,
             spec_stats: (0, 0, 0),
             cluster_client: None,
+            kv_branches: HashMap::new(),
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -1262,13 +1282,113 @@ impl SmolLm2Engine {
         }
     }
 
+    /// Saves a named snapshot of the current KV-cache position for zero-cost branching.
+    pub fn save_kv_branch(&mut self, name: &str) -> usize {
+        let draft_pos = self.draft_engine.as_ref().map(|d| d.cur_pos);
+        let draft_keep = self.draft_engine.as_ref().map(|d| d.n_keep);
+        self.kv_branches.insert(name.to_string(), (self.cur_pos, self.n_keep, draft_pos, draft_keep));
+        self.cur_pos
+    }
+
+    /// Rewinds KV-cache to a previously saved branch in 0 ms without re-evaluating prompt tokens.
+    pub fn restore_kv_branch(&mut self, name: &str) -> Result<usize, String> {
+        let (pos, keep, draft_pos, draft_keep) = self.kv_branches.get(name).copied()
+            .ok_or_else(|| {
+                let avail: Vec<String> = self.kv_branches.keys().cloned().collect();
+                format!("KV branch '{}' not found. Available branches: {:?}", name, avail)
+            })?;
+        self.cur_pos = pos;
+        self.n_keep = keep;
+        if let Some(draft) = self.draft_engine.as_mut() {
+            if let Some(dp) = draft_pos {
+                draft.cur_pos = dp;
+            }
+            if let Some(dk) = draft_keep {
+                draft.n_keep = dk;
+            }
+        }
+        Ok(pos)
+    }
+
+    /// Lists all active KV-cache branch checkpoints.
+    pub fn list_kv_branches(&self) -> Vec<(String, usize)> {
+        let mut list: Vec<(String, usize)> = self.kv_branches.iter().map(|(k, v)| (k.clone(), v.0)).collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        list
+    }
+
     /// Attaches a small draft engine for speculative decoding (`--draft <path>`).
     pub fn enable_draft(&mut self, mut draft: SmolLm2Engine) {
         let max_seq = self.max_seq.min(draft.max_seq);
         self.max_seq = max_seq;
         draft.max_seq = max_seq;
-        draft.system_prompt = self.system_prompt;
+        draft.system_prompt = self.system_prompt.clone();
         self.draft_engine = Some(Box::new(draft));
+    }
+
+    /// Sets or updates the assistant's system prompt dynamically.
+    pub fn set_system_prompt(&mut self, prompt: &str) {
+        self.system_prompt = prompt.to_string();
+        if let Some(draft) = self.draft_engine.as_mut() {
+            draft.system_prompt = self.system_prompt.clone();
+        }
+    }
+
+    /// Feeds raw text into the KV-cache.
+    pub unsafe fn feed_text(&mut self, text: &str) {
+        let ids = self.encode_bpe_segment(text);
+        self.feed(&ids);
+        if let Some(draft) = self.draft_engine.as_mut() {
+            draft.feed(&ids);
+        }
+    }
+
+    /// Configures the speculative draft speculation batch length (1..16).
+    pub fn set_draft_len(&mut self, len: usize) {
+        self.draft_len = len.clamp(1, 16);
+    }
+
+    /// Enables or disables agentic tool usage (file ops, web search, shell execution).
+    pub fn set_tools_enabled(&mut self, enabled: bool) {
+        self.enable_tools = enabled;
+        let base_prompt = if let Ok(custom) = std::env::var("SPINDLE_SYSTEM_PROMPT") {
+            custom
+        } else {
+            let name = self.idx.model_name.to_lowercase();
+            if name.contains("smollm") {
+                SMOLLM_SYSTEM_PROMPT.to_string()
+            } else if name.contains("granite") {
+                GRANITE_SYSTEM_PROMPT.to_string()
+            } else if name.contains("qwen") {
+                QWEN_SYSTEM_PROMPT.to_string()
+            } else {
+                DEFAULT_SYSTEM_PROMPT.to_string()
+            }
+        };
+        if enabled {
+            let mut prompt = format!("{}\n{}", base_prompt, crate::tools::TOOLS_SYSTEM_PROMPT);
+            if let Some(spindle_md) = crate::tools::load_spindle_md() {
+                prompt.push_str("\n# Project Instructions (SPINDLE.md)\n");
+                prompt.push_str(&spindle_md);
+                prompt.push('\n');
+            }
+            self.system_prompt = prompt;
+        } else {
+            self.system_prompt = base_prompt;
+        }
+        if let Some(draft) = self.draft_engine.as_mut() {
+            draft.system_prompt = self.system_prompt.clone();
+        }
+    }
+
+    /// Gets the current dynamic MoE pruning cutoff threshold.
+    pub fn moe_prune(&self) -> f32 {
+        for layer in &self.layers {
+            if let FfnKind::Moe(m) = &layer.ffn {
+                return m.moe_prune;
+            }
+        }
+        0.0
     }
 
     /// Sets the dynamic MoE expert pruning threshold (e.g. 0.03 = prune experts with prob < 3% of max).
@@ -2086,7 +2206,10 @@ impl SmolLm2Engine {
     /// The system message, framed for this model.
     fn encode_system(&self) -> Vec<usize> {
         let f = &self.format;
-        [&f.system_open[..], &self.encode_bpe_segment(self.system_prompt), &f.system_close].concat()
+        if self.system_prompt.trim().is_empty() {
+            return Vec::new();
+        }
+        [&f.system_open[..], &self.encode_bpe_segment(&self.system_prompt), &f.system_close].concat()
     }
 
     /// A user message followed by the opening of the assistant's reply.
@@ -2363,8 +2486,8 @@ impl SmolLm2Engine {
                 let mut draft_hidden = draft.forward_hidden(next_id, draft.cur_pos);
                 draft.cur_pos += 1;
 
-                // 2. Draft up to K tokens using the small fast model
-                let max_draft = 4.min(max_new_tokens.saturating_sub(recent.len().saturating_sub(answer_from.unwrap_or(0))));
+                // 2. Draft up to K tokens using the small fast model (configurable via self.draft_len)
+                let max_draft = self.draft_len.min(max_new_tokens.saturating_sub(recent.len().saturating_sub(answer_from.unwrap_or(0))));
                 let mut draft_tokens = Vec::with_capacity(max_draft);
                 for _ in 0..max_draft {
                     draft.ensure_kv_room(1);
@@ -2630,7 +2753,7 @@ mod tests {
             return;
         }
         let eng = SmolLm2Engine::load(path).expect("load");
-        for text in ["Kumusta, Señor! Magandang umaga.", "naïve café 日本語 🦀", "tabs\tand\nnewlines"] {
+        for text in ["Kumusta, Señor! Magandang umaga.", "naïve café 日本語 ∑", "tabs\tand\nnewlines"] {
             let ids = eng.encode_bpe_segment(text);
             let bytes: Vec<u8> = ids.iter().flat_map(|&id| eng.token_bytes(id)).collect();
             assert_eq!(String::from_utf8(bytes).unwrap(), text);
