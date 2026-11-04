@@ -1,7 +1,7 @@
 //! OpenCode-grade Full-Screen Terminal User Interface (TUI) for Spindle.
 //!
-//! Provides an alternate screen canvas, 24-bit TrueColor differential double-buffering,
-//! floating elevated card layout, real-time keyboard event processing, and live token streaming.
+//! Provides an alternate screen canvas, 24-bit TrueColor atomic frame rendering,
+//! floating elevated card layout, chronological conversation view, and an electric blue theme.
 
 use std::io::{self, Read, Write};
 use windows::Win32::System::Console::{
@@ -15,19 +15,19 @@ use windows::Win32::System::Console::{
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 impl Rgb {
-    pub const BLACK: Rgb = Rgb(12, 13, 15);
-    pub const BG_DARK: Rgb = Rgb(15, 16, 20);
-    pub const CARD_BG: Rgb = Rgb(26, 28, 35);
-    pub const CARD_BORDER: Rgb = Rgb(48, 52, 64);
-    pub const WHITE: Rgb = Rgb(248, 250, 252);
-    pub const CYAN: Rgb = Rgb(56, 189, 248);
-    pub const ELECTRIC_BLUE: Rgb = Rgb(37, 99, 235);
-    pub const GREEN: Rgb = Rgb(52, 211, 153);
-    pub const ORANGE: Rgb = Rgb(249, 115, 22);
-    pub const MUTED: Rgb = Rgb(148, 163, 184);
-    pub const DIM: Rgb = Rgb(80, 90, 105);
-    pub const GOLD: Rgb = Rgb(251, 191, 36);
-    pub const MAGENTA: Rgb = Rgb(217, 70, 239);
+    pub const BG_DARK: Rgb = Rgb(10, 14, 23);           // Deep midnight navy
+    pub const CARD_BG: Rgb = Rgb(17, 24, 39);          // Elevated dark sapphire slate
+    pub const CARD_BORDER: Rgb = Rgb(30, 58, 110);      // Muted cobalt border
+    pub const PRIMARY_BLUE: Rgb = Rgb(37, 99, 235);     // Signature Royal Blue
+    pub const BRIGHT_BLUE: Rgb = Rgb(59, 130, 246);     // Electric Blue
+    pub const SKY_BLUE: Rgb = Rgb(96, 165, 250);        // Sky Blue highlight
+    pub const ICE_CYAN: Rgb = Rgb(56, 189, 248);        // Ice Cyan
+    pub const WHITE: Rgb = Rgb(248, 250, 252);         // Crisp White
+    pub const MUTED: Rgb = Rgb(148, 163, 184);         // Slate Gray
+    pub const DIM: Rgb = Rgb(71, 85, 105);             // Subtle Dark Gray
+    pub const GREEN: Rgb = Rgb(52, 211, 153);          // Emerald (mesh/success)
+    pub const ORANGE: Rgb = Rgb(251, 146, 60);         // Warm Orange (prune/stats)
+    pub const GOLD: Rgb = Rgb(251, 191, 36);           // Tool action gold
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,7 +84,7 @@ impl TerminalGuard {
             let _ = SetConsoleMode(in_handle, CONSOLE_MODE(new_in));
 
             let mut stdout = io::stdout();
-            // Enter alternate screen buffer and hide cursor
+            // Enter alternate screen buffer and hide hardware cursor
             let _ = write!(stdout, "\x1b[?1049h\x1b[?25l");
             let _ = stdout.flush();
 
@@ -127,12 +127,11 @@ pub fn terminal_size() -> (u16, u16) {
     (100, 30)
 }
 
-/// High-performance 2D differential frame buffer with zero flicker.
+/// High-performance 2D frame buffer with atomic full-screen sync.
 pub struct Canvas {
     pub width: u16,
     pub height: u16,
-    front: Vec<Cell>,
-    back: Vec<Cell>,
+    grid: Vec<Cell>,
 }
 
 impl Canvas {
@@ -141,8 +140,7 @@ impl Canvas {
         Self {
             width,
             height,
-            front: vec![Cell::default(); size],
-            back: vec![Cell::default(); size],
+            grid: vec![Cell::default(); size],
         }
     }
 
@@ -153,12 +151,11 @@ impl Canvas {
         self.width = width;
         self.height = height;
         let size = (width as usize) * (height as usize);
-        self.front = vec![Cell::default(); size];
-        self.back = vec![Cell::default(); size];
+        self.grid = vec![Cell::default(); size];
     }
 
     pub fn clear(&mut self, bg: Rgb) {
-        for c in self.back.iter_mut() {
+        for c in self.grid.iter_mut() {
             c.ch = ' ';
             c.fg = Rgb::WHITE;
             c.bg = bg;
@@ -171,7 +168,7 @@ impl Canvas {
     pub fn set(&mut self, x: u16, y: u16, ch: char, fg: Rgb, bg: Rgb, bold: bool, dim: bool) {
         if x < self.width && y < self.height {
             let idx = (y as usize) * (self.width as usize) + (x as usize);
-            self.back[idx] = Cell { ch, fg, bg, bold, dim };
+            self.grid[idx] = Cell { ch, fg, bg, bold, dim };
         }
     }
 
@@ -202,7 +199,7 @@ impl Canvas {
         }
     }
 
-    /// Renders an OpenCode-style elevated card with an electric cyan accent bar on the left.
+    /// Renders an OpenCode-style floating card in dark blue tones.
     pub fn draw_card(&mut self, x: u16, y: u16, w: u16, h: u16, bg: Rgb, accent_bar: Rgb) {
         // Fill card background
         self.fill_rect(x, y, w, h, ' ', Rgb::WHITE, bg);
@@ -210,78 +207,68 @@ impl Canvas {
         // Draw subtle border around card
         let border_fg = Rgb::CARD_BORDER;
         for col in x..x + w {
-            self.set(col, y, '─', border_fg, bg, false, true);
-            self.set(col, y + h - 1, '─', border_fg, bg, false, true);
+            self.set(col, y, '─', border_fg, bg, false, false);
+            self.set(col, y + h - 1, '─', border_fg, bg, false, false);
         }
         for row in y..y + h {
-            self.set(x, row, '│', border_fg, bg, false, true);
-            self.set(x + w - 1, row, '│', border_fg, bg, false, true);
+            self.set(x, row, '│', border_fg, bg, false, false);
+            self.set(x + w - 1, row, '│', border_fg, bg, false, false);
         }
-        self.set(x, y, '┌', border_fg, bg, false, true);
-        self.set(x + w - 1, y, '┐', border_fg, bg, false, true);
-        self.set(x, y + h - 1, '└', border_fg, bg, false, true);
-        self.set(x + w - 1, y + h - 1, '┘', border_fg, bg, false, true);
+        self.set(x, y, '╭', border_fg, bg, false, false);
+        self.set(x + w - 1, y, '╮', border_fg, bg, false, false);
+        self.set(x, y + h - 1, '╰', border_fg, bg, false, false);
+        self.set(x + w - 1, y + h - 1, '╯', border_fg, bg, false, false);
 
-        // Left prominent accent bar (OpenCode signature `▌`)
+        // Left prominent accent bar (`▌`) in electric blue
         for row in (y + 1)..(y + h - 1) {
             self.set(x, row, '▌', accent_bar, bg, true, false);
         }
     }
 
-    /// Flushes only changed cells to stdout using 24-bit TrueColor ANSI escape sequences.
+    /// Atomic frame flush: emits the whole screen in one buffer write with zero artifacts.
     pub fn flush(&mut self) -> io::Result<()> {
-        let mut out = io::stdout();
-        let mut current_fg = Rgb(0, 0, 0);
-        let mut current_bg = Rgb(0, 0, 0);
-        let mut current_bold = false;
-        let mut current_dim = false;
+        let mut buf = String::with_capacity((self.width as usize) * (self.height as usize) * 8);
+        // Home cursor to (1, 1)
+        buf.push_str("\x1b[H");
+
+        let mut cur_fg = Rgb(0, 0, 0);
+        let mut cur_bg = Rgb(0, 0, 0);
+        let mut cur_bold = false;
+        let mut cur_dim = false;
         let mut in_escape = false;
 
         for y in 0..self.height {
-            let mut x = 0;
-            while x < self.width {
+            for x in 0..self.width {
                 let idx = (y as usize) * (self.width as usize) + (x as usize);
-                if self.back[idx] != self.front[idx] {
-                    // Position cursor to (row, col) - 1-based in ANSI
-                    write!(out, "\x1b[{};{}H", y + 1, x + 1)?;
+                let cell = self.grid[idx];
 
-                    // Stream contiguous changed cells
-                    while x < self.width {
-                        let c_idx = (y as usize) * (self.width as usize) + (x as usize);
-                        if self.back[c_idx] == self.front[c_idx] && (x + 1 < self.width && self.back[c_idx + 1] == self.front[c_idx + 1]) {
-                            break;
-                        }
-                        let cell = self.back[c_idx];
-
-                        // Update attributes if changed
-                        if !in_escape || cell.fg != current_fg || cell.bg != current_bg || cell.bold != current_bold || cell.dim != current_dim {
-                            write!(out, "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
-                                cell.fg.0, cell.fg.1, cell.fg.2,
-                                cell.bg.0, cell.bg.1, cell.bg.2
-                            )?;
-                            if cell.bold {
-                                write!(out, "\x1b[1m")?;
-                            }
-                            if cell.dim {
-                                write!(out, "\x1b[2m")?;
-                            }
-                            current_fg = cell.fg;
-                            current_bg = cell.bg;
-                            current_bold = cell.bold;
-                            current_dim = cell.dim;
-                            in_escape = true;
-                        }
-
-                        write!(out, "{}", cell.ch)?;
-                        self.front[c_idx] = cell;
-                        x += 1;
+                if !in_escape || cell.fg != cur_fg || cell.bg != cur_bg || cell.bold != cur_bold || cell.dim != cur_dim {
+                    buf.push_str(&format!(
+                        "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
+                        cell.fg.0, cell.fg.1, cell.fg.2,
+                        cell.bg.0, cell.bg.1, cell.bg.2
+                    ));
+                    if cell.bold {
+                        buf.push_str("\x1b[1m");
                     }
-                } else {
-                    x += 1;
+                    if cell.dim {
+                        buf.push_str("\x1b[2m");
+                    }
+                    cur_fg = cell.fg;
+                    cur_bg = cell.bg;
+                    cur_bold = cell.bold;
+                    cur_dim = cell.dim;
+                    in_escape = true;
                 }
+                buf.push(cell.ch);
             }
+            // Reset color at end of row and clear to end of line
+            buf.push_str("\x1b[0m\x1b[K\n");
+            in_escape = false;
         }
 
+        let mut out = io::stdout();
+        out.write_all(buf.as_bytes())?;
         out.flush()?;
         Ok(())
     }
@@ -293,6 +280,14 @@ pub const SPINDLE_LOGO: [&str; 4] = [
     "  ▀█▄     ██▄▄██  ██  ████ ██  ██   ██  ██       ██▄▄▄  ",
     "    ▀▀██  ██      ██  ██ ▀███  ██   ██  ██       ██     ",
     "  █████▀  ██      ██  ██   ██  ██████   ███████  ███████",
+];
+
+/// Gradient colors for each line of the Spindle logo (Ice White -> Royal Blue).
+pub const LOGO_GRADIENT: [Rgb; 4] = [
+    Rgb(240, 249, 255), // Ice White
+    Rgb(147, 197, 253), // Soft Sky Blue
+    Rgb(59, 130, 246),  // Electric Blue
+    Rgb(29, 78, 216),   // Deep Cobalt Blue
 ];
 
 /// Keys captured during the event loop.
@@ -319,7 +314,6 @@ pub fn read_key_nonblocking() -> KeyAction {
     let mut stdin = io::stdin();
     let mut byte = [0u8; 1];
 
-    // Read single byte
     if stdin.read(&mut byte).unwrap_or(0) == 0 {
         return KeyAction::None;
     }
@@ -328,9 +322,8 @@ pub fn read_key_nonblocking() -> KeyAction {
         13 | 10 => KeyAction::Enter,
         8 | 127 => KeyAction::Backspace,
         9 => KeyAction::Tab,
-        16 => KeyAction::CtrlP, // Ctrl+P
+        16 => KeyAction::CtrlP,
         27 => {
-            // Escape sequence or Alt
             let mut seq = [0u8; 2];
             if stdin.read(&mut seq[0..1]).unwrap_or(0) == 1 {
                 if seq[0] == b'[' {
@@ -429,6 +422,14 @@ pub struct ChatMessage {
     pub speed_badge: Option<String>,
 }
 
+/// Formatted line to be rendered inside the chat viewport.
+struct ViewportLine {
+    text: String,
+    fg: Rgb,
+    bold: bool,
+    dim: bool,
+}
+
 /// The Full-Screen TUI Orchestrator.
 pub struct SpindleTui {
     canvas: Canvas,
@@ -481,7 +482,7 @@ impl SpindleTui {
         None
     }
 
-    /// Renders the signature OpenCode-style hero screen when no active turn is in progress.
+    /// Renders the signature OpenCode-style hero screen in electric blue when starting.
     pub fn render_welcome(&mut self) {
         let (w, h) = terminal_size();
         self.canvas.resize(w, h);
@@ -490,12 +491,12 @@ impl SpindleTui {
         let center_x = w / 2;
         let logo_y = (h / 6).max(2);
 
-        // 1. Centered Hero Block Logo with Electric Cyan/Blue Gradient
+        // 1. Centered Hero Block Logo with Vertical Blue Gradient
         for (i, line) in SPINDLE_LOGO.iter().enumerate() {
             let row = logo_y + (i as u16);
             let len = line.chars().count() as u16;
             let start_x = center_x.saturating_sub(len / 2);
-            let color = if i < 2 { Rgb::WHITE } else { Rgb::CYAN };
+            let color = LOGO_GRADIENT[i % LOGO_GRADIENT.len()];
             self.canvas.print(start_x, row, line, color, Rgb::BG_DARK, true, false);
         }
 
@@ -505,50 +506,44 @@ impl SpindleTui {
         self.canvas.print(sub_x, logo_y + 5, sub, Rgb::MUTED, Rgb::BG_DARK, false, false);
 
         // 3. Floating Input Card
-        let card_w = 82.min(w.saturating_sub(6));
-        let card_h = 6;
+        let card_w = (w.saturating_sub(6)).clamp(40, 82);
+        let card_h = 5;
         let card_x = center_x.saturating_sub(card_w / 2);
         let card_y = logo_y + 7;
 
-        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::CYAN);
+        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
         // Content Row: Text or Ghost Placeholder
         let prompt_x = card_x + 3;
         let prompt_y = card_y + 1;
         if self.input.text.is_empty() {
             let ghost = "Ask anything... \"delete hello.py\", \"/review\", \"/stats\"";
-            self.canvas.print(prompt_x, prompt_y, ghost, Rgb::DIM, Rgb::CARD_BG, false, true);
-            // Blinking cursor indicator
-            self.canvas.print(prompt_x, prompt_y, "█", Rgb::CYAN, Rgb::CARD_BG, true, false);
+            self.canvas.print(prompt_x, prompt_y, ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
+            self.canvas.print(prompt_x, prompt_y, "█", Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
         } else {
-            // Render user input up to visible card width
             let visible_w = (card_w.saturating_sub(6)) as usize;
             let display_text: String = self.input.text.chars().take(visible_w).collect();
             self.canvas.print(prompt_x, prompt_y, &display_text, Rgb::WHITE, Rgb::CARD_BG, false, false);
-            // Render block cursor at insertion point
             let cursor_x = prompt_x + (self.input.cursor as u16).min(visible_w as u16);
-            self.canvas.set(cursor_x, prompt_y, '█', Rgb::CYAN, Rgb::CARD_BG, true, false);
+            self.canvas.set(cursor_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
         }
 
         // Bottom Meta Badges inside the card
         let meta_y = card_y + 3;
         let mut mx = prompt_x;
 
-        // Build Badge (Cyan pill)
-        self.canvas.print(mx, meta_y, "Build", Rgb::CYAN, Rgb::CARD_BG, true, false);
+        // Build Badge (Electric Blue pill)
+        self.canvas.print(mx, meta_y, "Build", Rgb::SKY_BLUE, Rgb::CARD_BG, true, false);
         mx += 6;
 
-        // Model Badge
         let model_badge = format!("· {} ({})", self.model_name, self.layers_info);
         self.canvas.print(mx, meta_y, &model_badge, Rgb::WHITE, Rgb::CARD_BG, false, false);
         mx += model_badge.len() as u16 + 1;
 
-        // Prune Badge
         let prune_badge = format!("· {:.2} prune", self.prune_val);
         self.canvas.print(mx, meta_y, &prune_badge, Rgb::ORANGE, Rgb::CARD_BG, false, false);
         mx += prune_badge.len() as u16 + 1;
 
-        // Cluster Mesh Badge
         if let Some(peer) = &self.cluster_peer {
             let mesh_badge = format!("· mesh: {peer}");
             self.canvas.print(mx, meta_y, &mesh_badge, Rgb::GREEN, Rgb::CARD_BG, false, false);
@@ -565,17 +560,17 @@ impl SpindleTui {
         let _ = self.canvas.flush();
     }
 
-    /// Renders the conversation view when messages exist.
+    /// Renders the conversation view strictly CHRONOLOGICALLY (oldest on top, newest at bottom).
     pub fn render_chat(&mut self) {
         let (w, h) = terminal_size();
         self.canvas.resize(w, h);
         self.canvas.clear(Rgb::BG_DARK);
 
-        // 1. Persistent Top Header (Row 0)
+        // 1. Persistent Top Header Bar (Row 0)
         let header_bg = Rgb::CARD_BG;
         self.canvas.fill_rect(0, 0, w, 1, ' ', Rgb::WHITE, header_bg);
-        self.canvas.print(2, 0, "SPINDLE v0.1.0", Rgb::CYAN, header_bg, true, false);
-        let status = format!("· {} · {} · peak 9.0 tok/s", self.model_name, self.layers_info);
+        self.canvas.print(2, 0, "SPINDLE v0.1.0", Rgb::BRIGHT_BLUE, header_bg, true, false);
+        let status = format!("· {} · {} · 9.0 tok/s record", self.model_name, self.layers_info);
         self.canvas.print(18, 0, &status, Rgb::MUTED, header_bg, false, false);
 
         if let Some(p) = &self.cluster_peer {
@@ -584,68 +579,98 @@ impl SpindleTui {
             self.canvas.print(mx, 0, &mesh_str, Rgb::GREEN, header_bg, true, false);
         }
 
-        // 2. Chat history rendering (Rows 2 to h - 8)
-        let mut current_y = 2;
-        let max_chat_y = h.saturating_sub(8);
-
-        for msg in self.history.iter().rev() {
-            if current_y >= max_chat_y {
-                break;
-            }
+        // 2. Format conversation history chronologically (Oldest -> Newest)
+        let mut lines: Vec<ViewportLine> = Vec::new();
+        for msg in &self.history {
             if msg.role == "user" {
-                let badge = "> User";
-                self.canvas.print(2, current_y, badge, Rgb::CYAN, Rgb::BG_DARK, true, false);
-                self.canvas.print(9, current_y, &msg.text, Rgb::WHITE, Rgb::BG_DARK, false, false);
-                current_y += 2;
+                lines.push(ViewportLine {
+                    text: format!("> You: {}", msg.text),
+                    fg: Rgb::SKY_BLUE,
+                    bold: true,
+                    dim: false,
+                });
             } else if msg.role == "tool" {
-                self.canvas.print(2, current_y, "┌ Tool Call", Rgb::MUTED, Rgb::BG_DARK, false, true);
-                self.canvas.print(14, current_y, &msg.text, Rgb::GOLD, Rgb::BG_DARK, false, false);
-                current_y += 2;
+                lines.push(ViewportLine {
+                    text: format!("  [*] {}", msg.text),
+                    fg: Rgb::GOLD,
+                    bold: false,
+                    dim: false,
+                });
             } else {
-                let badge = "Spindle";
-                self.canvas.print(2, current_y, badge, Rgb::ELECTRIC_BLUE, Rgb::BG_DARK, true, false);
-                if let Some(speed) = &msg.speed_badge {
-                    self.canvas.print(11, current_y, speed, Rgb::MUTED, Rgb::BG_DARK, false, true);
+                // Assistant message
+                let header = if let Some(speed) = &msg.speed_badge {
+                    format!("Spindle · {speed}")
+                } else {
+                    "Spindle".to_string()
+                };
+                lines.push(ViewportLine {
+                    text: header,
+                    fg: Rgb::PRIMARY_BLUE,
+                    bold: true,
+                    dim: false,
+                });
+                for body_line in msg.text.lines() {
+                    lines.push(ViewportLine {
+                        text: format!("  {body_line}"),
+                        fg: Rgb::WHITE,
+                        bold: false,
+                        dim: false,
+                    });
                 }
-                current_y += 1;
-
-                // Render assistant lines
-                for line in msg.text.lines().take(4) {
-                    if current_y >= max_chat_y {
-                        break;
-                    }
-                    self.canvas.print(4, current_y, line, Rgb::WHITE, Rgb::BG_DARK, false, false);
-                    current_y += 1;
-                }
-                current_y += 1;
             }
+            // Empty blank line between turns
+            lines.push(ViewportLine {
+                text: String::new(),
+                fg: Rgb::WHITE,
+                bold: false,
+                dim: false,
+            });
         }
 
-        // 3. Bottom Docked Input Card (Rows h - 7 to h - 2)
-        let card_w = 84.min(w.saturating_sub(4));
-        let card_h = 5;
-        let card_x = (w / 2).saturating_sub(card_w / 2);
+        // 3. Render visible viewport lines above the bottom input card
+        let top_y = 2u16;
+        let card_h = 5u16;
         let card_y = h.saturating_sub(7);
+        let viewport_h = card_y.saturating_sub(top_y) as usize;
 
-        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::CYAN);
+        let start_idx = if lines.len() > viewport_h {
+            lines.len() - viewport_h
+        } else {
+            0
+        };
+
+        for (i, line) in lines[start_idx..].iter().enumerate() {
+            let y = top_y + (i as u16);
+            if y >= card_y {
+                break;
+            }
+            self.canvas.print(2, y, &line.text, line.fg, Rgb::BG_DARK, line.bold, line.dim);
+        }
+
+        // 4. Floating Input Card docked at the bottom
+        let card_w = (w.saturating_sub(6)).clamp(40, 82);
+        let card_x = (w / 2).saturating_sub(card_w / 2);
+
+        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
         let prompt_x = card_x + 3;
         let prompt_y = card_y + 1;
         if self.input.text.is_empty() {
-            self.canvas.print(prompt_x, prompt_y, "Ask anything...", Rgb::DIM, Rgb::CARD_BG, false, true);
-            self.canvas.print(prompt_x, prompt_y, "█", Rgb::CYAN, Rgb::CARD_BG, true, false);
+            self.canvas.print(prompt_x, prompt_y, "Ask anything...", Rgb::DIM, Rgb::CARD_BG, false, false);
+            self.canvas.print(prompt_x, prompt_y, "█", Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
         } else {
             let visible_w = (card_w.saturating_sub(6)) as usize;
             let display: String = self.input.text.chars().take(visible_w).collect();
             self.canvas.print(prompt_x, prompt_y, &display, Rgb::WHITE, Rgb::CARD_BG, false, false);
             let cursor_x = prompt_x + (self.input.cursor as u16).min(visible_w as u16);
-            self.canvas.set(cursor_x, prompt_y, '█', Rgb::CYAN, Rgb::CARD_BG, true, false);
+            self.canvas.set(cursor_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
         }
 
-        // Card meta line
-        self.canvas.print(prompt_x, card_y + 3, "Build · Qwen3-30B-A3B · 0.03 prune · low-mem", Rgb::MUTED, Rgb::CARD_BG, false, false);
+        // Card meta line inside input box
+        let meta_str = format!("Build · {} · {:.2} prune · low-mem", self.model_name, self.prune_val);
+        self.canvas.print(prompt_x, card_y + 3, &meta_str, Rgb::MUTED, Rgb::CARD_BG, false, false);
 
-        // 4. Docked Global Footer
+        // 5. Docked Global Footer
         self.render_docked_footer(w, h);
 
         let _ = self.canvas.flush();
@@ -657,11 +682,11 @@ impl SpindleTui {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
         let footer_left = format!("{}:{}", cwd, self.git_branch);
-        self.canvas.print(2, footer_y, &footer_left, Rgb::MUTED, Rgb::BG_DARK, false, true);
+        self.canvas.print(2, footer_y, &footer_left, Rgb::MUTED, Rgb::BG_DARK, false, false);
 
         let footer_right = "spindle v0.1.0";
         let right_x = w.saturating_sub(footer_right.len() as u16 + 2);
-        self.canvas.print(right_x, footer_y, footer_right, Rgb::MUTED, Rgb::BG_DARK, false, true);
+        self.canvas.print(right_x, footer_y, footer_right, Rgb::MUTED, Rgb::BG_DARK, false, false);
     }
 
     /// Appends a completed message turn to conversation history.
@@ -766,6 +791,7 @@ fn execute_tui_turn(
     allow_think: bool,
     max_tokens: usize,
 ) {
+    // 1. Record user turn first
     tui.push_message("user", prompt, None);
     tui.render_chat();
 
@@ -776,9 +802,7 @@ fn execute_tui_turn(
 
     loop {
         let (out_text, secs, tokens) = unsafe {
-            engine.generate_reply(&current_input, max_tokens, allow_think, &mut |_token_piece| {
-                // Future enhancement: incremental token stream update
-            })
+            engine.generate_reply(&current_input, max_tokens, allow_think, &mut |_token_piece| {})
         };
 
         let tok_per_sec = tokens as f64 / secs.max(0.001);
@@ -855,6 +879,7 @@ fn execute_tui_turn(
             }
         }
 
+        // Clean out any raw tool call tags for final assistant display
         let display_reply = out_text.trim();
         tui.push_message("assistant", display_reply, Some(&speed_badge));
         tui.render_chat();
@@ -872,29 +897,27 @@ mod tests {
         assert_eq!(canvas.width, 80);
         assert_eq!(canvas.height, 24);
 
-        canvas.set(5, 5, 'A', Rgb::CYAN, Rgb::CARD_BG, true, false);
+        canvas.set(5, 5, 'A', Rgb::SKY_BLUE, Rgb::CARD_BG, true, false);
         let idx = 5 * 80 + 5;
-        assert_eq!(canvas.back[idx].ch, 'A');
-        assert_eq!(canvas.back[idx].fg, Rgb::CYAN);
+        assert_eq!(canvas.grid[idx].ch, 'A');
+        assert_eq!(canvas.grid[idx].fg, Rgb::SKY_BLUE);
 
-        canvas.clear(Rgb::BLACK);
-        assert_eq!(canvas.back[idx].ch, ' ');
-        assert_eq!(canvas.back[idx].bg, Rgb::BLACK);
+        canvas.clear(Rgb::BG_DARK);
+        assert_eq!(canvas.grid[idx].ch, ' ');
+        assert_eq!(canvas.grid[idx].bg, Rgb::BG_DARK);
     }
 
     #[test]
     fn test_canvas_draw_card() {
         let mut canvas = Canvas::new(80, 24);
-        canvas.draw_card(10, 5, 40, 6, Rgb::CARD_BG, Rgb::CYAN);
+        canvas.draw_card(10, 5, 40, 6, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
-        // Check top-left corner
         let tl_idx = 5 * 80 + 10;
-        assert_eq!(canvas.back[tl_idx].ch, '┌');
+        assert_eq!(canvas.grid[tl_idx].ch, '╭');
 
-        // Check left accent bar at row 6
         let bar_idx = 6 * 80 + 10;
-        assert_eq!(canvas.back[bar_idx].ch, '▌');
-        assert_eq!(canvas.back[bar_idx].fg, Rgb::CYAN);
+        assert_eq!(canvas.grid[bar_idx].ch, '▌');
+        assert_eq!(canvas.grid[bar_idx].fg, Rgb::BRIGHT_BLUE);
     }
 
     #[test]
@@ -919,16 +942,21 @@ mod tests {
         buf.move_right();
         assert_eq!(buf.cursor, 1);
 
-        buf.delete(); // deletes 'e'
+        buf.delete();
         assert_eq!(buf.text, "hy");
     }
 
     #[test]
-    fn test_spindle_tui_welcome_render_no_panic() {
+    fn test_spindle_tui_welcome_and_chat_render() {
         let mut tui = SpindleTui::new("Qwen3-30B-A3B", Some("192.168.1.10:42424"), "fp8", 0.03, "layers 35..48");
-        // Ensure rendering welcome does not panic even on smaller virtual canvases
         tui.canvas.resize(80, 24);
         tui.render_welcome();
         assert!(tui.running);
+
+        // Test chronological chat rendering
+        tui.push_message("user", "Hello Spindle", None);
+        tui.push_message("assistant", "I am ready to assist you.", Some("8.5 tok/s"));
+        tui.render_chat();
+        assert_eq!(tui.history.len(), 2);
     }
 }
