@@ -55,7 +55,7 @@ Captured live on November 4, 2026:
 
 ### Turn 1: Initialization & Greeting
 - **Prompt:** `"Hi"`
-- **Response:** `"Hi! How can I assist you today? 😊"`
+- **Response:** `"Hi! How can I assist you today?"`
 - **Performance:** **2.5 tok/s** · 26 tokens · 10.2 s · LAN RTT: 1.95 ms
 
 ### Turn 2: Identity & Purpose

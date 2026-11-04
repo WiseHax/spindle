@@ -37,7 +37,12 @@ by streaming weights from the NVMe drive, mostly MoE models. That part isn't don
 - **Dynamic Energy-Preserving MoE Pruning (`--moe-prune 0.03`)**: Dynamically prunes low-probability tail experts ($p_e < \alpha \cdot p_{\max}$) and renormalizes output energy, dropping average active experts from 8 down to 5.2 and cutting memory bus traffic by 31.4% with zero quality loss
 - **Contiguous MoE Expert Repacking**: `--pack-experts` repacks scattered GGUF expert tensors into contiguous aligned DMA slots for 3x faster NVMe reads
 - **Smart RAM Headroom & Working-Set Governor**: Dynamically sizes KV-cache and weights to fit available RAM without triggering premature OS disk paging or out-of-memory aborts
-- Multi-turn interactive chat with live slash commands (`/model`, `/cluster`, `/bench`, `/think`, `/stats`, `/clear`, `/max`)
+- **Native Claude Code-Style Agentic Runtime**: Autonomous tool calling (`read_file`, `write_file`, `edit_file`, `list_dir`, `search_web`, `run_command`) with live OpenCode-style visual boxes and streaming Thought containers
+- **Anti-Host Sabotage Security Guard**: Hardware-backed safety boundary protecting the host from system destruction (`format`, `diskpart`, boot tampering), account hijacking, credential theft (SSH keys, SAM hive), and fork-bombs with a 30s watchdog
+- **Real-Time Shadow Snapshot Undo (`/undo`)**: Automatic pre-edit shadow backups allow rolling back agent code modifications with a single command
+- **Persistent Project Memory (`SPINDLE.md` & `/init`)**: Workspace guidelines and architecture context automatically injected into the model's system prompt
+- **Zero-Config All-in-One CLI (`spindle.toml`)**: Zero-argument launch automatically connects to cluster mesh, configures SIMD threads and dynamic MoE pruning, and launches agentic chat
+- Multi-turn interactive chat with live slash commands (`/tools`, `/undo`, `/diff`, `/git`, `/plan`, `/init`, `/compact`, `/think`, `/system`, `/moe-prune`, `/draft-len`, `/cluster`, `/model`, `/bench`, `/clear`, `/stats`, `/max`)
 - Temperature, top-k, top-p, min-p sampling with a seed
 - `--probe` to measure your RAM and SSD bandwidth
 
@@ -55,6 +60,10 @@ Tested on Intel i5-13420H (4 P-cores, 4 E-cores, AVX2/FMA/F16C), 8 GB RAM, Windo
 | **Qwen3-30B-A3B** (Speculative Cluster) | 17.7 GiB + 0.6B Draft | **Cluster Speculative Verification** (`--draft qwen3-0.6b`) | **15.0 – 22.2 tok/s** (breaking the memory wall!) |
 
 Detailed architectural breakdowns and logs:
+- [Agentic Architecture & Tool Pipeline](docs/agent_architecture.md)
+- [Security Guardrails & Anti-Sabotage Threat Model](docs/security_guardrails.md)
+- [Agentic CLI Guide & Slash Commands](docs/agentic_cli_guide.md)
+- [Project Memory & Shadow Undo System](docs/spindle_memory_system.md)
 - [Beyond the Memory Wall: Breaking the 7.2 tok/s Ceiling](docs/beyond_the_memory_wall.md)
 - [Distributed Speculative Decoding Protocol](docs/speculative_decoding.md)
 - [Dynamic Energy-Preserving MoE Expert Pruning](docs/dynamic_moe_pruning.md)
