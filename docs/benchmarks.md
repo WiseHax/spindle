@@ -45,7 +45,8 @@ Speed (Tokens / Second)
 | **Stage 2: Multi-Thread Worker** | Worker pool enabled on 4 P-cores | `3.1` | 19.3 s | Saturated physical CPU cores |
 | **Stage 3: Layer Balance** | PC: 0..35, Laptop: 35..48 | `3.5` | 17.1 s | Relieved PC RAM from 97% to 80% (no Win32 paging) |
 | **Stage 4: FP8 Tensor Wire** | Adaptive 8-bit quantization | `5.1 – 6.0` | 10.0 s | Halved Wi-Fi packet payload (8 KB -> 4 KB) |
-| **Stage 5: Dual-Row Q6_K + Zero-Heap** | Port 0/1 FMA unroll + L1 stack router | **`6.3 – 7.2`** | **8.3 s** | Saturated dual FMA ports & removed heap lock contention |
+| **Stage 5: Dual-Row Q6_K + Zero-Heap** | Port 0/1 FMA unroll + L1 stack router | `6.3 – 7.2` | 8.3 s | Saturated dual FMA ports & removed heap lock contention |
+| **Stage 6: MoE Pruning + KV Pre-Warm** | Dynamic 0.03 cutoff + in-RAM KV caching | **`8.0 – 8.3`** | **48.3 s (402 tokens)** | All-time speed record across distributed Wi-Fi mesh |
 
 ---
 
