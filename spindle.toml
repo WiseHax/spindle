@@ -7,7 +7,7 @@ peer = "192.168.1.10:42424"
 layer_range = "35..48"
 wire_format = "fp8"
 threads = 4
-moe_prune = 0.15
+moe_prune = 4
 tools = true
 think = false
 
