@@ -1680,6 +1680,10 @@ mod tests {
     fn f16(v: f32) -> [u8; 2] {
         let b = v.to_bits();
         let sign = ((b >> 16) & 0x8000) as u16;
+        if v.abs() < 6.103_515_6e-5 {
+            // Below f16's smallest normal: flush to signed zero (the exponent would wrap to NaN).
+            return sign.to_le_bytes();
+        }
         let exp = (((b >> 23) & 0xff) as i32 - 127 + 15) as u16;
         let mant = ((b >> 13) & 0x3ff) as u16;
         (sign | (exp << 10) | mant).to_le_bytes()
@@ -1738,8 +1742,8 @@ mod tests {
             GgmlType::Q6K,
         ];
         for dtype in types {
-            for n in [256usize, 768] {
-                let rows = 5;
+            // Odd row counts exercise the 4-row/2-row kernels *and* their 1..3-row tails.
+            for (n, rows) in [256usize, 768, 2048].into_iter().flat_map(|n| [2usize, 3, 4, 5, 6, 8, 10].map(move |r| (n, r))) {
                 let mut mat = Vec::new();
                 for _ in 0..rows {
                     mat.extend(random_row(dtype, n, &mut rng));
