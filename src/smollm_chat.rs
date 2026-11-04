@@ -928,6 +928,15 @@ pub struct SmolLm2Engine {
     pub cluster_client: Option<crate::cluster_net::ClusterClient>,
     /// Saved KV-cache branches for zero-cost hypothesis rollout and rewinding in RAM.
     pub kv_branches: HashMap<String, (usize, usize, Option<usize>, Option<usize>)>,
+    /// Cluster execution timing breakdown per token.
+    pub cluster_timing: ClusterTiming,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ClusterTiming {
+    pub worker_us: u64,
+    pub local_us: u64,
+    pub steps: u64,
 }
 
 /// How a conversation is framed in tokens. Built once at load from the model's special
@@ -1180,6 +1189,7 @@ impl SmolLm2Engine {
             spec_stats: (0, 0, 0),
             cluster_client: None,
             kv_branches: HashMap::new(),
+            cluster_timing: ClusterTiming::default(),
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -1398,6 +1408,20 @@ impl SmolLm2Engine {
                 m.moe_prune = threshold;
             }
         }
+        if let Some(c) = self.cluster_client.as_mut() {
+            let _ = c.set_moe_prune(threshold);
+        }
+    }
+
+    /// Takes the average cluster timing breakdown (worker_ms, local_ms) for the completed turn.
+    pub fn take_cluster_timing(&mut self) -> Option<(f64, f64)> {
+        if self.cluster_timing.steps == 0 {
+            return None;
+        }
+        let w_avg_ms = (self.cluster_timing.worker_us as f64 / self.cluster_timing.steps as f64) / 1000.0;
+        let l_avg_ms = (self.cluster_timing.local_us as f64 / self.cluster_timing.steps as f64) / 1000.0;
+        self.cluster_timing = ClusterTiming::default();
+        Some((w_avg_ms, l_avg_ms))
     }
 
     /// Locks up to `budget` bytes of weights into RAM and returns how many were locked.
@@ -1690,9 +1714,19 @@ impl SmolLm2Engine {
     pub unsafe fn step_token(&mut self, token_id: usize, pos: usize) -> Vec<f32> {
         if self.cluster_client.is_some() {
             let mut client = self.cluster_client.take().unwrap();
+            let t_w = std::time::Instant::now();
             let worker_act = client.step(token_id, pos).expect("cluster worker step failed");
+            let w_us = t_w.elapsed().as_micros() as u64;
             self.cluster_client = Some(client);
-            self.forward_slice(None, Some(&worker_act), pos)
+
+            let t_l = std::time::Instant::now();
+            let act = self.forward_slice(None, Some(&worker_act), pos);
+            let l_us = t_l.elapsed().as_micros() as u64;
+
+            self.cluster_timing.worker_us += w_us;
+            self.cluster_timing.local_us += l_us;
+            self.cluster_timing.steps += 1;
+            act
         } else {
             self.forward_hidden(token_id, pos)
         }

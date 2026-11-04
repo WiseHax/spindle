@@ -1364,6 +1364,9 @@ fn main() -> Result<()> {
             });
             if let Some(p) = cli.moe_prune {
                 engine.set_moe_prune(p);
+                if engine.cluster_client.is_some() {
+                    println!("  Dynamic MoE Pruning: threshold {p:.3} synchronized across cluster");
+                }
             }
             if let Some(prompt) = &cli.system_prompt {
                 engine.set_system_prompt(prompt);

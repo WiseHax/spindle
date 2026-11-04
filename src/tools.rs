@@ -132,6 +132,7 @@ To invoke a tool, output:
 {"name": "<tool_name>", "arguments": {"<param>": "<value>"}}
 </tool_call>
 Wait for the <tool_response> before continuing.
+After receiving a tool response that fulfills the user's request, provide your final direct answer to the user. Do not call the same tool repeatedly.
 "#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -520,14 +521,34 @@ fn is_decl_line(line: &str, ext: &str) -> bool {
 }
 
 /// Parses `<tool_call> ... </tool_call>` payload from the model's generated text.
+/// Tolerates whitespace variations, single quotes, markdown fences, and missing closing tags.
 pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
-    let start_tag = "<tool_call>";
-    let end_tag = "</tool_call>";
-    let s = text.find(start_tag)?;
-    let e = text[s..].find(end_tag)?;
-    let body = text[s + start_tag.len()..s + e].trim();
+    let lower = text.to_lowercase();
+    let body = if let Some(s) = lower.find("<tool_call").or_else(|| lower.find("<toolcall")).or_else(|| lower.find("<tool-call")) {
+        let after_tag_start = &text[s..];
+        let tag_close = after_tag_start.find('>')?;
+        let payload_start = s + tag_close + 1;
+        let payload_slice = &text[payload_start..];
+        let lower_slice = &lower[payload_start..];
+        if let Some(e) = lower_slice.find("</tool_call").or_else(|| lower_slice.find("</toolcall")).or_else(|| lower_slice.find("</tool-call")).or_else(|| lower_slice.find("```")) {
+            &payload_slice[..e]
+        } else if let Some(open_brace) = payload_slice.find('{') {
+            extract_balanced_json(&payload_slice[open_brace..])?
+        } else {
+            payload_slice
+        }
+    } else if let Some(open_brace) = text.find('{') {
+        let candidate = extract_balanced_json(&text[open_brace..])?;
+        if candidate.contains("\"name\"") || candidate.contains("'name'") {
+            candidate
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
 
-    // Extract name
+    let body = body.trim();
     let name = extract_json_string(body, "name")?;
     let path = extract_json_string(body, "path");
     let content = extract_json_string(body, "content");
@@ -555,17 +576,60 @@ pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
     })
 }
 
+fn extract_balanced_json(s: &str) -> Option<&str> {
+    let mut depth = 0;
+    let mut in_quote = false;
+    let mut quote_char = '"';
+    let mut escape = false;
+    let mut end_idx = None;
+
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            if !in_quote {
+                in_quote = true;
+                quote_char = c;
+            } else if c == quote_char {
+                in_quote = false;
+            }
+            continue;
+        }
+        if !in_quote {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end_idx = Some(i + 1);
+                    break;
+                }
+            }
+        }
+    }
+    end_idx.map(|idx| &s[..idx])
+}
+
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{key}\"");
-    let idx = json.find(&pattern)?;
-    let after = &json[idx + pattern.len()..];
+    let pat_double = format!("\"{key}\"");
+    let pat_single = format!("'{key}'");
+    let idx = json.find(&pat_double).or_else(|| json.find(&pat_single))?;
+    let key_len = if json[idx..].starts_with(&pat_double) { pat_double.len() } else { pat_single.len() };
+    let after = &json[idx + key_len..];
     let colon = after.find(':')?;
     let val_part = after[colon + 1..].trim_start();
-    if !val_part.starts_with('"') {
+    let quote = val_part.chars().next()?;
+    if quote != '"' && quote != '\'' {
         return None;
     }
     let mut out = String::new();
-    let mut chars = val_part[1..].chars();
+    let mut chars = val_part[quote.len_utf8()..].chars();
     let mut escape = false;
 
     while let Some(ch) = chars.next() {
@@ -576,12 +640,13 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
                 't' => out.push('\t'),
                 '\\' => out.push('\\'),
                 '"' => out.push('"'),
+                '\'' => out.push('\''),
                 other => out.push(other),
             }
             escape = false;
         } else if ch == '\\' {
             escape = true;
-        } else if ch == '"' {
+        } else if ch == quote {
             return Some(out);
         } else {
             out.push(ch);
@@ -591,9 +656,11 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
 }
 
 fn extract_json_number(json: &str, key: &str) -> Option<usize> {
-    let pattern = format!("\"{key}\"");
-    let idx = json.find(&pattern)?;
-    let after = &json[idx + pattern.len()..];
+    let pat_double = format!("\"{key}\"");
+    let pat_single = format!("'{key}'");
+    let idx = json.find(&pat_double).or_else(|| json.find(&pat_single))?;
+    let key_len = if json[idx..].starts_with(&pat_double) { pat_double.len() } else { pat_single.len() };
+    let after = &json[idx + key_len..];
     let colon = after.find(':')?;
     let val_part = after[colon + 1..].trim_start();
     let num_str: String = val_part.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -694,6 +761,33 @@ I will now read the file.
         assert_eq!(fs::read_to_string(test_path).unwrap(), "temporary content");
 
         let _ = fs::remove_file(test_path);
+    }
+
+    #[test]
+    fn test_robust_parse_tool_call_variations() {
+        // Variation 1: Extra whitespace in opening tag and closing tag
+        let v1 = "<tool_call >\n{\"name\": \"delete_file\", \"arguments\": {\"path\": \"hello.py\"}}\n</tool_call >";
+        let c1 = parse_tool_call(v1).expect("v1 parsed");
+        assert_eq!(c1.name, "delete_file");
+        assert_eq!(c1.path.as_deref(), Some("hello.py"));
+
+        // Variation 2: Missing closing tag (model stopped at EOS)
+        let v2 = "<tool_call>\n{\"name\": \"delete_file\", \"arguments\": {\"path\": \"hello.py\"}}";
+        let c2 = parse_tool_call(v2).expect("v2 parsed without closing tag");
+        assert_eq!(c2.name, "delete_file");
+        assert_eq!(c2.path.as_deref(), Some("hello.py"));
+
+        // Variation 3: Single quotes
+        let v3 = "<tool_call>{'name': 'delete_file', 'arguments': {'path': 'hello.py'}}</tool_call>";
+        let c3 = parse_tool_call(v3).expect("v3 parsed with single quotes");
+        assert_eq!(c3.name, "delete_file");
+        assert_eq!(c3.path.as_deref(), Some("hello.py"));
+
+        // Variation 4: Markdown codeblock wrapped
+        let v4 = "```json\n<tool_call>\n{\"name\": \"list_dir\", \"path\": \".\"}\n</tool_call>\n```";
+        let c4 = parse_tool_call(v4).expect("v4 parsed with markdown fences");
+        assert_eq!(c4.name, "list_dir");
+        assert_eq!(c4.path.as_deref(), Some("."));
     }
 }
 

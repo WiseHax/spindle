@@ -30,6 +30,7 @@ pub const FRAME_STEP_RESP: u8 = 0x06;
 pub const FRAME_RESET: u8 = 0x07;
 pub const FRAME_PING: u8 = 0x08;
 pub const FRAME_PONG: u8 = 0x09;
+pub const FRAME_SET_PRUNE: u8 = 0x0A;
 pub const FRAME_SHUTDOWN: u8 = 0xFF;
 
 #[repr(u8)]
@@ -615,6 +616,19 @@ impl ClusterClient {
         Ok(())
     }
 
+    pub fn set_moe_prune(&mut self, threshold: f32) -> std::io::Result<()> {
+        let payload = threshold.to_le_bytes();
+        self.stream.send_frame(FRAME_SET_PRUNE, WireFormat::Fp32, &payload)?;
+        let (hdr, _) = self.recv_frame_type(FRAME_SET_PRUNE)?;
+        if hdr.frame_type != FRAME_SET_PRUNE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "expected SET_PRUNE confirmation",
+            ));
+        }
+        Ok(())
+    }
+
     fn recv_frame_type(&mut self, expected: u8) -> std::io::Result<(WireHeader, Vec<u8>)> {
         let (hdr, payload) = self.stream.recv_frame()?;
         if hdr.frame_type != expected {
@@ -702,6 +716,13 @@ pub fn serve_worker_connection(
             FRAME_RESET => {
                 engine.reset_kv();
                 cs.send_frame(FRAME_RESET, WireFormat::Fp32, &[])?;
+            }
+            FRAME_SET_PRUNE => {
+                if payload.len() >= 4 {
+                    let p = f32::from_le_bytes(payload[0..4].try_into().unwrap());
+                    engine.set_moe_prune(p);
+                }
+                cs.send_frame(FRAME_SET_PRUNE, WireFormat::Fp32, &[])?;
             }
             FRAME_PREFILL_REQ => {
                 if payload.len() < 8 {

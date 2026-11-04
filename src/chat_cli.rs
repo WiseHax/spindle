@@ -178,6 +178,11 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
     } else {
         parts.push("streaming from disk".to_string());
     }
+    if let Some((w_ms, l_ms)) = engine.take_cluster_timing() {
+        if detailed {
+            parts.push(format!("pipeline: worker {:.1}ms, local {:.1}ms", w_ms, l_ms));
+        }
+    }
     if detailed {
         let (ws, private, _) = memory_guard::process_counters();
         parts.push(format!("{} MiB RAM ({} MiB private)", ws >> 20, private >> 20));
@@ -246,6 +251,7 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
     let reply = |engine: &mut SmolLm2Engine, text: &str, allow_think: bool, show_think: bool, detailed: bool, max: usize| {
         let mut current_input = text.to_string();
         let mut steps = 0;
+        let mut last_call_sig = None;
         const MAX_STEPS: usize = 5;
 
         loop {
@@ -261,6 +267,17 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
             // Check if model emitted a tool call
             if engine.enable_tools && steps < MAX_STEPS {
                 if let Some(call) = crate::tools::parse_tool_call(&out_text) {
+                    let call_sig = format!("{}:{:?}:{:?}", call.name, call.path, call.command);
+                    if last_call_sig.as_ref() == Some(&call_sig) {
+                        println!("\n{}", dim("┌ Tool Call ────────────────────────────────────────────────────────"));
+                        println!("{}  {} {} (duplicate query skipped, completing turn)", dim("│"), bold("Action:"), accent(&call.name));
+                        println!("{}\n", dim("└ Result: Done"));
+                        current_input = "<tool_response>\nAction already completed. Please provide your final answer to the user.\n</tool_response>".to_string();
+                        steps += 1;
+                        continue;
+                    }
+                    last_call_sig = Some(call_sig);
+
                     steps += 1;
                     println!("\n{}", dim("┌ Tool Call ────────────────────────────────────────────────────────"));
                     println!("{}  {} {}", dim("│"), bold("Action:"), accent(&call.name));
