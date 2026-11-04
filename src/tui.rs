@@ -263,7 +263,10 @@ impl Canvas {
                 buf.push(cell.ch);
             }
             // Reset color at end of row and clear to end of line
-            buf.push_str("\x1b[0m\x1b[K\n");
+            buf.push_str("\x1b[0m\x1b[K");
+            if y + 1 < self.height {
+                buf.push('\n');
+            }
             in_escape = false;
         }
 
@@ -430,6 +433,71 @@ struct ViewportLine {
     dim: bool,
 }
 
+/// Word-wraps text by whitespace into lines no longer than `max_width`.
+pub fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let max_w = max_width.max(15);
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim_end();
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+
+        let words = trimmed.split_whitespace();
+        let mut cur = String::new();
+
+        for word in words {
+            if cur.is_empty() {
+                if word.chars().count() > max_w {
+                    let mut chars = word.chars();
+                    loop {
+                        let chunk: String = chars.by_ref().take(max_w).collect();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        if chars.as_str().is_empty() {
+                            cur = chunk;
+                        } else {
+                            out.push(chunk);
+                        }
+                    }
+                } else {
+                    cur.push_str(word);
+                }
+            } else if cur.chars().count() + 1 + word.chars().count() <= max_w {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push(cur);
+                cur = String::new();
+                if word.chars().count() > max_w {
+                    let mut chars = word.chars();
+                    loop {
+                        let chunk: String = chars.by_ref().take(max_w).collect();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        if chars.as_str().is_empty() {
+                            cur = chunk;
+                        } else {
+                            out.push(chunk);
+                        }
+                    }
+                } else {
+                    cur.push_str(word);
+                }
+            }
+        }
+
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
 /// The Full-Screen TUI Orchestrator.
 pub struct SpindleTui {
     canvas: Canvas,
@@ -518,8 +586,8 @@ impl SpindleTui {
         let prompt_y = card_y + 1;
         if self.input.text.is_empty() {
             let ghost = "Ask anything... \"delete hello.py\", \"/review\", \"/stats\"";
-            self.canvas.print(prompt_x, prompt_y, ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
-            self.canvas.print(prompt_x, prompt_y, "█", Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
+            self.canvas.set(prompt_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
+            self.canvas.print(prompt_x + 2, prompt_y, ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
         } else {
             let visible_w = (card_w.saturating_sub(6)) as usize;
             let display_text: String = self.input.text.chars().take(visible_w).collect();
@@ -579,23 +647,38 @@ impl SpindleTui {
             self.canvas.print(mx, 0, &mesh_str, Rgb::GREEN, header_bg, true, false);
         }
 
-        // 2. Format conversation history chronologically (Oldest -> Newest)
+        // Horizontal divider below header
+        for col in 0..w {
+            self.canvas.set(col, 1, '─', Rgb::CARD_BORDER, Rgb::BG_DARK, false, false);
+        }
+
+        // 2. Format conversation history chronologically with WORD WRAPPING (Oldest -> Newest)
+        let max_text_w = (w.saturating_sub(6)) as usize;
         let mut lines: Vec<ViewportLine> = Vec::new();
+
         for msg in &self.history {
             if msg.role == "user" {
-                lines.push(ViewportLine {
-                    text: format!("> You: {}", msg.text),
-                    fg: Rgb::SKY_BLUE,
-                    bold: true,
-                    dim: false,
-                });
+                let wrapped_user = wrap_text(&msg.text, max_text_w.saturating_sub(10));
+                for (idx, u_line) in wrapped_user.into_iter().enumerate() {
+                    let prefix = if idx == 0 { "> You: " } else { "       " };
+                    lines.push(ViewportLine {
+                        text: format!("{prefix}{u_line}"),
+                        fg: Rgb::SKY_BLUE,
+                        bold: true,
+                        dim: false,
+                    });
+                }
             } else if msg.role == "tool" {
-                lines.push(ViewportLine {
-                    text: format!("  [*] {}", msg.text),
-                    fg: Rgb::GOLD,
-                    bold: false,
-                    dim: false,
-                });
+                let wrapped_tool = wrap_text(&msg.text, max_text_w.saturating_sub(8));
+                for (idx, t_line) in wrapped_tool.into_iter().enumerate() {
+                    let prefix = if idx == 0 { "  [*] " } else { "      " };
+                    lines.push(ViewportLine {
+                        text: format!("{prefix}{t_line}"),
+                        fg: Rgb::GOLD,
+                        bold: false,
+                        dim: false,
+                    });
+                }
             } else {
                 // Assistant message
                 let header = if let Some(speed) = &msg.speed_badge {
@@ -609,9 +692,10 @@ impl SpindleTui {
                     bold: true,
                     dim: false,
                 });
-                for body_line in msg.text.lines() {
+                let wrapped_body = wrap_text(&msg.text, max_text_w.saturating_sub(4));
+                for b_line in wrapped_body {
                     lines.push(ViewportLine {
-                        text: format!("  {body_line}"),
+                        text: format!("  {b_line}"),
                         fg: Rgb::WHITE,
                         bold: false,
                         dim: false,
@@ -656,8 +740,8 @@ impl SpindleTui {
         let prompt_x = card_x + 3;
         let prompt_y = card_y + 1;
         if self.input.text.is_empty() {
-            self.canvas.print(prompt_x, prompt_y, "Ask anything...", Rgb::DIM, Rgb::CARD_BG, false, false);
-            self.canvas.print(prompt_x, prompt_y, "█", Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
+            self.canvas.set(prompt_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
+            self.canvas.print(prompt_x + 2, prompt_y, "Ask anything...", Rgb::DIM, Rgb::CARD_BG, false, false);
         } else {
             let visible_w = (card_w.saturating_sub(6)) as usize;
             let display: String = self.input.text.chars().take(visible_w).collect();
@@ -958,5 +1042,15 @@ mod tests {
         tui.push_message("assistant", "I am ready to assist you.", Some("8.5 tok/s"));
         tui.render_chat();
         assert_eq!(tui.history.len(), 2);
+    }
+
+    #[test]
+    fn test_wrap_text() {
+        let long_text = "I am Qwen, a large language model created by Alibaba. I can help you with various tasks such as answering questions, generating code, reviewing files, and automating your developer workflows.";
+        let wrapped = wrap_text(long_text, 40);
+        assert!(wrapped.len() >= 3);
+        for line in &wrapped {
+            assert!(line.len() <= 40, "Line exceeds max width 40: '{}'", line);
+        }
     }
 }
