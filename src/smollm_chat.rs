@@ -276,6 +276,54 @@ unsafe fn matvec(pool: Option<&WorkerPool>, base: *const u8, m: &Mat, x: &[f32],
     });
 }
 
+/// `outs[b] = W * xs[b]` for a batch of vectors, split by rows across `pool`. Each weight
+/// block is decoded once and reused for every vector (see `quant_multi`), so B tokens cost
+/// far less than B single-token matvecs. Falls back to `matvec` for one vector.
+unsafe fn matvec_multi(pool: Option<&WorkerPool>, base: *const u8, m: &Mat, xs: &[&[f32]], outs: &mut [&mut [f32]]) {
+    debug_assert_eq!(xs.len(), outs.len());
+    match xs.len() {
+        0 => return,
+        1 => return matvec(pool, base, m, xs[0], outs[0]),
+        _ => {}
+    }
+    const MAXB: usize = 128;
+    for start in (0..xs.len()).step_by(MAXB) {
+        let end = (start + MAXB).min(xs.len());
+        let n = end - start;
+        let mut xa = [0usize; MAXB];
+        let mut oa = [0usize; MAXB];
+        for i in 0..n {
+            debug_assert_eq!(xs[start + i].len(), m.cols);
+            debug_assert_eq!(outs[start + i].len(), m.rows);
+            xa[i] = xs[start + i].as_ptr() as usize;
+            oa[i] = outs[start + i].as_mut_ptr() as usize;
+        }
+        // usize and raw pointers share layout; plain addresses keep the closure `Sync`.
+        let (xa, oa) = (&xa[..n], &oa[..n]);
+        let n_rows = m.rows;
+        let run = |r0: usize, r1: usize, base: *const u8| {
+            let xp = std::slice::from_raw_parts(xa.as_ptr() as *const *const f32, n);
+            let op = std::slice::from_raw_parts(oa.as_ptr() as *const *mut f32, n);
+            crate::quant_multi::matmul_rows_avx2(base, m, xp, op, r0, r1);
+        };
+        match pool {
+            Some(p) if p.n_threads() > 1 && n_rows * m.cols >= PAR_MIN_WEIGHTS => {
+                let base_addr = base as usize;
+                p.run(&|t, nt| run(n_rows * t / nt, n_rows * (t + 1) / nt, base_addr as *const u8));
+            }
+            _ => run(0, n_rows, base),
+        }
+    }
+}
+
+fn as_refs(v: &[Vec<f32>]) -> Vec<&[f32]> {
+    v.iter().map(|x| x.as_slice()).collect()
+}
+
+fn as_muts(v: &mut [Vec<f32>]) -> Vec<&mut [f32]> {
+    v.iter_mut().map(|x| x.as_mut_slice()).collect()
+}
+
 /// `base` may be a streamed layer buffer shifted back by the layer's file offset, so the
 /// offset is applied with `wrapping_add` (the result is always inside the buffer).
 unsafe fn f32_at<'a>(base: *const u8, offset: usize, len: usize) -> &'a [f32] {
@@ -366,6 +414,38 @@ unsafe fn ffn_forward(pool: Option<&WorkerPool>, base: *const u8, f: &Ffn, x: &[
     matvec(pool, base, &f.down, g, out);
 }
 
+/// SwiGLU block for a batch of tokens through the SAME weights (one decode per weight block).
+/// `scratch` is grown as needed and reused, so steady-state verify batches don't allocate.
+unsafe fn ffn_forward_multi(
+    pool: Option<&WorkerPool>,
+    base: *const u8,
+    f: &Ffn,
+    xs: &[&[f32]],
+    outs: &mut [&mut [f32]],
+    scratch: &mut Vec<f32>,
+) {
+    let bsz = xs.len();
+    if bsz == 1 {
+        return ffn_forward(pool, base, f, xs[0], outs[0]);
+    }
+    let n_ff = f.gate.rows;
+    if scratch.len() < 2 * bsz * n_ff {
+        scratch.resize(2 * bsz * n_ff, 0.0);
+    }
+    let (gbuf, ubuf) = scratch[..2 * bsz * n_ff].split_at_mut(bsz * n_ff);
+    {
+        let mut g: Vec<&mut [f32]> = gbuf.chunks_mut(n_ff).collect();
+        matvec_multi(pool, base, &f.gate, xs, &mut g);
+        let mut u: Vec<&mut [f32]> = ubuf.chunks_mut(n_ff).collect();
+        matvec_multi(pool, base, &f.up, xs, &mut u);
+    }
+    for (g, u) in gbuf.iter_mut().zip(ubuf.iter()) {
+        *g = silu(*g) * *u;
+    }
+    let g: Vec<&[f32]> = gbuf.chunks(n_ff).collect();
+    matvec_multi(pool, base, &f.down, &g, outs);
+}
+
 /// Detailed timing breakdown of MoE operations for a turn.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct MoeTiming {
@@ -414,9 +494,13 @@ unsafe fn moe_forward_batch(
     let mut wsum_batch = vec![0.0f32; bsz];
     let mut unique_experts = Vec::new();
 
+    {
+        let xr = as_refs(xs);
+        let mut pr = as_muts(&mut probs_batch);
+        matvec_multi(pool, base, &m.router, &xr, &mut pr);
+    }
     for b in 0..bsz {
         let probs = &mut probs_batch[b];
-        matvec(pool, base, &m.router, &xs[b], probs);
         let max = probs.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         probs.iter_mut().for_each(|p| *p = (*p - max).exp());
         let sum: f32 = probs.iter().sum();
@@ -541,11 +625,44 @@ unsafe fn moe_forward_batch(
         (disk_us, hit_us + miss_us)
     } else {
         let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
-        for b in 0..bsz {
-            for (idx, &e) in chosen_batch[b].iter().enumerate() {
-                let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
-                run_expert_for_token(e, c_ptr, &xs[b], &mut expert_outs[b][idx]);
+        // Expert-major: every token routed to expert `e` goes through its weights in ONE
+        // shared-decode pass, so a verify batch reads each chosen expert once, not per token.
+        let _ = &run_expert_for_token;
+        let mut scratch = Vec::new();
+        let mut users: Vec<(usize, usize)> = Vec::with_capacity(bsz);
+        for &e in &unique_experts {
+            users.clear();
+            for b in 0..bsz {
+                if let Some(idx) = chosen_batch[b].iter().position(|&ce| ce == e) {
+                    users.push((b, idx));
+                }
             }
+            if users.is_empty() {
+                continue;
+            }
+            let f = m.experts.expert(e);
+            let c_ptr = cache.as_ref().and_then(|c| c.get_expert_ptr(layer, e));
+            let (fbase, ff) = match c_ptr {
+                Some(p) => {
+                    let [g_span, u_span, _] = f.spans();
+                    (
+                        p,
+                        Ffn {
+                            gate: Mat { offset: 0, ..f.gate },
+                            up: Mat { offset: g_span.1, ..f.up },
+                            down: Mat { offset: g_span.1 + u_span.1, ..f.down },
+                        },
+                    )
+                }
+                None => (base, f),
+            };
+            let xr: Vec<&[f32]> = users.iter().map(|&(b, _)| xs[b].as_slice()).collect();
+            // Each (b, idx) pair is a distinct buffer, so these mutable views never alias.
+            let mut orefs: Vec<&mut [f32]> = users
+                .iter()
+                .map(|&(b, idx)| std::slice::from_raw_parts_mut(expert_outs[b][idx].as_mut_ptr(), dim))
+                .collect();
+            ffn_forward_multi(pool, fbase, &ff, &xr, &mut orefs, &mut scratch);
         }
         (0, t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64))
     };
@@ -1816,10 +1933,11 @@ impl SmolLm2Engine {
 
         let mut x_norms = vec![vec![0.0f32; c.dim]; bsz];
         let mut proj_outs = vec![vec![0.0f32; c.dim]; bsz];
-        let mut q = vec![0.0f32; c.q_dim];
-        let mut k = vec![0.0f32; c.kv_dim];
-        let mut v = vec![0.0f32; c.kv_dim];
-        let mut attn_out = vec![0.0f32; c.q_dim];
+        let mut qs = vec![vec![0.0f32; c.q_dim]; bsz];
+        let mut ks = vec![vec![0.0f32; c.kv_dim]; bsz];
+        let mut vs = vec![vec![0.0f32; c.kv_dim]; bsz];
+        let mut attn_outs = vec![vec![0.0f32; c.q_dim]; bsz];
+        let mut ffn_scratch: Vec<f32> = Vec::new();
         if self.is_moe() {
             self.moe_stats.tokens += bsz;
         }
@@ -1847,29 +1965,43 @@ impl SmolLm2Engine {
 
             let scale = c.attn_scale.unwrap_or(1.0 / (c.head_dim as f32).sqrt());
             for b in 0..bsz {
-                let pos = start_pos + b;
                 rmsnorm(&xs[b], f32_at(lbase, ly.attn_norm, c.dim), &mut x_norms[b], c.rms_eps);
-                matvec(pool, lbase, &ly.wq, &x_norms[b], &mut q);
-                matvec(pool, lbase, &ly.wk, &x_norms[b], &mut k);
-                matvec(pool, lbase, &ly.wv, &x_norms[b], &mut v);
-                add_bias(lbase, &mut q, ly.q_bias);
-                add_bias(lbase, &mut k, ly.k_bias);
-                add_bias(lbase, &mut v, ly.v_bias);
+            }
+            {
+                // Q/K/V for the whole batch: each projection's weights are decoded once.
+                let xr = as_refs(&x_norms);
+                matvec_multi(pool, lbase, &ly.wq, &xr, &mut as_muts(&mut qs));
+                matvec_multi(pool, lbase, &ly.wk, &xr, &mut as_muts(&mut ks));
+                matvec_multi(pool, lbase, &ly.wv, &xr, &mut as_muts(&mut vs));
+            }
+            // K/V of every batch token are written before any attention runs; token b only
+            // reads positions <= its own, so causality is unchanged.
+            for b in 0..bsz {
+                let pos = start_pos + b;
+                let (q, k, v) = (&mut qs[b], &mut ks[b], &mut vs[b]);
+                add_bias(lbase, q, ly.q_bias);
+                add_bias(lbase, k, ly.k_bias);
+                add_bias(lbase, v, ly.v_bias);
                 if let Some(off) = ly.q_norm {
                     let n = if ly.qk_norm_full { c.q_dim } else { c.head_dim };
-                    rmsnorm_heads(&mut q, f32_at(lbase, off, n), n, c.rms_eps);
+                    rmsnorm_heads(q, f32_at(lbase, off, n), n, c.rms_eps);
                 }
                 if let Some(off) = ly.k_norm {
                     let n = if ly.qk_norm_full { c.kv_dim } else { c.head_dim };
-                    rmsnorm_heads(&mut k, f32_at(lbase, off, n), n, c.rms_eps);
+                    rmsnorm_heads(k, f32_at(lbase, off, n), n, c.rms_eps);
                 }
-                self.rope.rotate(&mut q, c.head_dim, pos as f32);
-                self.rope.rotate(&mut k, c.head_dim, pos as f32);
+                self.rope.rotate(q, c.head_dim, pos as f32);
+                self.rope.rotate(k, c.head_dim, pos as f32);
 
                 let kv_off = (local_l * self.max_seq + pos) * c.kv_dim;
-                f32_to_f16_slice(&k, &mut self.k_cache[kv_off..kv_off + c.kv_dim]);
-                f32_to_f16_slice(&v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
+                f32_to_f16_slice(k, &mut self.k_cache[kv_off..kv_off + c.kv_dim]);
+                f32_to_f16_slice(v, &mut self.v_cache[kv_off..kv_off + c.kv_dim]);
+            }
 
+            for b in 0..bsz {
+                let pos = start_pos + b;
+                let q = &qs[b];
+                let attn_out = &mut attn_outs[b];
                 let n_heads = c.n_heads;
                 let head_dim = c.head_dim;
                 let kv_dim = c.kv_dim;
@@ -1935,7 +2067,10 @@ impl SmolLm2Engine {
                     }
                 }
 
-                matvec(pool, lbase, &ly.wo, &attn_out, &mut proj_outs[b]);
+            }
+
+            matvec_multi(pool, lbase, &ly.wo, &as_refs(&attn_outs), &mut as_muts(&mut proj_outs));
+            for b in 0..bsz {
                 for i in 0..c.dim {
                     xs[b][i] += c.residual_scale * proj_outs[b][i];
                 }
@@ -1944,9 +2079,7 @@ impl SmolLm2Engine {
 
             match &ly.ffn {
                 FfnKind::Dense(f) => {
-                    for b in 0..bsz {
-                        ffn_forward(pool, lbase, f, &x_norms[b], &mut proj_outs[b]);
-                    }
+                    ffn_forward_multi(pool, lbase, f, &as_refs(&x_norms), &mut as_muts(&mut proj_outs), &mut ffn_scratch);
                 }
                 FfnKind::Moe(m) => moe_forward_batch(
                     pool,
