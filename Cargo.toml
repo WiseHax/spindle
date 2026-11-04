@@ -1,8 +1,8 @@
 [package]
 name = "spindle"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "LLM inference in Rust for low-RAM Windows laptops"
+description = "CPU inference for GGUF language models, on one Windows PC or split across two"
 license = "MIT"
 readme = "README.md"
 keywords = ["llm", "inference", "gguf", "avx2", "quantization"]

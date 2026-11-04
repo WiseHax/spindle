@@ -1,16 +1,19 @@
-# Spindle All-In-One Agentic Configuration
-# When this file is present, running 'spindle' without arguments automatically
-# connects to the cluster mesh and launches the agentic assistant.
+# spindle settings, read from the current directory when spindle starts.
+# Command-line options override anything here. Run `spindle --help` for all options.
 
 model = "Qwen3-30B-A3B-Q4_K_M.gguf"
+
+# Two-PC setup: the worker at `peer` runs layers 0..35, this PC runs 35..48.
+# Start the worker first:  spindle node <model.gguf> --bind 0.0.0.0:42424 --layer-range 0..35
 peer = "192.168.1.10:42424"
 layer_range = "35..48"
 wire_format = "fp8"
+
 threads = 4
-moe_prune = 4
-tools = true
+moe_prune = 4          # run the top 4 of the 8 routed experts per token
+tools = true           # let the model read and edit files and run commands
 think = false
 
-speculate = true
+speculate = true       # prompt-lookup speculative decoding (output is unchanged)
 draft_len = 4
-ctx = 8192
+ctx = 8192             # set the same --ctx on the worker; the smaller of the two wins
