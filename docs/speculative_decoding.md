@@ -1,154 +1,111 @@
-# Distributed Speculative Decoding in Spindle
+# Speculative decoding
 
-## 1. Overview
+Generating one token reads every active weight once. On a CPU, most of that time goes into
+moving weights from RAM, not into the math. If the engine can guess the next few tokens, it
+can check all of them in a single pass over the weights. When the guesses are right, it gets
+several tokens for roughly the price of one.
 
-**Speculative Decoding** is an algorithmic technique that breaks the memory bandwidth bottleneck of autoregressive LLM inference by generating multiple candidate tokens using a fast, compact **draft model**, and verifying them in parallel using a single batched forward pass of the larger **target model**.
+Spindle does this without a draft model by default, and it never changes the output.
 
-In Spindle, speculative decoding is natively distributed across the Wi-Fi cluster mesh:
-- **Drafter:** `qwen3-0.6b-q8_0.gguf` (609 MiB), running entirely in-RAM on the **8 GB Laptop**.
-- **Target:** `Qwen3-30B-A3B-Q4_K_M.gguf` (17.3 GiB, 30.5B MoE parameters), partitioned across **Desktop** (layers $0..35$) and **Laptop** (layers $35..48$).
+## Where the drafts come from
+
+Spindle keeps the token ids of the recent conversation: the system prompt, messages, replies
+and tool output. Before each step it takes the last 4 tokens it produced and searches for an
+earlier place where the same 4 tokens appear. If it finds one, the tokens that followed there
+become the draft. If there is no 4-token match, it tries 3, then 2. A 2-token match is weak
+evidence, so it proposes at most 2 tokens from it.
+
+This is prompt-lookup decoding. It works well when the reply repeats text that is already in
+the context:
+
+- editing a file the model just read
+- quoting code, logs or earlier answers
+- reformatting or translating structured text
+- tool calls that repeat paths and names
+
+On fresh prose, matches are rare and most steps have no draft at all. Those steps cost the
+same as normal decoding.
+
+The draft length adapts to how well drafts are doing:
+
+- It starts at `draft_len` (4 by default, `--draft-len`).
+- After a fully accepted draft, the next one may be 2 tokens longer, up to 7. Seven drafts
+  plus the pending token fill one 8-token kernel pass.
+- After any rejection, it goes back to `draft_len`.
+- When a weak 2-token draft is rejected outright, weak drafts are skipped for a while: 1 step,
+  then 2, 4 and so on, up to 16. Text with no repetition then stops paying for verify batches.
+  Matches of 3 or more tokens are always tried.
+
+`--draft <small.gguf>` uses a small model with the same tokenizer to write the drafts instead,
+for example Qwen3-0.6B for Qwen3-30B-A3B. This costs the draft model's RAM and its own decode
+time on every step. Prompt lookup costs neither, so it is the default.
+
+## Verification
+
+Each step runs one batch through the model: the pending token plus the draft tokens.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       Laptop (8 GB RAM - Intel i5-13420H)                    │
-│                                                                             │
-│  ┌───────────────────────────┐         ┌─────────────────────────────────┐  │
-│  │     Draft Model (In-RAM)  │         │   Target Model (Layers 35..48)  │  │
-│  │   qwen3-0.6b-q8_0.gguf    │         │      LM Head & Verification     │  │
-│  │  Generates K=4 Draft Toks │         │      Rewind / Accept Engine     │  │
-│  └─────────────┬─────────────┘         └────────────────▲────────────────┘  │
-│                │ Draft tokens: [T1, T2, T3, T4]         │                   │
-└────────────────┼────────────────────────────────────────┼───────────────────┘
-                 │                                        │ Activations:
-                 │ Batch Prefill Request                  │ FP8 [5, 4096]
-                 │ FRAME_PREFILL_REQ                      │ FRAME_PREFILL_RESP
-                 ▼                                        │
-┌─────────────────────────────────────────────────────────┴───────────────────┐
-│                       Desktop PC (16 GB RAM - 192.168.1.10)                 │
-│                                                                             │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │              Target Model Worker (Layers 0..35)                       │  │
-│  │       Batched Layer Scan across 35 layers in a single pass!           │  │
-│  │       KV-Cache dynamically addressed by exact token position          │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+batch:      [ t   d1  d2  d3  d4 ]     t = last accepted token, d = drafts
+positions:   p   p+1 p+2 p+3 p+4
 ```
 
----
+The batch goes through the same batched forward pass that processes prompts. On two PCs that
+is one `PREFILL_REQ` round trip. The pass returns a hidden state for every position, and from
+each one spindle samples a token with the normal sampler and the same random number
+generator:
 
-## 2. Why Qwen3-0.6B + Qwen3-30B is an Optimal Pair
+1. Sample from position `p`. If the token equals `d1`, accept it and go on to position `p+1`.
+2. At the first position where the sampled token differs from the draft, keep the sampled
+   token, which is the model's own choice, and stop.
+3. If every draft matched, the last position yields one extra token for free.
 
-Speculative decoding requires the draft model and target model to share identical tokenization characteristics:
+Every token that reaches the output was sampled by the target model, from the same
+distribution and in the same order as without speculation. With `--temp 0`, the reply is
+identical token for token. With sampling on, it follows the same distribution. Turning
+speculation off (`--no-spec`, `/spec off`) never changes the quality, only the speed.
 
-| Property | Draft Model (`qwen3-0.6b-q8_0`) | Target Model (`Qwen3-30B-A3B`) | Match Status |
-| :--- | :--- | :--- | :--- |
-| **Vocabulary Size** | 151,936 tokens | 151,936 tokens | **Exact 100% Match** |
-| **Tokenizer Type** | Byte-level BPE with unicode table | Byte-level BPE with unicode table | **Exact 100% Match** |
-| **Chat Framing** | ChatML (`<|im_start|>`, `<|im_end|>`) | ChatML (`<|im_start|>`, `<|im_end|>`) | **Exact 100% Match** |
-| **RoPE Theta** | $\theta = 1,000,000$ (NeoX permutation) | $\theta = 1,000,000$ (NeoX permutation) | **Exact 100% Match** |
-| **Resident RAM** | $609.8\text{ MiB}$ | Distributed ($12.5\text{ GB} + 4.8\text{ GB}$) | **Fits in 8 GB Laptop** |
-| **Single-Core Speed** | $\sim 80\text{ tok/s}$ | $\sim 7.2\text{ tok/s}$ | **$11.1\times$ Draft Lead** |
+Rejected draft positions need no cleanup. Their KV entries are past the accepted position,
+attention reads only up to the current position, and the next pass overwrites them. On two
+PCs the worker needs no message for this either.
 
-Because both models share the exact same training tokenizer distribution, the speculative draft acceptance rate $\alpha$ consistently exceeds **$70\% - 85\%$** across code, chat, and reasoning sequences.
+## What a batch costs
 
----
+A batch is only cheap if processing 5 tokens costs much less than 5 single-token passes.
+The multi-vector kernels in `src/quant_multi.rs` decode each quantized block once and apply it
+to every token in the batch. Single-thread cost of a 5-token batch against one token:
 
-## 3. The Distributed Verification Protocol
+| Weights | 5 tokens vs 1 |
+|---|---|
+| Q4_K | 1.78x |
+| Q6_K | 1.36x |
+| Q6_K LM head | 1.37x |
+| Q8_0 | 1.61x |
 
-### Step 1: Local In-RAM Speculative Drafting
-The laptop's draft engine advances locally from `next_id`:
-```rust
-let max_draft = 4;
-let mut draft_tokens = Vec::with_capacity(max_draft);
-for _ in 0..max_draft {
-    draft.ensure_kv_room(1);
-    let d = draft.sample_next_token(&draft_hidden, &[], false, forbid_think);
-    if draft.stop_ids.contains(&d) { break; }
-    draft_tokens.push(d);
-    draft_hidden = draft.forward_hidden(d, draft.cur_pos);
-    draft.cur_pos += 1;
-}
-```
-At $\sim 80\text{ tok/s}$, generating 4 draft tokens takes just **$48\text{ ms}$** on an Intel E-core or P-core.
+Separate passes would cost 5x. MoE layers group the tokens by the experts they chose, so an
+expert used by several tokens in the batch is read once.
 
-### Step 2: Batch Transmission Across RIOT-Wire
-The target model verifies the prefix token plus all draft tokens as a single continuous batch `verify_batch = [next_id, d_0, d_1, d_2, d_3]`:
-```rust
-let w_hiddens = client.prefill(&verify_batch, target_start_pos)?;
-let hiddens = self.forward_batch_slice(None, Some(&w_hiddens), target_start_pos);
-```
-- A single `FRAME_PREFILL_REQ` transmits the 5 token IDs over the socket ($28\text{ bytes}$).
-- The desktop worker executes layers $0..35$ for all 5 tokens using AVX2 GEMM.
-- The desktop worker replies with `FRAME_PREFILL_RESP` containing the 5 activation vectors ($5 \times 4096 = 20,480\text{ bytes}$ at FP8).
-- The laptop completes layers $35..48$ and runs the LM head.
+## Results
 
-### Step 3: Sequential Verification & Rewind Invariance
-The target model checks the draft tokens sequentially:
-```rust
-for (i, &d_tok) in draft_tokens.iter().enumerate() {
-    let target_tok = self.sample_next_token(&hiddens[i], ...);
-    if target_tok == d_tok {
-        // ACCEPT: Token accepted! Emit text immediately.
-        self.spec_stats.0 += 1; // accepted count
-        emit_token(d_tok);
-    } else {
-        // REJECT: Mismatch at position target_start_pos + 1 + i.
-        emit_token(target_tok);
-        
-        let mismatch_pos = target_start_pos + 1 + i;
-        self.cur_pos = mismatch_pos;
-        last_hidden = self.step_token(target_tok, self.cur_pos);
-        self.cur_pos += 1;
+| Case | Without | With |
+|---|---|---|
+| Qwen3-0.6B, a copy task (reply repeats text from the prompt) | 14.7 tok/s | 32.5 tok/s, same reply |
+| SmolLM2-360M, a fresh paragraph of prose | 56.6 tok/s | 48.4 tok/s (0 of 11 drafts accepted) |
+| Granite 1B-A400M, a fresh paragraph of prose | | 5 of 11 drafts accepted |
 
-        draft.cur_pos = mismatch_pos;
-        draft.forward_hidden(target_tok, draft.cur_pos);
-        draft.cur_pos += 1;
-        break;
-    }
-}
-```
+The prose rows show the cost of a step whose draft is rejected: the batch is a little more
+expensive than a single token. Over a whole agent session, with file reads, edits and tool
+output, the copy-like steps dominate. On prose-only chats where every millisecond counts, use
+`--no-spec`.
 
-#### Why Rewinding Works Without Stale Cache Corruption:
-In Spindle's attention implementation:
-```rust
-let pos_len = pos + 1;
-// Online softmax loop only scans k_cache[0..=pos]
-```
-The attention kernel is strictly position-addressed up to `pos`. When a mismatch occurs:
-1. `mismatch_pos` overwrites the KV cache at that index.
-2. Any speculative tokens drafted beyond `mismatch_pos` that were written into the KV cache are automatically ignored because subsequent attention steps only query up to the new `cur_pos`.
-3. No cache copies or zeroing allocations are ever performed.
+The stats line after each reply shows how many drafts were accepted, for example
+`speculation: 41/52 drafts accepted (79%), 18 verify steps`.
 
----
+## Settings
 
-## 4. Cache Capacity Coordination
-
-When running two independent models in RAM simultaneously, available system RAM can vary. To prevent cache overflow panics:
-```rust
-pub fn enable_draft(&mut self, mut draft: SmolLm2Engine) {
-    let max_seq = self.max_seq.min(draft.max_seq);
-    self.max_seq = max_seq;
-    draft.max_seq = max_seq;
-    draft.system_prompt = self.system_prompt;
-    self.draft_engine = Some(Box::new(draft));
-}
-```
-Both the target and draft models automatically clamp their sequence lengths to the minimum supported capacity of the pair, ensuring 100% memory safety.
-
----
-
-## 5. Verification Results
-
-Empirical test run (`cargo test test_speculative_decoding_smollm2`):
-```
-[model:mmap] 100.6 MiB mapped
-[model:config] llama | dim=576 layers=30/30 heads=9/3 vocab=49152 | KV-cache 2048 pos
-[model:mmap] 100.6 MiB mapped
-[model:config] llama | dim=576 layers=30/30 heads=9/3 vocab=49152 | KV-cache 2048 pos
-[speculative:test] 19 tokens in 1.069s | stats: (6, 6, 2) | reply: "Hello! How can I help you today?"
-```
-- **Draft tokens accepted:** 6
-- **Draft tokens evaluated:** 6
-- **Batches executed:** 2
-- **Acceptance rate:** **100%**
-- **Generation:** Clean, zero artifacting, exact model output.
+| | |
+|---|---|
+| `speculate = true` / `--no-spec` | on by default |
+| `draft_len = 4` / `--draft-len n` | starting draft length (1..16) |
+| `/spec on`, `/spec off`, `/spec <n>` | change it during a chat (full-screen interface) |
+| `/draft-len <n>` | change it during a chat (line-based interface) |
+| `--draft <model.gguf>` | use a draft model instead of prompt lookup |

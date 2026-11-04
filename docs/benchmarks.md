@@ -1,130 +1,106 @@
-# Spindle Empirical Benchmark Log
+# Benchmarks
 
-This document records the verifiable real-world benchmarks achieved by `spindle` running `Qwen3-30B-A3B-Q4_K_M.gguf` (30.5 billion parameter MoE model, 48 layers, 128 experts, 8 active per token) on consumer hardware without dedicated GPUs.
+Every number here was measured, and each section says how. Laptop clocks are noisy, so
+expect about ±10% between runs. Free RAM matters a lot on an 8 GB machine. A model that
+fits in RAM on one run can stream from disk on the next, if a browser was open in between.
 
----
+## Machines
 
-## 1. Hardware Cluster Configuration
+| | Laptop (dev machine, client) | Desktop (worker) |
+|---|---|---|
+| CPU | Intel i5-13420H, 4 P-cores + 4 E-cores | x86-64, 6 cores / 12 threads |
+| RAM | 8 GB | 16 GB |
+| OS | Windows 11 | Windows |
+| Network | home Wi-Fi | home Wi-Fi |
 
-| Node | Machine Role | CPU | Physical Cores / Threads | Total RAM | Assigned Model Layers | RAM Utilization |
-|---|---|---|---|---|---|---|
-| **Master Node** | Laptop Client | Intel Core i5-13420H | 4 P-cores + 4 E-cores (12 threads) | **8 GB DDR5** | Layers `35..48` + LM Head | ~88% (no swapping) |
-| **Worker Node** | Desktop Worker | Intel Core x86-64 | 6 Physical Cores (12 threads) | **16 GB DDR4** | Layers `0..35` | ~80% (no swapping) |
-| **Network Fabric** | Home Wi-Fi Router | Standard 802.11ac Wi-Fi | Sub-millisecond to 4 ms LAN ping | Combined: **24 GB** | **48 / 48 total layers** | Zero disk paging |
+`spindle --probe` on the laptop measures about 31 GB/s from RAM with 4 or more threads,
+2.2–2.8 GB/s for large SSD reads, and 0.03–0.16 GB/s for random 4 KiB SSD reads.
 
----
+## Single PC
 
-## 2. Optimization Progression (0.1 tok/s to 7.2 tok/s)
+spindle 1.0.0, laptop, `--temp 0 -n 128`, prompt "Write a short paragraph about how rivers
+shape valleys.", 4 threads. Each model was loaded fully into RAM, except where noted.
 
+| Model | File | Speculation off | Speculation on |
+|---|---|---|---|
+| SmolLM2-135M-Instruct | 101 MiB, Q4_K_M | 170.7 tok/s | 191.0 tok/s |
+| SmolLM2-360M-Instruct | 368 MiB, Q8_0 | 56.6 tok/s | 48.4 tok/s |
+| Qwen3-0.6B | 609 MiB, Q8_0 | 39.1 tok/s | 33.6 tok/s |
+| Granite 3.1 1B-A400M | 1.3 GiB, Q8_0 | 42.2 tok/s | 13.2 tok/s* |
+
+\* In that run free RAM was too low to hold the model, so it streamed from disk. It is not
+comparable with the column next to it.
+
+This prompt asks for new prose, so few drafts match: 0 of 11 for SmolLM2-360M, for example.
+The "on" column shows what a rejected draft costs. When the reply copies text from the
+context, speculation pays off instead:
+
+| Qwen3-0.6B, copy task | tok/s |
+|---|---|
+| speculation off | 14.7 |
+| speculation on | 32.5 (same reply) |
+
+To reproduce, run from a folder without a `spindle.toml`:
+
+```powershell
+.\spindle.exe qwen3-0.6b-q8_0.gguf --prompt "Write a short paragraph about how rivers shape valleys." --temp 0 -n 128
+.\spindle.exe qwen3-0.6b-q8_0.gguf --prompt "Write a short paragraph about how rivers shape valleys." --temp 0 -n 128 --no-spec
 ```
-Speed (Tokens / Second)
-   ▲
-8.0│                                                        ● 7.2 tok/s (Peak)
-   │                                                    ● 7.0 tok/s
-7.0│                                                ● 6.3 tok/s
-   │                                            ● 6.0 tok/s
-6.0│                                        ● 5.7 tok/s
-   │                                    ● 5.5 tok/s
-5.0│
-4.0│                            ● 3.5 tok/s
-3.0│                    ● 3.1 tok/s
-2.0│
-1.0│            ● 1.1 tok/s
-   │  ● 0.1 tok/s
-0.0└──┴─────────┴───────┴───────┴───────┴───────┴───────┴───────┴────────►
-      Baseline  Unthread Multi-  Layer   FP8     Dual-Row Zero-Heap
-      (1x 8GB)  Cluster  Thread  Balance Wire    Q6_K     MoE Router
-```
 
-### Detailed Milestone Table
+The last line of output is the speed. `/bench` in a chat does the same with a fixed prompt.
 
-| Milestone | Configuration | Tok/s | 60-Token Gen Time | Key Bottleneck Solved |
-|---|---|---|---|---|
-| **Baseline** | Single 8GB laptop, SSD streaming | `0.1 – 0.2` | ~450 s (7.5 min) | SSD random read latency (0.03 GB/s) |
-| **Stage 1: Distributed Cluster** | Single-threaded worker over LAN | `1.1` | 55 s | Pooled 24 GB RAM eliminated SSD thrashing |
-| **Stage 2: Multi-Thread Worker** | Worker pool enabled on 4 P-cores | `3.1` | 19.3 s | Saturated physical CPU cores |
-| **Stage 3: Layer Balance** | PC: 0..35, Laptop: 35..48 | `3.5` | 17.1 s | Relieved PC RAM from 97% to 80% (no Win32 paging) |
-| **Stage 4: FP8 Tensor Wire** | Adaptive 8-bit quantization | `5.1 – 6.0` | 10.0 s | Halved Wi-Fi packet payload (8 KB -> 4 KB) |
-| **Stage 5: Dual-Row Q6_K + Zero-Heap** | Port 0/1 FMA unroll + L1 stack router | `6.3 – 7.2` | 8.3 s | Saturated dual FMA ports & removed heap lock contention |
-| **Stage 6: MoE Pruning + KV Pre-Warm** | Dynamic 0.03 cutoff + in-RAM KV caching | `8.0 – 8.3` | 48.3 s (402 tokens) | All-time speed record across distributed Wi-Fi mesh |
-| **Stage 7: Dynamic Cluster Pruning** | Mesh synchronized MoE pruning (`FRAME_SET_PRUNE`) | **`8.3 – 9.0`** | **46.2 s (417 tokens)** | Sustained 9.0 tok/s record on consumer Wi-Fi |
+## Two PCs: Qwen3-30B-A3B
 
----
+`Qwen3-30B-A3B-Q4_K_M.gguf` (17.3 GiB, 48 layers, 128 experts, 8 routed per token):
 
-## 3. Verified Multi-Turn Chat Log (`spindle-v0.1.0`)
+- desktop: layers 0..35, 5 threads
+- laptop: layers 35..48 and the LM head, 4 threads
+- `wire_format = fp8`, `moe_prune = 4`, speculation on, `ctx = 8192`
 
-Captured live on November 4, 2026:
+Three replies in one session, spindle 1.0.0:
 
-### Turn 1: Initialization & Greeting
-- **Prompt:** `"Hi"`
-- **Response:** `"Hi! How can I assist you today?"`
-- **Performance:** **2.5 tok/s** · 26 tokens · 10.2 s · LAN RTT: 1.95 ms
+| Reply | tok/s | Worker per token | Laptop per token |
+|---|---|---|---|
+| 28 tokens, 3.4 s | 8.2 | 73 ms | 31 ms |
+| 260 tokens, 31.6 s | 8.2 | 71 ms | 30 ms |
+| 320 tokens, 44.2 s | 7.2 | 76 ms | 40 ms |
 
-### Turn 2: Identity & Purpose
-- **Prompt:** `"Hi, Who are you?"`
-- **Response:** `"Hi there! I'm Qwen, a large language model developed by Alibaba Group..."`
-- **Performance:** **5.5 tok/s** · 68 tokens · 12.3 s · LAN RTT: 7.61 ms
+"Worker per token" is the time from sending a request until its activations come back, so it
+includes the network. "Laptop per token" is the local layers and the LM head. The two add up
+to about 104 ms, or about 9.6 tok/s. The rest goes to sampling, detokenizing and drawing the
+interface. Neither machine paged to disk.
 
-### Turn 3: Technical Definition
-- **Prompt:** `"Are you an large language model"`
-- **Response:** `"Yes, I am a large language model. I've been trained on a vast amount of text data..."`
-- **Performance:** **6.3 tok/s** · 57 tokens · 9.1 s · LAN RTT: 1.80 ms
+Earlier versions on the same hardware, for context. These come from the development log and
+were measured with different settings:
 
-### Turn 4: Python Code Generation
-- **Prompt:** `"can you even write hello word on basic python script?"`
-- **Response:** Python code snippet and formatted Markdown explanation.
-- **Performance:** **5.7 tok/s** · 86 tokens · 15.1 s · LAN RTT: 1.40 ms
+| Version | Change | tok/s |
+|---|---|---|
+| one laptop, streaming from SSD | model doesn't fit | 0.1–0.2 |
+| first two-PC run | single-threaded worker | 1.1 |
+| | multi-threaded worker | 3.1 |
+| | 35/13 layer split | 3.5 |
+| | fp8 activations | 5.1–6.0 |
+| | 2-row Q6_K kernel, no allocations in the MoE router | 6.3–7.2 |
+| 1.0.0 | multi-vector kernels, `moe_prune = 4`, speculation | 7.2–8.2 |
 
-### Turn 5: Autonomous ReAct File Deletion & Verification
-- **Prompt:** `"i mean the hello.py file in the directory?"`
-- **Action 1:** `list_dir(".")` -> Verified workspace files.
-- **Action 2:** `delete_file("hello.py")` -> Atomically removed `hello.py` with shadow undo backup.
-- **Performance:** **9.0 tok/s** (Peak) · 417 tokens · 46.2 s · LAN RTT: 1.25 ms
+## Kernels
 
-### Turn 5: Multi-Paradigm Variations
-- **Prompt:** `"can you even write hello world in a different way?"`
-- **Response:** 5 distinct Python paradigms (concatenation, f-strings, functions, OOP classes).
-- **Performance:** **6.1 tok/s** · 235 tokens · 38.5 s · LAN RTT: 9.35 ms
+`cargo test --release bench_multi_vs_serial -- --ignored --nocapture` measures the cost of a batch of 5
+vectors against a single one through the multi-vector kernels. These are the kernels behind
+prompt processing and speculative verification. Single thread, laptop:
 
-### Turn 6: Self-Capability Assessment (Peak Sustained Throughput)
-- **Prompt:** `"can you even write a symphony? just ask do not write"`
-- **Response:** Objective boundary explanation of multimodal audio vs text generation.
-- **Performance:** **7.2 tok/s** · 92 tokens · 12.8 s · LAN RTT: 7.35 ms
+| Weights | 5 vectors vs 1 |
+|---|---|
+| Q4_K | 1.78x |
+| Q6_K | 1.36x |
+| Q6_K LM head | 1.37x |
+| Q8_0 | 1.61x |
 
-### Turn 7: Real-Time Network Architecture
-- **Prompt:** `"can you even search on internet eve nyou are just an large language model in my laptop?"`
-- **Response:** Detailed explanation of offline weights vs real-time search APIs.
-- **Performance:** **7.0 tok/s** · 163 tokens · 23.1 s · LAN RTT: 1.66 ms
+Before these kernels, a batch of 5 cost 5x.
 
-### Turn 8: Rust Code & Systems Programming
-- **Prompt:** `"oh can you wrtie a for loop in rust? and explain what is rust in short sentence?"`
-- **Response:** Clean Rust `for i in 1..5` loop + systems concurrency explanation.
-- **Performance:** **6.3 tok/s** · 214 tokens · 33.9 s · LAN RTT: 29.22 ms
+## Not measured yet
 
----
-
-## 4. Hardware Physics & Memory Bandwidth Calculations
-
-- **Active Weights per Token:**
-  - 48 layers $\times$ ~71M active weights per layer = **~3.4 Billion weights / token**.
-  - In 4-bit (`Q4_K`), 3.4B weights = **~1.9 Gigabytes of physical RAM read per token**.
-- **Bandwidth Saturation at 7.2 tok/s:**
-  $$\text{Throughput} = 7.2\text{ tokens/sec} \times 1.9\text{ GB/token} = \mathbf{13.68\text{ GB/s}}$$
-- **Latency per Token:**
-  $$\text{Latency} = \frac{1000\text{ ms}}{7.2\text{ tok/s}} = \mathbf{138.8\text{ ms per token}}$$
-- **Zero Thrashing:**
-  - Desktop RAM remained stable at **~80%** (no Windows memory compression stalls).
-  - Laptop RAM remained stable at **~88%** (zero NVMe page faults).
-  - Continuous chat across 8 diverse turns with **zero disconnects or memory leaks**.
-
----
-
-## 5. Beyond 7.2 tok/s: Optimization Progression
-
-| Optimization Stage | Per-Token Latency | Speed (tok/s) | Active RAM Bandwidth | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **Serial Hardware Limit (Stage 5)** | $138.8\text{ ms}$ | **$7.2\text{ tok/s}$** | $13.68\text{ GB/s}$ | Dual-port Q6_K + Zero-heap MoE |
-| **Dynamic MoE Pruning ($\alpha=0.03$)** | $98.0\text{ ms}$ | **$10.2\text{ tok/s}$** | $13.36\text{ GB/s}$ | 5.2 active experts avg, 31.4% RAM saved |
-| **Cluster Speculative Verification** | $45.0\text{ ms (eff.)}$ | **$22.2\text{ tok/s}$** | $42.4\text{ GB/s (equiv.)}$ | Qwen3-0.6B Drafter + 30B Target Batch |
-
-
+- The output quality of MoE pruning (perplexity, or task scores).
+- Prompt processing speed, separately from generation.
+- The same models in llama.cpp on the same machines. `tools/golden.ps1` checks that the
+  output agrees with llama.cpp, not the speed.

@@ -1,14 +1,17 @@
-# Spindle Project Guidelines
+# Project notes for spindle
 
-## Project Context
-- Pure-Rust distributed LLM inference engine running across Desktop Worker (0..35) and Laptop Client (35..48).
+Spindle is a CPU inference engine for GGUF models in Rust. It runs on one Windows PC, or
+across two (the worker runs layers 0..35, the client runs 35..48).
 
-## Build & Test Commands
+## Build and test
+
 - Build: `cargo build --release`
-- Tests: `cargo test --release`
+- Test: `cargo test --release -- --test-threads 1` (some tests load real models and need the RAM)
 - Check: `cargo check`
 
-## Development Guidelines
-- Maintain zero external third-party crate dependencies for core runtime simplicity.
-- Always preserve anti-host sabotage safety guardrails in `src/guard.rs`.
-- Do not make breaking changes to network wire protocol frames in `src/cluster_net.rs`.
+## Rules
+
+- No new dependencies without asking. The only one is the `windows` crate.
+- Never change an existing cluster frame in `src/cluster_net.rs`; add a new frame type.
+- Keep the command and path checks in `src/guard.rs` when changing tools.
+- New kernels need a test against the scalar reference in `src/quant.rs`.

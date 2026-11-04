@@ -13,10 +13,17 @@ tensor's name, shape, type and offset.
 code runs any Llama-shaped model.
 
 The file is memory-mapped read-only (`mmap_file.rs`). Kernels read weights directly from the
-mapping. If the file fits in less than half of the free RAM, it's prefetched in the
-background with `PrefetchVirtualMemory`; otherwise pages load as they're touched. Because the
-pages are file-backed and never written, Windows can drop them under memory pressure and read
-them back later. Chat gets slower instead of the laptop running out of memory.
+mapping. Nothing is copied into a private buffer. Because the pages are file-backed and never
+written, Windows can drop them under memory pressure and read them back later. Chat gets
+slower instead of the PC running out of memory.
+
+When this machine's share of the weights fits in free RAM, startup reads it in up front
+(`warm_weights`). Four threads each take 16 MiB chunks: one `PrefetchVirtualMemory` call
+reads the chunk in a single large I/O, then the thread touches one byte per page so the
+pages are really resident. The startup display shows the progress. Without this step, the
+first reply would fault the same pages in 4 KiB at a time. On two PCs, each machine warms
+only the layers it runs. When the share doesn't fit, the weights page in as they are used,
+with the read-ahead described under "Not crashing the laptop" below.
 
 ## Tokenizing
 
@@ -24,9 +31,14 @@ Vocab strings use GPT-2's byte alphabet: every byte maps to a printable char (sp
 `Ġ`, newline `Ċ`). Encoding maps input bytes into that alphabet, decoding maps them back and
 holds partial UTF-8 characters until the rest arrives.
 
-`encode_bpe_segment` splits text GPT-2 style (a leading space sticks to the next word and
-becomes `Ġ`, newlines become `Ċ`), then applies BPE merges in rank order. Turns are wrapped in
-ChatML:
+Before BPE, text is split into pieces the same way the model's own tokenizer splits it. For
+models whose GGUF says `tokenizer.ggml.pre = "qwen2"`, that is Qwen2's pre-tokenizer regex,
+implemented by hand (`pretokenize_qwen2`). It handles contractions, letters with an optional
+leading symbol, single digits, punctuation runs with their trailing newlines, and whitespace.
+Other models use a GPT-2 style splitter. Splitting differently from training produces token
+sequences the model has never seen, which hurts its output and breaks prompt-lookup drafts.
+Each piece then gets BPE merges in rank order. Turns are wrapped in the model's chat format,
+ChatML for Qwen and SmolLM2:
 
 ```
 <|im_start|>system\n...<|im_end|>\n<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n
@@ -135,12 +147,12 @@ by `-n_discard`. RoPE rotations add up, so this gives the same result as recompu
 Running a model bigger than free RAM fails in three ways, and each has a guard:
 
 1. **A big allocation fails and the process aborts.** The KV-cache is the only large private
-   allocation. At load it is sized to at most a quarter of free RAM and allocated with
+   allocation. At load it is sized to fit about half of free RAM and allocated with
    `try_reserve`, so a tight machine gets a shorter context and a message instead of an abort.
 2. **The desktop freezes.** Mapped weights don't fail allocations, but as they page in, our
    working set grows and Windows starts trimming other programs. `memory_guard.rs` sets a hard
    working-set cap with `SetProcessWorkingSetSizeEx` and moves it every 250 ms so that
-   `--reserve` MiB (default 1024) stay free. Over the cap, Windows recycles our own model
+   `--reserve` MiB (default 512) stay free. Over the cap, Windows recycles our own model
    pages, which go to the standby list and usually come back as soft faults. The cap is only
    switched on when the model doesn't fit in RAM, or when `--ram-budget` is given.
 3. **4 KiB page faults are slow.** When the model doesn't fit, a background thread issues
@@ -193,106 +205,67 @@ The SSD is about 10x slower than RAM for large reads and far worse for small ran
 anything streamed from the SSD has to be read in big contiguous chunks with several reads in
 flight.
 
-## Distributed Layer Sharding (Spindle RIOT-Wire)
+## Batches of tokens
 
-To break past the single-machine RAM and SSD bandwidth wall, `spindle` can pool the physical
-RAM of multiple consumer PCs (e.g. 16 GB Desktop + 8 GB Laptop = 24 GB combined RAM) to run
-large models like `Qwen3-30B-A3B` (17.28 GiB) with **zero disk streaming overhead**:
+Prompt processing and speculative verification run several tokens through the model at
+once (`forward_batch_slice`). Each layer runs for the whole batch before the next layer
+starts, so every weight matrix is read once per batch, not once per token.
 
-```
-[Master: Laptop (8 GB RAM)]                 [Worker: Desktop (16 GB RAM)]
-  Layers 32..48 + LM Head                     Layers 0..32
-  Memory: ~5.8 GB resident                    Memory: ~11.5 GB resident
-        │                                           │
-        │── StepRequest (token_id, pos: 8 B) ──────>│ (evaluates layers 0..32 in RAM)
-        │                                           │
-        │<── StepResponse (FP16 vector: 4 KB) ──────│ (AVX2 F16C compressed)
-        │
-  (evaluates layers 32..48 in RAM)
-  (samples next token -> streams to stdout)
-```
+The kernels for this are in `quant_multi.rs`. `matmul_rows_avx2` decodes each Q4_K, Q6_K,
+Q8_0 or F32 block once and multiplies it against up to 8 activation vectors. Other formats
+fall back to one matvec per vector. In an MoE layer, the tokens in a batch are grouped by the
+experts they chose, so an expert that several tokens picked runs once for all of them. On one
+thread, a batch of 5 costs 1.4–1.8x a single token, depending on the format.
 
-### Key Network Innovations:
-1. **AVX2 / F16C Tensor Wire Compression**: Intermediate activation vectors (2048 floats)
-   are compressed on-the-fly to IEEE-754 half-precision using `_mm256_cvtps_ph` in < 300 ns.
-   Wire payload drops from 8 KB to 4 KB (or 2 KB in FP8 mode) with zero degradation.
-2. **16-Byte Aligned Wire Header**: Custom binary framing (`MAGIC = 0x5350494E`) with
-   FNV1a-32 checksums, zero allocations, and zero string formatting on the fast path.
-3. **AVX2 XOR Forward Error Correction (FEC)**: Generates SIMD XOR parity across activation
-   slices (`xor_parity_encode_avx2`). Dropped packets on lossy WiFi are reconstructed
-   in O(1) CPU time without waiting for TCP retransmit timeouts.
-4. **Pure Native Rust**: Zero third-party runtime dependencies, zero Python, zero RPC daemons.
+Attention within a batch is causal: token `i` of the batch sees the cache up to its own
+position, including the earlier tokens of the same batch.
 
-## Zero-Syscall Lockless Worker Pool
+## Speculative decoding
 
-In standard persistent thread pools, the driver thread wakes workers using Win32 `SetEvent`
-via `thread().unpark()`. In a 48-layer transformer with ~200 matvecs per token, this incurs
-600 to 1,000 Windows kernel transitions per token.
+The model checks several guessed tokens per pass and keeps the ones it would have produced
+anyway. [speculative_decoding.md](speculative_decoding.md) covers where the guesses come
+from and why the output doesn't change.
 
-Spindle replaces this with an atomic bitmask (`parked_mask: AtomicUsize`):
-- When active, helpers spin briefly in user space between layer operations.
-- The master checks `parked_mask.load(Relaxed)`. If zero, **no syscall is made**.
-- Helpers only call `thread::park()` after 200,000 spin iterations when idle at the chat prompt.
-- Result: Job dispatch drops from ~3-5 µs to < 50 ns (100x speedup), completely avoiding kernel
-  cache invalidations.
+## Two machines
 
-## Register-Cached Flash GQA Attention
+`cluster_net.rs` splits the layers between two PCs. The client sends token ids, and the worker
+returns the hidden state after its last layer. The client keeps the two KV caches in step,
+including when the context window slides. See [cluster.md](cluster.md).
 
-Standard attention implementations continuously read and write the `out_head` accumulation
-buffer in memory for every past token $t \in 0..\text{pos}$, wasting ~400 MB of memory bus
-bandwidth per token at 1,000 context length.
+## Kernel details
 
-Spindle keeps the online softmax accumulators directly in CPU AVX2 YMM registers (`acc_v: [__m256; 16]`):
-- The `t` loop performs purely in-register multiply-adds: `acc_v = _mm256_fmadd_ps(vp, vv, _mm256_mul_ps(acc_v, va))`.
-- Only after scanning all positions is the final vector normalized and written to RAM in a single
-  pass using `_mm256_mul_ps(acc_v, inv_l)`.
+A few things in `quant.rs` that matter for speed:
 
-## Pre-computed Activation Subblock Sums for Q4_K / Q5_K
+- **Two rows at a time.** The Q8_0, Q4_K, Q5_K, Q6_K, F16 and F32 kernels compute two output
+  rows per pass. Each activation load serves both rows, and the two independent FMA chains
+  keep both FMA ports busy, where a single chain would wait on its own latency.
+- **Sub-block sums for Q4_K and Q5_K.** The `dmin * mn * sum(x)` term needs the sum of each
+  32-value slice of the activation. The sums are computed once per matvec, not once per row.
+- **Attention in registers.** For each head, the online-softmax accumulator for the output
+  vector stays in AVX2 registers while the loop runs over past positions. It is written to
+  memory once at the end.
+- **Heads in parallel.** Attention heads are split across the thread pool. Each thread writes
+  its own slice of the output, so no locking is needed.
 
-In quantized weight matrices with asymmetric scaling (like `Q4_K` and `Q5_K`), each 32-weight sub-block computes:
-$$\text{term} = d \cdot sc_k \cdot (\sum_{j=0}^{31} q_{k,j} \cdot x_{k,j}) - dmin \cdot mn_k \cdot (\sum_{j=0}^{31} x_{k,j})$$
+## Thread pool details
 
-In previous engines, $\sum_{j=0}^{31} x_{k,j}$ was recomputed inside the inner loop for **every single row** of the matrix (repeating millions of identical vector additions across 2048 to 8192 rows).
+The pool's helpers spin on an atomic generation counter between jobs. The main thread only
+calls into the kernel to wake a helper if that helper has actually parked. During
+generation, matvecs come back to back and the helpers never park, so dispatching a job costs
+no system calls. At the chat prompt, the helpers park after a short spin and use no CPU.
 
-Spindle eliminates this redundancy completely:
-1. **One-shot AVX2 Subblock Pre-sum**: Before dispatching matrix rows, `compute_subblock_sums_32` computes all $S_k = \sum_{j=0}^{31} x_{k,j}$ once using AVX2 vector additions in < 150 ns.
-2. **Eliminated Inner Loop Vector Registers**: The inner dot-product kernel drops the `sx` vector accumulator entirely, freeing YMM registers and removing 32 vector additions per 256-weight block.
-3. **Scalar In-Register Min Reduction**: The min contribution is calculated via 8 fast scalar multiply-adds per block directly from L1 cache:
-   $$\text{total\_min} += dmin \cdot \sum_{k=0}^7 (mn_k \cdot S_{b \cdot 8 + k})$$
-4. **Single Row-End Horizontal Reduction**: Rather than invoking costly horizontal sum instructions (`_mm_hadd_ps`) for every super-block, `acc` accumulates across all blocks and a single `hsum_avx2(acc) - total_min` is evaluated at the end of the row.
+Threads are pinned to physical performance cores (`compute_cores` in `main.rs`): thread `i`
+goes to the `i`-th P-core, with core 0 last since Windows favors it for other work. Threads
+beyond the number of P-cores are left unpinned.
 
-## Dual-Port Interleaved 2-Row GEMV Kernels (`rows_2x!`)
+## Startup
 
-Modern Intel Raptor Lake P-cores (Golden Cove architecture) feature **two independent 256-bit FMA execution ports** (Port 0 and Port 1), capable of executing two 8-wide float FMAs per clock cycle with a 4-cycle latency.
+`loading.rs` draws the startup display: one line per phase, with a spinner, and a progress
+bar where the phase can measure its progress. The phases are reading the model, warming the
+weights, connecting to the worker, engine settings, and processing the system prompt. Each
+line ends with its result and duration. Without a color terminal, or with `--verbose`, it
+prints plain lines.
 
-In naive single-row accumulation (`acc = _mm256_fmadd_ps(w, x, acc)`), each instruction has a loop-carried dependency on the previous result, stalling the pipeline for 3 out of every 4 cycles.
-
-Spindle implements interleaved 2-row SIMD unrolling (`dot_q8_0_2rows_avx2`, `dot_q4_k_2rows_avx2_presum`, `dot_q5_k_2rows_avx2_presum`, `dot_f16_2rows_avx2`, `dot_f32_2rows_avx2`):
-- **Shared Activation Loads**: Input vector slices $x[0..32]$ are loaded once into registers and shared between both rows, halving memory bandwidth demand.
-- **Port 0 & Port 1 Saturation**: Independent accumulators `acc0` and `acc1` execute concurrently without dependency stalls, doubling effective computation throughput.
-
-## Parallel GQA Attention Heads Across P-Cores
-
-When sequence length $t$ increases during generation or prompt processing, computing attention over all heads sequentially leaves helper P-cores idle while thread 0 loops over $0..=pos$.
-
-Spindle dynamically shards attention heads across the zero-syscall worker pool (`pool.run`):
-- Each physical P-core processes a disjoint range of query heads $h \in [h_0, h_1)$.
-- Reads from the KV-cache and query vectors are purely immutable and lock-free.
-- Each core writes directly into its assigned slice of `attn_out` with zero synchronization overhead or false sharing.
-
-## Dynamic Energy-Preserving MoE Expert Pruning
-
-In Mixture-of-Experts architectures like `Qwen3-30B-A3B`, static top-8 selection wastes significant RAM bandwidth on low-probability tail experts that contribute $< 1.5\%$ to the residual stream.
-
-Spindle introduces dynamic energy-preserving expert pruning (`--moe-prune <f32>`):
-- **Relative Thresholding**: Experts whose probability satisfies $p_e < \alpha \cdot \max(p)$ (default $\alpha = 0.03$) are skipped, while enforcing a floor of $\min(4, k)$.
-- **Energy Conservation**: Surviving expert weights are renormalized via $\tilde{w}_e = p_e / \sum p_j$, ensuring $\sum \tilde{w}_e = 1.0$.
-- **Bandwidth Reduction**: Average active experts drop from 8.0 down to 5.2 per layer, slashing RAM bandwidth demand by 31.4% and accelerating serial generation from 7.2 tok/s to ~10.2 tok/s with zero perplexity degradation.
-
-## Distributed Speculative Decoding Protocol
-
-To break beyond the single-stream memory wall:
-- **In-RAM Local Drafter**: `qwen3-0.6b-q8_0` resides in 609 MiB on the 8 GB laptop, generating $K=4$ speculative tokens at ~80 tok/s.
-- **Batched Cluster Verification**: The distributed cluster verifies candidate tokens in a single batched GEMM pass (`FRAME_PREFILL_REQ`), streaming model weights once across all candidate tokens.
-- **Position-Addressed Cache Rewind**: When mismatches occur, the attention cache's $0..=\text{pos}$ address boundary ignores discarded speculative slots automatically, ensuring zero cache copying or reallocation overhead across the network.
-- **Effective Throughput**: Delivers **15 to 22+ tok/s** effective generation on 30.5B MoE models over standard Wi-Fi.
+The system prompt is processed during startup, before the chat opens (`prefill_system_with`
+reports progress after every 128-token chunk). With tools on, it is about 930 tokens. After
+that, every message only processes its own tokens.
