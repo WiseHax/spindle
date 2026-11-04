@@ -715,6 +715,148 @@ unsafe fn dot_q6_k_2rows_avx2(
     (hsum_avx2(total0), hsum_avx2(total1))
 }
 
+/// Interleaved 4-row AVX2 dot product for `Q6_K`.
+/// Amortizes activation loads by 4x and saturates FMA execution ports (used for LM head with 152K vocab).
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn dot_q6_k_4rows_avx2(
+    row0_ptr: *const u8,
+    row1_ptr: *const u8,
+    row2_ptr: *const u8,
+    row3_ptr: *const u8,
+    x: *const f32,
+    n_cols: usize,
+) -> (f32, f32, f32, f32) {
+    let n_blocks = n_cols / 256;
+    let mut total0 = _mm256_setzero_ps();
+    let mut total1 = _mm256_setzero_ps();
+    let mut total2 = _mm256_setzero_ps();
+    let mut total3 = _mm256_setzero_ps();
+    let m4 = _mm256_set1_epi32(0x0F);
+    let m3 = _mm256_set1_epi32(3);
+    let off = _mm256_set1_epi32(32);
+
+    for b in 0..n_blocks {
+        let blk0 = &*(row0_ptr.add(b * 210) as *const BlockQ6K);
+        let blk1 = &*(row1_ptr.add(b * 210) as *const BlockQ6K);
+        let blk2 = &*(row2_ptr.add(b * 210) as *const BlockQ6K);
+        let blk3 = &*(row3_ptr.add(b * 210) as *const BlockQ6K);
+
+        let mut yp = x.add(b * 256);
+        let mut ql0 = blk0.ql.as_ptr();
+        let mut qh0 = blk0.qh.as_ptr();
+        let mut sc0 = blk0.scales.as_ptr();
+
+        let mut ql1 = blk1.ql.as_ptr();
+        let mut qh1 = blk1.qh.as_ptr();
+        let mut sc1 = blk1.scales.as_ptr();
+
+        let mut ql2 = blk2.ql.as_ptr();
+        let mut qh2 = blk2.qh.as_ptr();
+        let mut sc2 = blk2.scales.as_ptr();
+
+        let mut ql3 = blk3.ql.as_ptr();
+        let mut qh3 = blk3.qh.as_ptr();
+        let mut sc3 = blk3.scales.as_ptr();
+
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+        let mut acc2 = _mm256_setzero_ps();
+        let mut acc3 = _mm256_setzero_ps();
+
+        for _ in (0..256).step_by(128) {
+            for l in (0..32).step_by(8) {
+                let is = l / 16;
+                let load8 = |p: *const u8| _mm256_cvtepu8_epi32(_mm_loadl_epi64(p as *const __m128i));
+
+                let y0 = _mm256_loadu_ps(yp.add(l));
+                let y1 = _mm256_loadu_ps(yp.add(l + 32));
+                let y2 = _mm256_loadu_ps(yp.add(l + 64));
+                let y3 = _mm256_loadu_ps(yp.add(l + 96));
+
+                // Row 0
+                let ql0_0 = load8(ql0.add(l));
+                let ql32_0 = load8(ql0.add(l + 32));
+                let h0 = load8(qh0.add(l));
+                let q1_0 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql0_0, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(h0, m3))), off);
+                let q2_0 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql32_0, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<2>(h0), m3))), off);
+                let q3_0 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql0_0), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<4>(h0), m3))), off);
+                let q4_0 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql32_0), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<6>(h0), m3))), off);
+                let w1_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q1_0), _mm256_set1_ps(*sc0.add(is) as f32));
+                let w2_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q2_0), _mm256_set1_ps(*sc0.add(is + 2) as f32));
+                let w3_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q3_0), _mm256_set1_ps(*sc0.add(is + 4) as f32));
+                let w4_0 = _mm256_mul_ps(_mm256_cvtepi32_ps(q4_0), _mm256_set1_ps(*sc0.add(is + 6) as f32));
+                acc0 = _mm256_fmadd_ps(w1_0, y0, acc0);
+                acc0 = _mm256_fmadd_ps(w2_0, y1, acc0);
+                acc0 = _mm256_fmadd_ps(w3_0, y2, acc0);
+                acc0 = _mm256_fmadd_ps(w4_0, y3, acc0);
+
+                // Row 1
+                let ql0_1 = load8(ql1.add(l));
+                let ql32_1 = load8(ql1.add(l + 32));
+                let h1 = load8(qh1.add(l));
+                let q1_1 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql0_1, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(h1, m3))), off);
+                let q2_1 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql32_1, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<2>(h1), m3))), off);
+                let q3_1 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql0_1), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<4>(h1), m3))), off);
+                let q4_1 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql32_1), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<6>(h1), m3))), off);
+                let w1_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q1_1), _mm256_set1_ps(*sc1.add(is) as f32));
+                let w2_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q2_1), _mm256_set1_ps(*sc1.add(is + 2) as f32));
+                let w3_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q3_1), _mm256_set1_ps(*sc1.add(is + 4) as f32));
+                let w4_1 = _mm256_mul_ps(_mm256_cvtepi32_ps(q4_1), _mm256_set1_ps(*sc1.add(is + 6) as f32));
+                acc1 = _mm256_fmadd_ps(w1_1, y0, acc1);
+                acc1 = _mm256_fmadd_ps(w2_1, y1, acc1);
+                acc1 = _mm256_fmadd_ps(w3_1, y2, acc1);
+                acc1 = _mm256_fmadd_ps(w4_1, y3, acc1);
+
+                // Row 2
+                let ql0_2 = load8(ql2.add(l));
+                let ql32_2 = load8(ql2.add(l + 32));
+                let h2 = load8(qh2.add(l));
+                let q1_2 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql0_2, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(h2, m3))), off);
+                let q2_2 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql32_2, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<2>(h2), m3))), off);
+                let q3_2 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql0_2), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<4>(h2), m3))), off);
+                let q4_2 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql32_2), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<6>(h2), m3))), off);
+                let w1_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q1_2), _mm256_set1_ps(*sc2.add(is) as f32));
+                let w2_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q2_2), _mm256_set1_ps(*sc2.add(is + 2) as f32));
+                let w3_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q3_2), _mm256_set1_ps(*sc2.add(is + 4) as f32));
+                let w4_2 = _mm256_mul_ps(_mm256_cvtepi32_ps(q4_2), _mm256_set1_ps(*sc2.add(is + 6) as f32));
+                acc2 = _mm256_fmadd_ps(w1_2, y0, acc2);
+                acc2 = _mm256_fmadd_ps(w2_2, y1, acc2);
+                acc2 = _mm256_fmadd_ps(w3_2, y2, acc2);
+                acc2 = _mm256_fmadd_ps(w4_2, y3, acc2);
+
+                // Row 3
+                let ql0_3 = load8(ql3.add(l));
+                let ql32_3 = load8(ql3.add(l + 32));
+                let h3 = load8(qh3.add(l));
+                let q1_3 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql0_3, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(h3, m3))), off);
+                let q2_3 = _mm256_sub_epi32(_mm256_or_si256(_mm256_and_si256(ql32_3, m4), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<2>(h3), m3))), off);
+                let q3_3 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql0_3), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<4>(h3), m3))), off);
+                let q4_3 = _mm256_sub_epi32(_mm256_or_si256(_mm256_srli_epi32::<4>(ql32_3), _mm256_slli_epi32::<4>(_mm256_and_si256(_mm256_srli_epi32::<6>(h3), m3))), off);
+                let w1_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q1_3), _mm256_set1_ps(*sc3.add(is) as f32));
+                let w2_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q2_3), _mm256_set1_ps(*sc3.add(is + 2) as f32));
+                let w3_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q3_3), _mm256_set1_ps(*sc3.add(is + 4) as f32));
+                let w4_3 = _mm256_mul_ps(_mm256_cvtepi32_ps(q4_3), _mm256_set1_ps(*sc3.add(is + 6) as f32));
+                acc3 = _mm256_fmadd_ps(w1_3, y0, acc3);
+                acc3 = _mm256_fmadd_ps(w2_3, y1, acc3);
+                acc3 = _mm256_fmadd_ps(w3_3, y2, acc3);
+                acc3 = _mm256_fmadd_ps(w4_3, y3, acc3);
+            }
+            yp = yp.add(128);
+            ql0 = ql0.add(64); qh0 = qh0.add(32); sc0 = sc0.add(8);
+            ql1 = ql1.add(64); qh1 = qh1.add(32); sc1 = sc1.add(8);
+            ql2 = ql2.add(64); qh2 = qh2.add(32); sc2 = sc2.add(8);
+            ql3 = ql3.add(64); qh3 = qh3.add(32); sc3 = sc3.add(8);
+        }
+        total0 = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk0.d)), acc0, total0);
+        total1 = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk1.d)), acc1, total1);
+        total2 = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk2.d)), acc2, total2);
+        total3 = _mm256_fmadd_ps(_mm256_set1_ps(f16_to_f32_fast(blk3.d)), acc3, total3);
+    }
+
+    (hsum_avx2(total0), hsum_avx2(total1), hsum_avx2(total2), hsum_avx2(total3))
+}
+
 /// Plain f32 dot product.
 #[target_feature(enable = "avx2,fma")]
 #[inline]
@@ -902,7 +1044,34 @@ pub(crate) unsafe fn matvec_rows_avx2(base_ptr: *const u8, m: &Mat, x: &[f32], o
                 out[i] = dot_q5_k_row_avx2_presum(p0, xp, act_sums_ptr, n_cols);
             }
         }
-        GgmlType::Q6K => rows_2x!((n_cols / 256) * 210, dot_q6_k_2rows_avx2, dot_q6_k_row_avx2),
+        GgmlType::Q6K => {
+            let row_bytes = (n_cols / 256) * 210;
+            let mut i = 0;
+            while i + 3 < n_rows {
+                let p0 = tensor_ptr.add((r0 + i) * row_bytes);
+                let p1 = tensor_ptr.add((r0 + i + 1) * row_bytes);
+                let p2 = tensor_ptr.add((r0 + i + 2) * row_bytes);
+                let p3 = tensor_ptr.add((r0 + i + 3) * row_bytes);
+                let (v0, v1, v2, v3) = dot_q6_k_4rows_avx2(p0, p1, p2, p3, xp, n_cols);
+                out[i] = v0;
+                out[i + 1] = v1;
+                out[i + 2] = v2;
+                out[i + 3] = v3;
+                i += 4;
+            }
+            while i + 1 < n_rows {
+                let p0 = tensor_ptr.add((r0 + i) * row_bytes);
+                let p1 = tensor_ptr.add((r0 + i + 1) * row_bytes);
+                let (v0, v1) = dot_q6_k_2rows_avx2(p0, p1, xp, n_cols);
+                out[i] = v0;
+                out[i + 1] = v1;
+                i += 2;
+            }
+            if i < n_rows {
+                let p0 = tensor_ptr.add((r0 + i) * row_bytes);
+                out[i] = dot_q6_k_row_avx2(p0, xp, n_cols);
+            }
+        }
         GgmlType::F16 => rows_2x!(n_cols * 2, dot_f16_2rows_avx2, dot_f16_row_avx2),
         GgmlType::BF16 => rows_1x!(n_cols * 2, dot_bf16_row_avx2),
         GgmlType::F32 => {
