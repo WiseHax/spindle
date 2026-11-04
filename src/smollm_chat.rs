@@ -941,6 +941,12 @@ pub struct SmolLm2Engine {
     pub cluster_timing: ClusterTiming,
     /// Atomic abort signal to cancel generation early when user hits Escape or Ctrl+C.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Pre-allocated buffer for LM head logits to eliminate 600 KiB heap allocation per token.
+    pub logits_buf: Vec<f32>,
+    /// Pre-allocated buffer for sampler top-k candidate indices to eliminate 1.2 MiB heap allocation per token.
+    pub cand_buf: Vec<usize>,
+    /// Pre-allocated mask for repetition penalty to eliminate 152 KiB heap allocation per token.
+    pub penalized_mask: Vec<u8>,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -1202,6 +1208,9 @@ impl SmolLm2Engine {
             kv_branches: HashMap::new(),
             cluster_timing: ClusterTiming::default(),
             abort_signal: None,
+            logits_buf: vec![0.0f32; c.vocab],
+            cand_buf: Vec::with_capacity(c.vocab),
+            penalized_mask: vec![0u8; c.vocab],
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -2167,35 +2176,49 @@ impl SmolLm2Engine {
         forbid_think: bool,
     ) -> usize {
         let c = self.cfg;
-        let mut logits = vec![0.0f32; c.vocab];
-        matvec(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, hidden, &mut logits);
+        if self.logits_buf.len() != c.vocab {
+            self.logits_buf.resize(c.vocab, 0.0);
+        }
+        if self.penalized_mask.len() != c.vocab {
+            self.penalized_mask.resize(c.vocab, 0);
+        }
+        matvec(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, hidden, &mut self.logits_buf);
         if c.logit_scale != 1.0 {
-            logits.iter_mut().for_each(|l| *l /= c.logit_scale);
+            self.logits_buf.iter_mut().for_each(|l| *l /= c.logit_scale);
         }
 
-        // O(1) membership instead of `recent.contains()` per vocab entry.
-        let mut penalized = vec![false; c.vocab];
-        for &t in recent {
-            penalized[t] = true;
-        }
         let sc = self.sampler;
-        for (tid, logit) in logits.iter_mut().enumerate() {
-            if penalized[tid] {
-                *logit = if *logit > 0.0 { *logit / sc.repeat_penalty } else { *logit * sc.repeat_penalty };
+        if sc.repeat_penalty != 1.0 {
+            for &t in recent {
+                if t < self.logits_buf.len() && self.penalized_mask[t] == 0 {
+                    self.penalized_mask[t] = 1;
+                    let logit = &mut self.logits_buf[t];
+                    *logit = if *logit > 0.0 { *logit / sc.repeat_penalty } else { *logit * sc.repeat_penalty };
+                }
+            }
+            // Clear only the touched entries
+            for &t in recent {
+                if t < self.penalized_mask.len() {
+                    self.penalized_mask[t] = 0;
+                }
             }
         }
         if forbid_stop {
             for &id in &self.stop_ids {
-                logits[id] = f32::NEG_INFINITY;
+                if id < self.logits_buf.len() {
+                    self.logits_buf[id] = f32::NEG_INFINITY;
+                }
             }
         }
         if forbid_think {
             if let Some((open, _)) = self.think_ids {
-                logits[open] = f32::NEG_INFINITY;
+                if open < self.logits_buf.len() {
+                    self.logits_buf[open] = f32::NEG_INFINITY;
+                }
             }
         }
 
-        let argmax = || {
+        let argmax = |logits: &[f32]| {
             logits
                 .iter()
                 .enumerate()
@@ -2204,24 +2227,37 @@ impl SmolLm2Engine {
                 .unwrap_or(0)
         };
         if sc.temperature <= 0.0 {
-            return argmax();
+            return argmax(&self.logits_buf);
         }
 
-        // Candidates: top-k by logit (partial select, then sort just those k).
-        let mut cand: Vec<usize> = (0..c.vocab).filter(|&t| logits[t].is_finite()).collect();
-        let k = if sc.top_k == 0 { cand.len() } else { sc.top_k.min(cand.len()) };
+        // Candidates: top-k by logit (reusing pre-allocated cand_buf).
+        self.cand_buf.clear();
+        self.cand_buf.extend((0..c.vocab).filter(|&t| self.logits_buf[t].is_finite()));
+        let k = if sc.top_k == 0 { self.cand_buf.len() } else { sc.top_k.min(self.cand_buf.len()) };
         if k == 0 {
-            return argmax();
+            return argmax(&self.logits_buf);
         }
-        if k < cand.len() {
-            cand.select_nth_unstable_by(k - 1, |&a, &b| logits[b].total_cmp(&logits[a]));
-            cand.truncate(k);
+        let logits = &self.logits_buf;
+        if k < self.cand_buf.len() {
+            self.cand_buf.select_nth_unstable_by(k - 1, |&a, &b| logits[b].total_cmp(&logits[a]));
+            self.cand_buf.truncate(k);
         }
-        cand.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        self.cand_buf.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
 
         // Softmax with temperature (subtract max for numerical stability).
+        let cand = &self.cand_buf;
         let max = logits[cand[0]];
-        let mut probs: Vec<f32> = cand.iter().map(|&t| ((logits[t] - max) / sc.temperature).exp()).collect();
+        let mut stack_probs = [0.0f32; 128];
+        let mut heap_probs;
+        let probs: &mut [f32] = if k <= 128 {
+            for i in 0..k {
+                stack_probs[i] = ((logits[cand[i]] - max) / sc.temperature).exp();
+            }
+            &mut stack_probs[..k]
+        } else {
+            heap_probs = cand.iter().map(|&t| ((logits[t] - max) / sc.temperature).exp()).collect::<Vec<f32>>();
+            &mut heap_probs[..]
+        };
         let sum: f32 = probs.iter().sum();
         probs.iter_mut().for_each(|p| *p /= sum);
 
