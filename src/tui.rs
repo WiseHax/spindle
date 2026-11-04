@@ -88,8 +88,9 @@ impl TerminalGuard {
 
             let mut stdout = io::stdout();
             // Enter alternate buffer (\x1b[?1049h), hide cursor (\x1b[?25l), disable auto-wrap (\x1b[?7l),
-            // enable normal mouse tracking (\x1b[?1000h), enable SGR extended mouse mode (\x1b[?1006h)
-            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h");
+            // enable SGR extended mouse mode (\x1b[?1006h), enable alternate scroll mode (\x1b[?1007h).
+            // NOTE: \x1b[?1000h (normal click tracking) is omitted so mouse clicks/taps never emit raw escape bytes!
+            let _ = write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1006h\x1b[?1007h");
             let _ = stdout.flush();
 
             Ok(Self {
@@ -106,9 +107,9 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         unsafe {
             let mut stdout = io::stdout();
-            // Disable SGR mouse (\x1b[?1006l), disable mouse (\x1b[?1000l), enable auto-wrap (\x1b[?7h),
-            // show cursor (\x1b[?25h), exit alternate screen buffer (\x1b[?1049l), reset styles
-            let _ = write!(stdout, "\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
+            // Disable mouse modes, enable auto-wrap (\x1b[?7h), show cursor (\x1b[?25h),
+            // exit alternate screen buffer (\x1b[?1049l), reset styles
+            let _ = write!(stdout, "\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
             let _ = stdout.flush();
 
             let _ = SetConsoleMode(self.out_handle, self.orig_out_mode);
@@ -360,10 +361,35 @@ impl InputReader {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut stdin = io::stdin();
+            let mut chunk = [0u8; 512];
+            let mut pending: Vec<u8> = Vec::new();
             loop {
-                let action = read_one_key_blocking(&mut stdin);
-                if tx.send(action).is_err() {
-                    break;
+                // Read whatever bytes are available as one chunk
+                let n = match stdin.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                pending.extend_from_slice(&chunk[..n]);
+
+                // If pending buffer ends with solitary ESC (0x1b), wait a brief 25ms window
+                // to see if subsequent escape sequence bytes arrive together
+                if pending.ends_with(&[27]) {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    if has_console_input() {
+                        if let Ok(more) = stdin.read(&mut chunk) {
+                            if more > 0 {
+                                pending.extend_from_slice(&chunk[..more]);
+                            }
+                        }
+                    }
+                }
+
+                let (actions, consumed) = parse_input_bytes(&pending);
+                pending.drain(..consumed);
+                for a in actions {
+                    if a != KeyAction::None && tx.send(a).is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -376,125 +402,155 @@ impl InputReader {
     }
 }
 
-/// Blocks on the background input thread until a raw byte arrives, then parses ANSI/VT escape sequences.
-fn read_one_key_blocking(stdin: &mut io::Stdin) -> KeyAction {
-    let mut byte = [0u8; 1];
-    if stdin.read(&mut byte).unwrap_or(0) == 0 {
-        return KeyAction::None;
-    }
-
-    match byte[0] {
-        3 => KeyAction::Escape, // Ctrl+C clean exit
-        13 | 10 => KeyAction::Enter,
-        8 | 127 => KeyAction::Backspace,
-        9 => KeyAction::Tab,
-        16 => KeyAction::CtrlP,
-        27 => {
-            // Check if further escape sequence bytes are available
-            if !has_console_input() {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+/// Parses a raw input byte buffer into key/mouse actions.
+/// Returns `(actions, bytes_consumed)`. Incomplete trailing escape sequences are left
+/// unconsumed so the next read can complete them. Unknown sequences and mouse tracking clicks
+/// are swallowed whole and never leaked into the input box as text.
+pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        match b {
+            3 => {
+                out.push(KeyAction::Escape);
+                i += 1;
             }
-            if !has_console_input() {
-                return KeyAction::Escape;
+            13 | 10 => {
+                out.push(KeyAction::Enter);
+                i += 1;
             }
-
-            let mut seq = [0u8; 2];
-            if stdin.read(&mut seq[0..1]).unwrap_or(0) == 1 {
-                if seq[0] == b'[' {
-                    if stdin.read(&mut seq[1..2]).unwrap_or(0) == 1 {
-                        match seq[1] {
-                            b'<' => {
-                                // SGR 1006 Mouse Event: \x1b[<button;x;yM or m
-                                let mut sgr_buf = Vec::with_capacity(16);
-                                let mut b = [0u8; 1];
-                                while stdin.read(&mut b).unwrap_or(0) == 1 {
-                                    if b[0] == b'M' || b[0] == b'm' {
-                                        break;
-                                    }
-                                    sgr_buf.push(b[0]);
-                                    if sgr_buf.len() >= 32 {
-                                        break;
-                                    }
-                                }
-                                let sgr_str = String::from_utf8_lossy(&sgr_buf);
-                                let btn = sgr_str.split(';').next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-                                match btn {
-                                    64 | 68 | 80 => KeyAction::ScrollUp(3),   // Wheel Up (normal, shift, ctrl)
-                                    65 | 69 | 81 => KeyAction::ScrollDown(3), // Wheel Down (normal, shift, ctrl)
-                                    _ => KeyAction::None,
-                                }
-                            }
-                            b'M' => {
-                                // Legacy X10/X11 mouse event: 3 bytes follow
-                                let mut m_bytes = [0u8; 3];
-                                if stdin.read(&mut m_bytes).unwrap_or(0) == 3 {
-                                    let btn = m_bytes[0].saturating_sub(32);
-                                    match btn {
-                                        64 => KeyAction::ScrollUp(3),
-                                        65 => KeyAction::ScrollDown(3),
-                                        _ => KeyAction::None,
-                                    }
-                                } else {
-                                    KeyAction::None
-                                }
-                            }
-                            b'1' => {
-                                // Modifier sequences: e.g. \x1b[1;5A (Ctrl+Up), \x1b[1;2A (Shift+Up)
-                                let mut mod_seq = [0u8; 3];
-                                if stdin.read(&mut mod_seq).unwrap_or(0) == 3 {
-                                    match mod_seq[2] {
-                                        b'A' => KeyAction::ScrollUp(2),
-                                        b'B' => KeyAction::ScrollDown(2),
-                                        b'C' => KeyAction::Right,
-                                        b'D' => KeyAction::Left,
-                                        _ => KeyAction::None,
-                                    }
-                                } else {
-                                    KeyAction::None
-                                }
-                            }
-                            b'A' => KeyAction::Up,
-                            b'B' => KeyAction::Down,
-                            b'C' => KeyAction::Right,
-                            b'D' => KeyAction::Left,
-                            b'H' => KeyAction::Home,
-                            b'F' => KeyAction::End,
-                            b'3' => {
-                                let mut tilde = [0u8; 1];
-                                let _ = stdin.read(&mut tilde);
-                                KeyAction::Delete
-                            }
-                            b'5' => {
-                                let mut tilde = [0u8; 1];
-                                let _ = stdin.read(&mut tilde);
-                                KeyAction::PageUp
-                            }
-                            b'6' => {
-                                let mut tilde = [0u8; 1];
-                                let _ = stdin.read(&mut tilde);
-                                KeyAction::PageDown
-                            }
-                            _ => KeyAction::None,
-                        }
-                    } else {
-                        KeyAction::Escape
+            8 | 127 => {
+                out.push(KeyAction::Backspace);
+                i += 1;
+            }
+            9 => {
+                out.push(KeyAction::Tab);
+                i += 1;
+            }
+            16 => {
+                out.push(KeyAction::CtrlP);
+                i += 1;
+            }
+            27 => {
+                // Lone ESC at end of chunk: treated as Escape key
+                if i + 1 >= buf.len() {
+                    out.push(KeyAction::Escape);
+                    i += 1;
+                    continue;
+                }
+                let next = buf[i + 1];
+                if next != b'[' && next != b'O' {
+                    // ESC followed by something else (Alt+key / double ESC): treat as Escape
+                    out.push(KeyAction::Escape);
+                    i += 1;
+                    continue;
+                }
+                // CSI / SS3: params are bytes 0x20..=0x3F, final byte 0x40..=0x7E
+                let mut j = i + 2;
+                while j < buf.len() && (0x20..=0x3F).contains(&buf[j]) {
+                    j += 1;
+                }
+                if j >= buf.len() {
+                    // Incomplete sequence: leave in pending buffer to wait for next chunk
+                    break;
+                }
+                let fin = buf[j];
+                let params = std::str::from_utf8(&buf[i + 2..j]).unwrap_or("");
+                let action = if let Some(sgr) = params.strip_prefix('<') {
+                    // SGR extended mouse mode: \x1b[<btn;col;rowM or m
+                    let btn = sgr.split(';').next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                    match btn & !(4 | 8 | 16) {
+                        64 => KeyAction::ScrollUp(3),
+                        65 => KeyAction::ScrollDown(3),
+                        _ => KeyAction::None, // clicks, releases, drags silently swallowed
+                    }
+                } else if fin == b'M' && params.is_empty() {
+                    // Legacy X10 mouse: 3 raw bytes follow
+                    if j + 3 >= buf.len() {
+                        break; // wait for the 3 payload bytes
+                    }
+                    let btn = buf[j + 1].saturating_sub(32);
+                    j += 3;
+                    match btn {
+                        64 => KeyAction::ScrollUp(3),
+                        65 => KeyAction::ScrollDown(3),
+                        _ => KeyAction::None,
                     }
                 } else {
-                    KeyAction::Escape
+                    let modified = params.contains(';');
+                    match fin {
+                        b'A' if modified => KeyAction::ScrollUp(2),
+                        b'B' if modified => KeyAction::ScrollDown(2),
+                        b'A' => KeyAction::Up,
+                        b'B' => KeyAction::Down,
+                        b'C' => KeyAction::Right,
+                        b'D' => KeyAction::Left,
+                        b'H' => KeyAction::Home,
+                        b'F' => KeyAction::End,
+                        b'~' => match params {
+                            "1" | "7" => KeyAction::Home,
+                            "4" | "8" => KeyAction::End,
+                            "3" => KeyAction::Delete,
+                            "5" => KeyAction::PageUp,
+                            "6" => KeyAction::PageDown,
+                            _ => KeyAction::None,
+                        },
+                        _ => KeyAction::None,
+                    }
+                };
+                out.push(action);
+                i = j + 1;
+            }
+            b'[' if i + 1 < buf.len() && (buf[i + 1] == b'<' || buf[i + 1] == b'?') => {
+                // Safeguard against orphaned CSI sequences missing leading ESC
+                let mut j = i + 2;
+                while j < buf.len() && (0x20..=0x3F).contains(&buf[j]) {
+                    j += 1;
                 }
-            } else {
-                KeyAction::Escape
+                if j >= buf.len() {
+                    break;
+                }
+                i = j + 1;
+            }
+            b';' if i + 1 < buf.len() && buf[i + 1].is_ascii_digit() => {
+                // Safeguard against orphaned SGR coordinate fragments like ";77;27M"
+                let mut j = i + 1;
+                while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                    j += 1;
+                }
+                if j < buf.len() && (buf[j] == b'M' || buf[j] == b'm') {
+                    i = j + 1;
+                } else {
+                    out.push(KeyAction::Char(';'));
+                    i += 1;
+                }
+            }
+            b if b >= 32 => {
+                // UTF-8 decode one character
+                let len = match b {
+                    0x00..=0x7F => 1,
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF7 => 4,
+                    _ => 1,
+                };
+                if i + len > buf.len() {
+                    break;
+                }
+                if let Ok(s) = std::str::from_utf8(&buf[i..i + len]) {
+                    if let Some(c) = s.chars().next() {
+                        out.push(KeyAction::Char(c));
+                    }
+                }
+                i += len;
+            }
+            _ => {
+                i += 1;
             }
         }
-        ch if ch >= 32 => {
-            if let Some(c) = char::from_u32(ch as u32) {
-                KeyAction::Char(c)
-            } else {
-                KeyAction::None
-            }
-        }
-        _ => KeyAction::None,
     }
+    (out, i)
 }
 
 /// Text input line editor state.
@@ -711,49 +767,82 @@ impl SpindleTui {
         self.canvas.clear(Rgb::BG_DARK);
 
         let center_x = w / 2;
-        let logo_y = (h / 6).max(2);
+        let card_w = (w.saturating_sub(6)).clamp(40, 84);
+        let card_h = 5u16;
+        let card_x = center_x.saturating_sub(card_w / 2);
 
-        // 1. Centered Hero Block Logo with Vertical Blue Gradient
-        for (i, line) in SPINDLE_LOGO.iter().enumerate() {
-            let row = logo_y + (i as u16);
-            let len = line.chars().count() as u16;
-            let start_x = center_x.saturating_sub(len / 2);
-            let color = LOGO_GRADIENT[i % LOGO_GRADIENT.len()];
-            self.canvas.print(start_x, row, line, color, Rgb::BG_DARK, true, false);
+        if h >= 22 {
+            // Full height terminal: display stylish block logo and centered hero card
+            let logo_y = ((h.saturating_sub(18)) / 2).max(2);
+            for (i, line) in SPINDLE_LOGO.iter().enumerate() {
+                let row = logo_y + (i as u16);
+                let len = line.chars().count() as u16;
+                let start_x = center_x.saturating_sub(len / 2);
+                let color = LOGO_GRADIENT[i % LOGO_GRADIENT.len()];
+                self.canvas.print(start_x, row, line, color, Rgb::BG_DARK, true, false);
+            }
+
+            // Subtitle
+            let sub_prefix = "/help";
+            let sub_mid = " for slash commands · ";
+            let sub_cmd2 = "/heal";
+            let sub_tail = " autonomous loop";
+            let total_sub_len = (sub_prefix.len() + sub_mid.len() + sub_cmd2.len() + sub_tail.len()) as u16;
+            let mut sub_x = center_x.saturating_sub(total_sub_len / 2);
+            let sub_y = logo_y + 4;
+
+            self.canvas.print(sub_x, sub_y, sub_prefix, Rgb::ORANGE, Rgb::BG_DARK, true, false);
+            sub_x += sub_prefix.len() as u16;
+            self.canvas.print(sub_x, sub_y, sub_mid, Rgb::MUTED, Rgb::BG_DARK, false, false);
+            sub_x += sub_mid.len() as u16;
+            self.canvas.print(sub_x, sub_y, sub_cmd2, Rgb::ORANGE, Rgb::BG_DARK, true, false);
+            sub_x += sub_cmd2.len() as u16;
+            self.canvas.print(sub_x, sub_y, sub_tail, Rgb::MUTED, Rgb::BG_DARK, false, false);
+
+            let card_y = logo_y + 6;
+            self.render_card_content(card_x, card_y, card_w, card_h, true);
+
+            let hotkeys = "tab tools    ctrl+p commands    /help slash commands    esc quit";
+            let hk_x = center_x.saturating_sub((hotkeys.len() as u16) / 2);
+            self.canvas.print(hk_x, card_y + card_h + 1, hotkeys, Rgb::MUTED, Rgb::BG_DARK, false, false);
+        } else {
+            // Compact terminal: sleek single-line header with no overlapping rows
+            let banner = "SPINDLE · Autonomous Distributed MoE Engine";
+            let bx = center_x.saturating_sub(banner.len() as u16 / 2);
+            self.canvas.print(bx, 1, banner, Rgb::BRIGHT_BLUE, Rgb::BG_DARK, true, false);
+
+            let sub_prefix = "/help for slash commands · /heal loop";
+            let sx = center_x.saturating_sub(sub_prefix.len() as u16 / 2);
+            self.canvas.print(sx, 2, sub_prefix, Rgb::MUTED, Rgb::BG_DARK, false, false);
+
+            let card_y = 4u16;
+            self.render_card_content(card_x, card_y, card_w, card_h, true);
+
+            if h >= 14 {
+                let hotkeys = "tab tools   ctrl+p commands   esc quit";
+                let hk_x = center_x.saturating_sub((hotkeys.len() as u16) / 2);
+                self.canvas.print(hk_x, card_y + card_h + 1, hotkeys, Rgb::MUTED, Rgb::BG_DARK, false, false);
+            }
         }
 
-        // 2. Subtitle with OpenCode-style colored command tokens
-        let sub_prefix = "/help";
-        let sub_mid = " for slash commands · ";
-        let sub_cmd2 = "/heal";
-        let sub_tail = " autonomous loop";
-        let total_sub_len = (sub_prefix.len() + sub_mid.len() + sub_cmd2.len() + sub_tail.len()) as u16;
-        let mut sub_x = center_x.saturating_sub(total_sub_len / 2);
-        let sub_y = logo_y + 5;
+        self.render_docked_footer(w, h);
+        let _ = self.canvas.flush();
+    }
 
-        self.canvas.print(sub_x, sub_y, sub_prefix, Rgb::ORANGE, Rgb::BG_DARK, true, false);
-        sub_x += sub_prefix.len() as u16;
-        self.canvas.print(sub_x, sub_y, sub_mid, Rgb::MUTED, Rgb::BG_DARK, false, false);
-        sub_x += sub_mid.len() as u16;
-        self.canvas.print(sub_x, sub_y, sub_cmd2, Rgb::ORANGE, Rgb::BG_DARK, true, false);
-        sub_x += sub_cmd2.len() as u16;
-        self.canvas.print(sub_x, sub_y, sub_tail, Rgb::MUTED, Rgb::BG_DARK, false, false);
-
-        // 3. Floating Elevated Input Card
-        let card_w = (w.saturating_sub(6)).clamp(40, 84);
-        let card_h = 5;
-        let card_x = center_x.saturating_sub(card_w / 2);
-        let card_y = logo_y + 7;
-
+    /// Renders an input card with prompt editor, ghost text, and meta pills.
+    fn render_card_content(&mut self, card_x: u16, card_y: u16, card_w: u16, card_h: u16, is_welcome: bool) {
         self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
 
-        // Content Row: Text or Ghost Placeholder with horizontal windowing and non-stomping cursor
         let prompt_x = card_x + 3;
         let prompt_y = card_y + 1;
         let visible_w = (card_w.saturating_sub(6)) as usize;
 
         if self.input.text.is_empty() {
-            let ghost = "Ask anything... \"delete hello.py\", \"/review\", \"/stats\"";
+            let ghost = if is_welcome {
+                "Ask anything... \"delete hello.py\", \"/review\", \"/stats\""
+            } else {
+                "Ask anything... \"delete hello.py\", \"/review\""
+            };
             let max_ghost_w = visible_w.saturating_sub(2);
             let clipped_ghost: String = ghost.chars().take(max_ghost_w).collect();
 
@@ -772,7 +861,6 @@ impl SpindleTui {
             self.canvas.set(cursor_x, prompt_y, char_under, Rgb::CARD_BG, Rgb::BRIGHT_BLUE, true, false);
         }
 
-        // Bottom Meta Badges inside the card
         let meta_y = card_y + 3;
         let mut mx = prompt_x;
         let max_card_content_x = card_x + card_w - 2;
@@ -782,7 +870,11 @@ impl SpindleTui {
             mx += 6;
         }
 
-        let model_badge = format!("· {} ({})", self.model_name, self.layers_info);
+        let model_badge = if is_welcome {
+            format!("· {} ({})", self.model_name, self.layers_info)
+        } else {
+            format!("· {}", self.model_name)
+        };
         if mx + (model_badge.len() as u16) < max_card_content_x {
             self.canvas.print(mx, meta_y, &model_badge, Rgb::WHITE, Rgb::CARD_BG, false, false);
             mx += model_badge.len() as u16 + 1;
@@ -794,22 +886,19 @@ impl SpindleTui {
             mx += prune_badge.len() as u16 + 1;
         }
 
-        if let Some(peer) = &self.cluster_peer {
-            let mesh_badge = format!("· mesh: {peer}");
-            if mx + (mesh_badge.len() as u16) < max_card_content_x {
-                self.canvas.print(mx, meta_y, &mesh_badge, Rgb::GREEN, Rgb::CARD_BG, false, false);
+        if is_welcome {
+            if let Some(peer) = &self.cluster_peer {
+                let mesh_badge = format!("· mesh: {peer}");
+                if mx + (mesh_badge.len() as u16) < max_card_content_x {
+                    self.canvas.print(mx, meta_y, &mesh_badge, Rgb::GREEN, Rgb::CARD_BG, false, false);
+                }
+            }
+        } else {
+            let low_mem = "· low-mem";
+            if mx + (low_mem.len() as u16) < max_card_content_x {
+                self.canvas.print(mx, meta_y, low_mem, Rgb::MUTED, Rgb::CARD_BG, false, false);
             }
         }
-
-        // 4. Hotkey legends below the card
-        let hotkeys = "tab tools    ctrl+p commands    /help slash commands    esc quit";
-        let hk_x = center_x.saturating_sub((hotkeys.len() as u16) / 2);
-        self.canvas.print(hk_x, card_y + card_h + 1, hotkeys, Rgb::MUTED, Rgb::BG_DARK, false, false);
-
-        // 5. Docked Global Footer (Pinned at row = h - 1)
-        self.render_docked_footer(w, h);
-
-        let _ = self.canvas.flush();
     }
 
     /// Renders the conversation view strictly CHRONOLOGICALLY with word wrapping and scroll support.
@@ -849,7 +938,7 @@ impl SpindleTui {
 
         for msg in &self.history {
             if msg.role == "user" {
-                let user_max_w = (w.saturating_sub(16)) as usize;
+                let user_max_w = (w.saturating_sub(14)).max(20) as usize;
                 let wrapped_user = wrap_text(&msg.text, user_max_w);
                 for (idx, u_line) in wrapped_user.into_iter().enumerate() {
                     let prefix = if idx == 0 { "> You: " } else { "       " };
@@ -861,7 +950,7 @@ impl SpindleTui {
                     });
                 }
             } else if msg.role == "tool" {
-                let tool_max_w = (w.saturating_sub(14)) as usize;
+                let tool_max_w = (w.saturating_sub(14)).max(20) as usize;
                 let wrapped_tool = wrap_text(&msg.text, tool_max_w);
                 for (idx, t_line) in wrapped_tool.into_iter().enumerate() {
                     let prefix = if idx == 0 { "  [*] " } else { "      " };
@@ -885,7 +974,7 @@ impl SpindleTui {
                     bold: true,
                     dim: false,
                 });
-                let assistant_max_w = (w.saturating_sub(12)) as usize;
+                let assistant_max_w = (w.saturating_sub(12)).max(20) as usize;
                 let wrapped_body = wrap_text(&msg.text, assistant_max_w);
                 for b_line in wrapped_body {
                     lines.push(ViewportLine {
@@ -908,7 +997,7 @@ impl SpindleTui {
         // 3. Render visible viewport lines above the bottom input card with scroll offset
         let top_y = 2u16;
         let card_h = 5u16;
-        let card_y = h.saturating_sub(7);
+        let card_y = if h >= 12 { h.saturating_sub(7) } else { (h.saturating_sub(card_h + 1)).max(top_y) };
         let viewport_h = card_y.saturating_sub(top_y) as usize;
 
         let total_lines = lines.len();
@@ -928,7 +1017,7 @@ impl SpindleTui {
 
         // Render scroll indicator if scrolled up into history
         if self.scroll_offset > 0 {
-            let scroll_indicator = format!("[▲ Scrolled: +{} lines | Mouse wheel or PgDn to bottom]", self.scroll_offset);
+            let scroll_indicator = format!("▲ Scrolled +{} lines · Mouse wheel or PgDn to return to bottom", self.scroll_offset);
             let sx = w.saturating_sub(scroll_indicator.len() as u16 + 4);
             self.canvas.print(sx, 1, &scroll_indicator, Rgb::ICE_CYAN, Rgb::BG_DARK, true, false);
         }
@@ -937,38 +1026,7 @@ impl SpindleTui {
         let card_w = (w.saturating_sub(6)).clamp(40, 84);
         let card_x = (w / 2).saturating_sub(card_w / 2);
 
-        self.canvas.draw_card(card_x, card_y, card_w, card_h, Rgb::CARD_BG, Rgb::BRIGHT_BLUE);
-
-        let prompt_x = card_x + 3;
-        let prompt_y = card_y + 1;
-        let visible_w = (card_w.saturating_sub(6)) as usize;
-
-        if self.input.text.is_empty() {
-            let ghost = "Ask anything... \"delete hello.py\", \"/review\"";
-            let max_ghost_w = visible_w.saturating_sub(2);
-            let clipped_ghost: String = ghost.chars().take(max_ghost_w).collect();
-
-            self.canvas.set(prompt_x, prompt_y, '█', Rgb::BRIGHT_BLUE, Rgb::CARD_BG, true, false);
-            self.canvas.print(prompt_x + 2, prompt_y, &clipped_ghost, Rgb::DIM, Rgb::CARD_BG, false, false);
-        } else {
-            let total_chars = self.input.text.chars().count();
-            let cursor = self.input.cursor.min(total_chars);
-            let window_start = if cursor >= visible_w { cursor - visible_w + 1 } else { 0 };
-
-            let visible_text: String = self.input.text.chars().skip(window_start).take(visible_w).collect();
-            self.canvas.print(prompt_x, prompt_y, &visible_text, Rgb::WHITE, Rgb::CARD_BG, false, false);
-
-            let cursor_x = prompt_x + (cursor - window_start) as u16;
-            let char_under = self.input.text.chars().nth(cursor).unwrap_or(' ');
-            self.canvas.set(cursor_x, prompt_y, char_under, Rgb::CARD_BG, Rgb::BRIGHT_BLUE, true, false);
-        }
-
-        // Card meta line inside input box with color tokens
-        self.canvas.print(prompt_x, card_y + 3, "Build", Rgb::ICE_CYAN, Rgb::CARD_BG, true, false);
-        let chat_meta = format!("· {} · {:.2} prune · low-mem", self.model_name, self.prune_val);
-        let max_meta_w = (card_w.saturating_sub(14)) as usize;
-        let clipped_meta: String = chat_meta.chars().take(max_meta_w).collect();
-        self.canvas.print(prompt_x + 6, card_y + 3, &clipped_meta, Rgb::MUTED, Rgb::CARD_BG, false, false);
+        self.render_card_content(card_x, card_y, card_w, card_h, false);
 
         // 5. Docked Global Footer
         self.render_docked_footer(w, h);
@@ -1045,33 +1103,27 @@ impl SpindleTui {
                     self.scroll_offset = self.scroll_offset.saturating_sub(6);
                 }
                 KeyAction::Up => {
-                    // Up arrow: If scrolled up into history, scroll further up!
                     if self.scroll_offset > 0 {
                         self.scroll_offset = self.scroll_offset.saturating_add(2);
-                    } else if self.input.text.is_empty() {
-                        if !self.prompt_history.is_empty() && self.history_idx.is_none() {
-                            let idx = self.prompt_history.len() - 1;
-                            self.history_idx = Some(idx);
-                            self.input.set_text(&self.prompt_history[idx]);
-                        } else if !self.history.is_empty() {
-                            // Empty input with chat history: scroll up into convo!
-                            self.scroll_offset = self.scroll_offset.saturating_add(2);
-                        }
+                    } else if !self.history.is_empty() && self.input.text.is_empty() {
+                        // Empty input in chat view: Up arrow scrolls conversation history!
+                        self.scroll_offset = self.scroll_offset.saturating_add(2);
+                    } else if self.input.text.is_empty() && !self.prompt_history.is_empty() && self.history_idx.is_none() {
+                        let idx = self.prompt_history.len() - 1;
+                        self.history_idx = Some(idx);
+                        self.input.set_text(&self.prompt_history[idx]);
                     } else if let Some(idx) = self.history_idx {
                         if idx > 0 {
                             let new_idx = idx - 1;
                             self.history_idx = Some(new_idx);
                             self.input.set_text(&self.prompt_history[new_idx]);
                         } else {
-                            // At earliest prompt: clear and scroll up
                             self.history_idx = None;
                             self.input.clear();
-                            self.scroll_offset = self.scroll_offset.saturating_add(2);
                         }
                     }
                 }
                 KeyAction::Down => {
-                    // Down arrow: If scrolled up, scroll back down towards bottom!
                     if self.scroll_offset > 0 {
                         self.scroll_offset = self.scroll_offset.saturating_sub(2);
                     } else if let Some(idx) = self.history_idx {
@@ -1083,6 +1135,17 @@ impl SpindleTui {
                             self.history_idx = None;
                             self.input.clear();
                         }
+                    }
+                }
+                KeyAction::CtrlP => {
+                    if !self.prompt_history.is_empty() {
+                        let idx = match self.history_idx {
+                            None => self.prompt_history.len() - 1,
+                            Some(0) => 0,
+                            Some(i) => i - 1,
+                        };
+                        self.history_idx = Some(idx);
+                        self.input.set_text(&self.prompt_history[idx]);
                     }
                 }
                 KeyAction::Enter => {
@@ -1574,5 +1637,51 @@ mod tests {
         // Simulate PageDown
         tui.scroll_offset = tui.scroll_offset.saturating_sub(6);
         assert_eq!(tui.scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_parse_input_bytes_swallows_mouse_clicks_and_parses_wheel() {
+        // 1. Mouse click press & release sequences: button 0 press (\x1b[<0;77;27M) and release (\x1b[<0;77;27m)
+        let click_bytes = b"\x1b[<0;77;27M\x1b[<0;77;27m";
+        let (actions, consumed) = parse_input_bytes(click_bytes);
+        assert_eq!(consumed, click_bytes.len());
+        // All click actions are None
+        for a in &actions {
+            assert_eq!(*a, KeyAction::None);
+        }
+
+        // 2. Mouse wheel up: button 64 (\x1b[<64;77;27M)
+        let wheel_up = b"\x1b[<64;77;27M";
+        let (actions, consumed) = parse_input_bytes(wheel_up);
+        assert_eq!(consumed, wheel_up.len());
+        assert_eq!(actions, vec![KeyAction::ScrollUp(3)]);
+
+        // 3. Mouse wheel down: button 65 (\x1b[<65;77;27M)
+        let wheel_down = b"\x1b[<65;77;27M";
+        let (actions, consumed) = parse_input_bytes(wheel_down);
+        assert_eq!(consumed, wheel_down.len());
+        assert_eq!(actions, vec![KeyAction::ScrollDown(3)]);
+
+        // 4. Orphaned CSI fragments (like [<0;77;27M) without leading ESC
+        let orphan = b"[<0;77;27M";
+        let (actions, consumed) = parse_input_bytes(orphan);
+        assert_eq!(consumed, orphan.len());
+        assert_eq!(actions.len(), 0);
+
+        // 5. Orphaned SGR semicolon fragments (like ;77;27M)
+        let orphan_semi = b";77;27M";
+        let (actions, consumed) = parse_input_bytes(orphan_semi);
+        assert_eq!(consumed, orphan_semi.len());
+        assert_eq!(actions.len(), 0);
+
+        // 6. Normal text mixed with swallowed mouse clicks
+        let mixed = b"hello\x1b[<0;10;10M world";
+        let (actions, consumed) = parse_input_bytes(mixed);
+        assert_eq!(consumed, mixed.len());
+        let text: String = actions.into_iter().filter_map(|a| match a {
+            KeyAction::Char(c) => Some(c),
+            _ => None,
+        }).collect();
+        assert_eq!(text, "hello world");
     }
 }
