@@ -23,6 +23,14 @@
   (it may route to other experts), so weak drafts that rarely pay are skipped instead of
   slowing the step down. Output is unchanged. `/timing` and `--bench` show the measured cost
   and accept rates. `SPINDLE_SPEC_FIXED=1` restores the fixed draft length.
+- Prompt processing on two PCs is pipelined: the prompt goes out in 64-token chunks, and the
+  worker already computes the next chunk while this PC runs its layers on the current one.
+  Before, each PC waited for the other. Applies when the prompt fits in the context without a
+  KV shift (otherwise the old one-chunk-at-a-time path runs). A loopback test checks that the
+  result is identical to one node. `SPINDLE_NO_PIPELINE=1` turns it off.
+- Batches of more than 8 tokens (prompt chunks) walk each matrix in 16-row tiles and run every
+  group of 8 tokens on a tile before moving on, so the weights come from RAM once per chunk
+  instead of once per 8 tokens.
 - Batched verify and one-by-one decoding give bit-identical results on all-K-quant models: the
   integer kernels compute each vector the same way at any batch size, and F32 router matrices
   now run per vector in a batch too.

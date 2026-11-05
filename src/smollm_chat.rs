@@ -285,6 +285,15 @@ fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig, layer_range: std::ops::
 
 // ---------------------------------------------------------------- math helpers
 
+/// Prompt chunk size for pipelined prefill across two PCs.
+const PIPELINE_CHUNK: usize = 64;
+
+/// Pipelined prefill over the cluster; `SPINDLE_NO_PIPELINE=1` turns it off.
+fn pipelined_prefill() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPINDLE_NO_PIPELINE").is_none())
+}
+
 /// Fused FFN passes (two pool barriers per FFN or MoE layer instead of three per expert).
 /// `SPINDLE_UNFUSED=1` turns them off, for comparing.
 fn fused_ffn() -> bool {
@@ -2895,9 +2904,35 @@ impl SmolLm2Engine {
     /// Feeds `ids` into the KV-cache starting at `cur_pos` and returns the last hidden state.
     /// Processes up to 32 tokens per layer-synchronous batch so a multi-token prompt scans
     /// the model's layers once per chunk instead of once per token.
-    unsafe fn feed(&mut self, ids: &[usize]) -> Vec<f32> {
+    pub(crate) unsafe fn feed(&mut self, ids: &[usize]) -> Vec<f32> {
         self.remember_tokens(ids);
         let mut last_hidden = vec![0.0f32; self.cfg.dim];
+        if self.cluster_client.is_some() && ids.len() > PIPELINE_CHUNK && self.cur_pos + ids.len() <= self.max_seq && pipelined_prefill() {
+            // Pipelined: the worker computes chunk i+1 while this PC runs its layers on chunk
+            // i. The whole prompt fits without a KV shift, so no other frame interleaves with
+            // the outstanding requests.
+            let chunks: Vec<&[usize]> = ids.chunks(PIPELINE_CHUNK).collect();
+            let mut pos = self.cur_pos;
+            let mut send_pos = pos;
+            let mut client = self.cluster_client.take().unwrap();
+            client.prefill_send(chunks[0], send_pos).expect("cluster prefill failed");
+            send_pos += chunks[0].len();
+            for i in 0..chunks.len() {
+                let worker_hiddens = client.prefill_recv(chunks[i].len()).expect("cluster prefill failed");
+                if let Some(next) = chunks.get(i + 1) {
+                    client.prefill_send(next, send_pos).expect("cluster prefill failed");
+                    send_pos += next.len();
+                }
+                let mut hiddens = self.forward_batch_slice(None, Some(&worker_hiddens), pos);
+                pos += chunks[i].len();
+                if let Some(h) = hiddens.pop() {
+                    last_hidden = h;
+                }
+            }
+            self.cur_pos = pos;
+            self.cluster_client = Some(client);
+            return last_hidden;
+        }
         if self.cluster_client.is_some() {
             for chunk in ids.chunks(128) {
                 // With the client attached, so a shift is mirrored to the worker.

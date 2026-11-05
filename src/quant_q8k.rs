@@ -260,28 +260,37 @@ pub(crate) unsafe fn matmul_rows(base: *const u8, m: &Mat, xq: &[&Q8K], outs: &[
     let tensor = base.wrapping_add(m.offset);
     let n = m.cols;
     macro_rules! go {
-        ($t:expr, $x:expr, $o:expr) => {
+        ($t:expr, $x:expr, $o:expr, $a:expr, $b:expr) => {
             match $x.len() {
-                1 => rows::<1, { $t }>(tensor, n, $x, $o, r0, r1),
-                2 => rows::<2, { $t }>(tensor, n, $x, $o, r0, r1),
-                3 => rows::<3, { $t }>(tensor, n, $x, $o, r0, r1),
-                4 => rows::<4, { $t }>(tensor, n, $x, $o, r0, r1),
-                5 => rows::<5, { $t }>(tensor, n, $x, $o, r0, r1),
-                6 => rows::<6, { $t }>(tensor, n, $x, $o, r0, r1),
-                7 => rows::<7, { $t }>(tensor, n, $x, $o, r0, r1),
-                _ => rows::<8, { $t }>(tensor, n, $x, $o, r0, r1),
+                1 => rows::<1, { $t }>(tensor, n, $x, $o, $a, $b),
+                2 => rows::<2, { $t }>(tensor, n, $x, $o, $a, $b),
+                3 => rows::<3, { $t }>(tensor, n, $x, $o, $a, $b),
+                4 => rows::<4, { $t }>(tensor, n, $x, $o, $a, $b),
+                5 => rows::<5, { $t }>(tensor, n, $x, $o, $a, $b),
+                6 => rows::<6, { $t }>(tensor, n, $x, $o, $a, $b),
+                7 => rows::<7, { $t }>(tensor, n, $x, $o, $a, $b),
+                _ => rows::<8, { $t }>(tensor, n, $x, $o, $a, $b),
             }
         };
     }
-    let mut g = 0;
-    while g < xq.len() {
-        let e = (g + 8).min(xq.len());
-        let (gx, go_) = (&xq[g..e], &outs[g..e]);
-        match m.dtype {
-            GgmlType::Q4K => go!(T_Q4K, gx, go_),
-            _ => go!(T_Q6K, gx, go_),
+    // More than 8 vectors (prefill chunks): walk the rows in tiles and run every group of 8
+    // on a tile before moving on, so each tile's weights are read from RAM once and reused
+    // from cache by the other groups.
+    const TILE: usize = 16;
+    let mut t0 = r0;
+    while t0 < r1 {
+        let t1 = if xq.len() > 8 { (t0 + TILE).min(r1) } else { r1 };
+        let mut g = 0;
+        while g < xq.len() {
+            let e = (g + 8).min(xq.len());
+            let (gx, go_) = (&xq[g..e], &outs[g..e]);
+            match m.dtype {
+                GgmlType::Q4K => go!(T_Q4K, gx, go_, t0, t1),
+                _ => go!(T_Q6K, gx, go_, t0, t1),
+            }
+            g = e;
         }
-        g = e;
+        t0 = t1;
     }
 }
 
@@ -361,7 +370,8 @@ mod tests {
         let mut rng = Rng(0x51ED);
         for dtype in [GgmlType::Q4K, GgmlType::Q6K] {
             for n in [256usize, 768, 2048] {
-                let rows = 7;
+                // More than one 16-row tile, so the >8-vector tiled path is covered.
+                let rows = 37;
                 let mat = random_matrix(dtype, n, rows, &mut rng);
                 let m = Mat { dtype, offset: 0, cols: n, rows };
                 let rb = row_bytes(dtype, n).unwrap();
@@ -406,7 +416,7 @@ mod tests {
     fn int_kernel_batch_is_bitwise() {
         let mut rng = Rng(77);
         for dtype in [GgmlType::Q4K, GgmlType::Q6K] {
-            let (n, rows) = (768usize, 5usize);
+            let (n, rows) = (768usize, 37usize);
             let mat = random_matrix(dtype, n, rows, &mut rng);
             let m = Mat { dtype, offset: 0, cols: n, rows };
             let qs: Vec<Q8K> = (0..11)

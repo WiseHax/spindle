@@ -702,14 +702,25 @@ impl ClusterClient {
     }
 
     pub fn prefill(&mut self, tokens: &[usize], start_pos: usize) -> std::io::Result<Vec<Vec<f32>>> {
+        self.prefill_send(tokens, start_pos)?;
+        self.prefill_recv(tokens.len())
+    }
+
+    /// Sends a prefill request without waiting for the answer, so the worker can compute
+    /// while this PC runs its own layers on the previous chunk. Every `prefill_send` must be
+    /// matched by one `prefill_recv`, in order, before any other request.
+    pub fn prefill_send(&mut self, tokens: &[usize], start_pos: usize) -> std::io::Result<()> {
         let mut req_buf = Vec::with_capacity(8 + tokens.len() * 4);
         req_buf.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
         req_buf.extend_from_slice(&(start_pos as u32).to_le_bytes());
         for &t in tokens {
             req_buf.extend_from_slice(&(t as u32).to_le_bytes());
         }
+        self.stream.send_frame(FRAME_PREFILL_REQ, self.wire_format, &req_buf)
+    }
 
-        self.stream.send_frame(FRAME_PREFILL_REQ, self.wire_format, &req_buf)?;
+    /// Receives the answer to the oldest outstanding `prefill_send` of `n` tokens.
+    pub fn prefill_recv(&mut self, n: usize) -> std::io::Result<Vec<Vec<f32>>> {
         let (hdr, payload) = self.stream.recv_frame()?;
         if hdr.frame_type != FRAME_PREFILL_RESP {
             return Err(std::io::Error::new(
@@ -727,7 +738,7 @@ impl ClusterClient {
 
         let n_tokens = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
         let dim = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
-        if n_tokens != tokens.len() || dim != self.dim {
+        if n_tokens != n || dim != self.dim {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "prefill token count or dim mismatch",
@@ -1146,6 +1157,47 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_cluster_pipelined_prefill_matches_one_node() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let mut w = SmolLm2Engine::load_sharded(path, 0..15).expect("load worker");
+            let (stream, _) = listener.accept().expect("accept");
+            let _ = serve_worker_connection(&mut w, stream, WireFormat::Fp32);
+        });
+        let mut master = SmolLm2Engine::load_sharded(path, 15..30).expect("load master");
+        let client = match ClusterClient::connect(addr, &master.idx.model_name, master.cfg.dim, master.cfg.n_layers, (15, 30), WireFormat::Fp32) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("client connect error: {e}"),
+        };
+        master.cluster_client = Some(client);
+        let text = "Pipelined prefill sends the next chunk to the worker before this node processes the current one. ".repeat(10);
+        let ids = master.encode_chatml(&text);
+        assert!(ids.len() > 3 * PIPELINE_CHUNK_FOR_TESTS, "prompt too short for the pipeline: {}", ids.len());
+        let h_cluster = unsafe { master.feed(&ids) };
+        assert_eq!(master.cur_pos, ids.len());
+        // Same prompt on one node, all layers, one 128-token chunk at a time.
+        let mut single = SmolLm2Engine::load(path).expect("load full");
+        let h_single = unsafe { single.feed(&ids) };
+        let num: f32 = h_cluster.iter().zip(&h_single).map(|(a, b)| (a - b).abs()).sum();
+        let den: f32 = h_single.iter().map(|v| v.abs()).sum::<f32>().max(1e-6);
+        // Fp32 on the wire and the same kernels: the split, chunked and pipelined prefill must
+        // match one node (measured: identical).
+        assert!(num / den < 1e-4, "pipelined cluster prefill diverged: relative L1 {}", num / den);
+        if let Some(mut c) = master.cluster_client.take() {
+            let _ = c.stream.send_frame(FRAME_SHUTDOWN, WireFormat::Fp32, &[]);
+        }
+        let _ = handle.join();
+    }
+
+    const PIPELINE_CHUNK_FOR_TESTS: usize = 64;
 
     #[test]
     fn test_cluster_loopback_distributed_inference() {
