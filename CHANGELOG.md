@@ -44,6 +44,11 @@ model can answer. At 25 tok/s a 6,000-token build log costs four minutes.
 - **Mouse selection.** Drag to select text in the interface; it is copied to the clipboard on
   release. Before, the interface captured the mouse and only shift+drag selected.
 - The terminal bell rings when a turn of 15 s or more finishes.
+- **Qwen3-Coder tool calls.** Qwen3-Coder writes calls as `<function=name>` with
+  `<parameter=key>` blocks instead of JSON, sometimes without the `<tool_call>` wrapper. Both
+  forms are parsed (values that are JSON lists, objects, numbers or booleans come through
+  typed) and hidden from the reply while streaming, so Qwen3-Coder-30B-A3B works as the agent
+  model. It uses the same `qwen3moe` architecture and layer split as Qwen3-30B-A3B.
 
 ### Fixed (agent and interface)
 
@@ -90,6 +95,11 @@ per forward pass 157 → 118 ms (worker 103 → 80 ms, laptop layers 39 → 26 m
   Before, each PC waited for the other. Applies when the prompt fits in the context without a
   KV shift (otherwise the old one-chunk-at-a-time path runs). A loopback test checks that the
   result is identical to one node. `SPINDLE_NO_PIPELINE=1` turns it off.
+- The batched MoE path (verify and prompt chunks) runs all chosen experts in two thread-pool
+  passes, like the one-token path. It gives bit-identical hidden states to one-token steps on
+  Qwen3-30B-A3B (checked on its real layers). Speed is about the same: on a verify batch every
+  extra token routes to its own 8 experts, so its cost is the extra weights read, about 60–70%
+  of a step, not the thread handoffs.
 - Batches of more than 8 tokens (prompt chunks) walk each matrix in 16-row tiles and run every
   group of 8 tokens on a tile before moving on, so the weights come from RAM once per chunk
   instead of once per 8 tokens.

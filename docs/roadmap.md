@@ -33,12 +33,17 @@ Ordered by how much each item is expected to help, measured against what it cost
 
 ### 1. Make verification cheap on MoE
 
-A verify pass costs about 110% of a step for every extra token, so speculation rarely pays on
-Qwen3-30B-A3B. The batched MoE path still runs each expert as three separate thread-pool jobs,
-and every extra token can route to experts the others don't use.
+Each extra token in a verify pass costs 60–70% of a step on Qwen3-30B-A3B (measured on its
+real layers, warm). Fusing the batched MoE path into two thread-pool passes (done in 1.1) kept
+the results bit-identical but did not change that: the cost is the weights themselves. Every
+token routes to its own 8 experts, so 5 tokens read close to 5 times the expert weights.
 
-- Fuse the batched MoE path the way the single-token path is fused (two passes per layer).
-- Measure the extra-token cost again (`--bench` prints it).
+Ideas that keep the output exact:
+
+- Draft only where tokens are likely to share experts (repeated text routes alike), and let
+  the measured accept rate and cost decide, as the adaptive drafter already does.
+- Overlap the extra expert reads with compute (prefetch the experts the router picks for
+  token `i+1` while token `i` runs).
 
 Done when: an extra verify token costs under 40% of a step.
 

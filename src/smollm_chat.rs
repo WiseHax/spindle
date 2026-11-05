@@ -645,6 +645,126 @@ unsafe fn ffn_forward_multi(
     matvec_multi(pool, base, &f.down, &g, outs);
 }
 
+/// The batched MoE layer (verify and prompt chunks) in two thread-pool passes for all
+/// chosen experts together, like `ffns_fused` does for one token:
+///
+/// 1. every gate/up row of every chosen expert, for all tokens routed to that expert (each
+///    weight block is decoded once and applied to every such token), then SiLU;
+/// 2. every down row of every expert, into `expert_outs[b][idx]`.
+///
+/// Before, each expert was three separate pool jobs with the main thread in between, so a
+/// 4-token verify touching 20 experts paid 60 handoffs per layer instead of 2. Each token's
+/// vector goes through the same kernels as in the one-token path (the integer kernels give
+/// bit-identical results at any batch size), so verify still matches plain decoding.
+unsafe fn moe_batch_fused(
+    pool: Option<&WorkerPool>,
+    base: *const u8,
+    m: &Moe,
+    xs: &[Vec<f32>],
+    chosen: &[Vec<usize>],
+    experts: &[usize],
+    expert_outs: &mut [Vec<Vec<f32>>],
+) {
+    let bsz = xs.len();
+    let n_ff = m.experts.gate.rows;
+    let dim = m.experts.down.rows;
+    let cols = m.experts.gate.cols;
+    // (expert weights, [(token, slot in that token's chosen list)])
+    let jobs: Vec<(Ffn, Vec<(usize, usize)>)> = experts
+        .iter()
+        .filter_map(|&e| {
+            let users: Vec<(usize, usize)> = (0..bsz).filter_map(|b| chosen[b].iter().position(|&c| c == e).map(|i| (b, i))).collect();
+            (!users.is_empty()).then(|| (m.experts.expert(e), users))
+        })
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    let mut starts = Vec::with_capacity(jobs.len());
+    let mut n_vec = 0usize;
+    for j in &jobs {
+        starts.push(n_vec);
+        n_vec += j.1.len();
+    }
+    let int_gate = quant_q8k::supports(&m.experts.gate);
+    let int_up = quant_q8k::supports(&m.experts.up);
+    let int_down = quant_q8k::supports(&m.experts.down);
+    // Output slots, as addresses (each (token, slot) pair is a distinct buffer).
+    let out_addr: Vec<Vec<usize>> = jobs
+        .iter()
+        .map(|(_, users)| users.iter().map(|&(b, i)| expert_outs[b][i].as_mut_ptr() as usize).collect())
+        .collect();
+    let x_addr: Vec<usize> = xs.iter().map(|x| x.as_ptr() as usize).collect();
+    let base_addr = base as usize;
+
+    with_ffn_scratch(2 * n_vec * n_ff, |buf| {
+        let (h, u) = buf.split_at_mut(n_vec * n_ff);
+        let (h_addr, u_addr) = (h.as_mut_ptr() as usize, u.as_mut_ptr() as usize);
+        quant_q8k::with_scratch(bsz + n_vec, |q| {
+            let (xq, hq) = q.split_at_mut(bsz);
+            if int_gate || int_up {
+                for b in 0..bsz {
+                    xq[b].quantize(&xs[b]);
+                }
+            }
+            let xq: &[Q8K] = xq;
+            // Pass 1: gate and up rows, then SiLU, over (expert, row) pairs.
+            let total = jobs.len() * n_ff;
+            par_rows(pool, total, total * cols * 2, &|a, b| {
+                let base = base_addr as *const u8;
+                for (j, (f, users)) in jobs.iter().enumerate() {
+                    let lo = a.max(j * n_ff);
+                    let hi = b.min((j + 1) * n_ff);
+                    if lo >= hi {
+                        continue;
+                    }
+                    let (r0, r1) = (lo - j * n_ff, hi - j * n_ff);
+                    let hp: Vec<*mut f32> = (0..users.len()).map(|k| (h_addr as *mut f32).add((starts[j] + k) * n_ff)).collect();
+                    let up: Vec<*mut f32> = (0..users.len()).map(|k| (u_addr as *mut f32).add((starts[j] + k) * n_ff)).collect();
+                    let xp: Vec<*const f32> = users.iter().map(|&(t, _)| x_addr[t] as *const f32).collect();
+                    let qr: Vec<&Q8K> = users.iter().map(|&(t, _)| &xq[t]).collect();
+                    if int_gate {
+                        quant_q8k::matmul_rows(base, &f.gate, &qr, &hp, r0, r1);
+                    } else {
+                        crate::quant_multi::matmul_rows_avx2(base, &f.gate, &xp, &hp, r0, r1);
+                    }
+                    if int_up {
+                        quant_q8k::matmul_rows(base, &f.up, &qr, &up, r0, r1);
+                    } else {
+                        crate::quant_multi::matmul_rows_avx2(base, &f.up, &xp, &up, r0, r1);
+                    }
+                    for k in 0..users.len() {
+                        for r in r0..r1 {
+                            *hp[k].add(r) = silu(*hp[k].add(r)) * *up[k].add(r);
+                        }
+                    }
+                }
+            });
+            let hs: Vec<&[f32]> = (0..n_vec).map(|v| std::slice::from_raw_parts((h_addr as *const f32).add(v * n_ff), n_ff)).collect();
+            if int_down {
+                for v in 0..n_vec {
+                    hq[v].quantize(hs[v]);
+                }
+            }
+            let hq: &[Q8K] = hq;
+            // Pass 2: down rows of every expert, for all its tokens.
+            par_rows(pool, dim, dim * n_ff * n_vec, &|r0, r1| {
+                let base = base_addr as *const u8;
+                for (j, (f, users)) in jobs.iter().enumerate() {
+                    let op: Vec<*mut f32> = out_addr[j].iter().map(|&a| a as *mut f32).collect();
+                    if int_down {
+                        let qr: Vec<&Q8K> = (0..users.len()).map(|k| &hq[starts[j] + k]).collect();
+                        quant_q8k::matmul_rows(base, &f.down, &qr, &op, r0, r1);
+                    } else {
+                        let xp: Vec<*const f32> = (0..users.len()).map(|k| hs[starts[j] + k].as_ptr()).collect();
+                        crate::quant_multi::matmul_rows_avx2(base, &f.down, &xp, &op, r0, r1);
+                    }
+                }
+            });
+        });
+    });
+}
+
 /// Detailed timing breakdown of MoE operations for a turn.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct MoeTiming {
@@ -961,6 +1081,11 @@ unsafe fn moe_forward_batch(
         }
         miss_us += t_rem.map_or(0, |t| t.elapsed().as_micros() as u64);
         (disk_us, hit_us + miss_us)
+    } else if cache.is_none() && fused_ffn() {
+        let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
+        let _ = &run_expert_for_token;
+        moe_batch_fused(pool, base, m, xs, &chosen_batch, &unique_experts, &mut expert_outs);
+        (0, t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64))
     } else {
         let t_matvec = if crate::ui::verbose() { Some(std::time::Instant::now()) } else { None };
         // Expert-major: every token routed to expert `e` goes through its weights in ONE
@@ -4566,6 +4691,48 @@ mod tests {
         // Fixed mode always takes the whole draft.
         let mut f = SpecModel { fixed: true, ..Default::default() };
         assert_eq!(f.best_len(0, 4), 4);
+    }
+
+    /// Real-model check (run by hand, it maps Qwen3-30B-A3B): the fused batched MoE path must
+    /// give bit-identical hidden states to one-token steps on an all-K-quant model.
+    /// `cargo test --release qwen3_moe_batch_is_bitwise -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn qwen3_moe_batch_is_bitwise() {
+        let path = "Qwen3-30B-A3B-Q4_K_M.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut e = SmolLm2Engine::load_sharded(path, 44..48).expect("load");
+        let dim = e.cfg.dim;
+        let mut seed = 12345u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.2
+        };
+        let n: usize = std::env::var("BATCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let inputs: Vec<Vec<f32>> = (0..n).map(|_| (0..dim).map(|_| rnd()).collect()).collect();
+        unsafe {
+            let seq: Vec<Vec<f32>> = (0..n).map(|i| e.forward_slice(None, Some(&inputs[i]), i)).collect();
+            let bat = e.forward_batch_slice(None, Some(&inputs), 0);
+            // Warm timings (weights paged in by the runs above): best of 8.
+            let (mut one, mut five) = (f64::MAX, f64::MAX);
+            for _ in 0..8 {
+                let t = std::time::Instant::now();
+                let _ = e.forward_slice(None, Some(&inputs[0]), 0);
+                one = one.min(t.elapsed().as_secs_f64() * 1e3);
+                let t = std::time::Instant::now();
+                let _ = e.forward_batch_slice(None, Some(&inputs), 0);
+                five = five.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            println!("[moe-batch] 4 layers: 1 token {one:.1} ms, {n} tokens {five:.1} ms = {:.2}x, each extra token {:.0}% of a step", five / one, (five - one) / (n - 1) as f64 / one * 100.0);
+            for i in 0..n {
+                let diff = seq[i].iter().zip(&bat[i]).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                assert_eq!(diff, 0, "position {i}: {diff} of {dim} values differ");
+            }
+        }
     }
 
     /// How far integer kernels move hidden states, compared with the seq/batch difference.

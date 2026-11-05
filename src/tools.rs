@@ -238,12 +238,76 @@ fn call_from_json(v: Json) -> Option<ToolCall> {
     Some(ToolCall { name, args })
 }
 
+/// Qwen3-Coder's own call format, inside `<tool_call>`:
+///
+/// ```text
+/// <function=run_command>
+/// <parameter=command>
+/// cargo test
+/// </parameter>
+/// </function>
+/// ```
+///
+/// Values are text; one that is a JSON array, object, number or boolean is read as that, so
+/// `todo`'s list and `read_file`'s numbers come through typed.
+fn call_from_xml(body: &str) -> Option<ToolCall> {
+    let start = body.find("<function=")? + "<function=".len();
+    let gt = body[start..].find('>')? + start;
+    let name = body[start..gt].trim().trim_matches(['"', '\'']).to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let end = body[gt..].find("</function>").map_or(body.len(), |e| gt + e);
+    let inner = &body[gt + 1..end];
+    let mut args = Vec::new();
+    let mut pos = 0;
+    while let Some(p) = inner[pos..].find("<parameter=") {
+        let ks = pos + p + "<parameter=".len();
+        let Some(kg) = inner[ks..].find('>') else { break };
+        let key = inner[ks..ks + kg].trim().trim_matches(['"', '\'']).to_string();
+        let vs = ks + kg + 1;
+        // The value runs to its close tag, or to the next parameter if the model left it open.
+        let close = inner[vs..].find("</parameter>");
+        let next = inner[vs..].find("<parameter=");
+        let ve = match (close, next) {
+            (Some(c), Some(n)) => vs + c.min(n),
+            (Some(c), None) => vs + c,
+            (None, Some(n)) => vs + n,
+            (None, None) => inner.len(),
+        };
+        let mut v = &inner[vs..ve];
+        // One line break after the open tag and before the close tag is formatting.
+        v = v.strip_prefix("\r\n").or_else(|| v.strip_prefix('\n')).unwrap_or(v);
+        v = v.strip_suffix("\r\n").or_else(|| v.strip_suffix('\n')).unwrap_or(v);
+        let t = v.trim();
+        let typed = if t.starts_with('[') || t.starts_with('{') || t == "true" || t == "false" || (!t.is_empty() && t.parse::<f64>().is_ok()) {
+            json::parse(t).ok()
+        } else {
+            None
+        };
+        if !key.is_empty() {
+            args.push((key, typed.unwrap_or_else(|| Json::Str(v.to_string()))));
+        }
+        pos = if close.is_some_and(|c| next.map_or(true, |n| c < n)) { ve + "</parameter>".len() } else { ve };
+    }
+    Some(ToolCall { name, args: Json::Obj(args) })
+}
+
 /// Other tag names models use for the same thing. Qwen is trained on `<tool_call>`, but it
 /// sometimes writes `<function_call>` (or `<tool_use>`) instead.
 const CALL_TAG_ALIASES: &[&str] = &["function_call", "tool_use", "functioncall"];
 
 /// Rewrites alias call tags (any case) to `<tool_call>` / `</tool_call>`.
 pub fn normalize_call_tags(text: &str) -> std::borrow::Cow<'_, str> {
+    let aliased = normalize_alias_tags(text);
+    // Qwen3-Coder sometimes writes its `<function=…>` block without the `<tool_call>` wrapper.
+    if aliased.contains("<function=") && !aliased.contains("<tool_call") {
+        return std::borrow::Cow::Owned(aliased.replace("<function=", "<tool_call><function=").replace("</function>", "</function></tool_call>"));
+    }
+    aliased
+}
+
+fn normalize_alias_tags(text: &str) -> std::borrow::Cow<'_, str> {
     let lower = text.to_ascii_lowercase();
     if !CALL_TAG_ALIASES.iter().any(|a| lower.contains(&format!("<{a}")) || lower.contains(&format!("</{a}"))) {
         return std::borrow::Cow::Borrowed(text);
@@ -288,8 +352,12 @@ pub fn parse_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
         let close = find_ci(text, "</tool_call", body_start);
         let body_end = close.unwrap_or(text.len());
         let body = &text[body_start..body_end];
-        // The JSON object may be wrapped in a ``` fence; parse from its first brace.
-        if let Some(brace) = body.find('{') {
+        if body.contains("<function=") {
+            if let Some(c) = call_from_xml(body) {
+                calls.push(c);
+            }
+        } else if let Some(brace) = body.find('{') {
+            // The JSON object may be wrapped in a ``` fence; parse from its first brace.
             if let Ok((v, _)) = json::parse_prefix(&body[brace..]) {
                 if let Some(c) = call_from_json(v) {
                     calls.push(c);
@@ -326,12 +394,13 @@ pub fn parse_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
 #[derive(Default)]
 pub struct ToolMarkupFilter {
     buf: String,
-    in_tool: bool,
+    /// The close tag of the block being hidden, while inside one.
+    close: Option<&'static str>,
 }
 
 /// Longest trailing partial opening call tag (`<tool_c`, `<function_ca`, ...) in `s`.
 pub fn partial_call_tag(s: &str) -> usize {
-    let mut n = partial_tag_suffix(s, "<tool_call>");
+    let mut n = partial_tag_suffix(s, "<tool_call>").max(partial_tag_suffix(s, "<function="));
     for a in CALL_TAG_ALIASES {
         n = n.max(partial_tag_suffix(s, &format!("<{a}>")));
     }
@@ -349,33 +418,40 @@ pub fn partial_tag_suffix(s: &str, tag: &str) -> usize {
 impl ToolMarkupFilter {
     /// Feeds a piece; returns the text that is now safe to display.
     pub fn push(&mut self, piece: &str) -> String {
-        const OPEN: &str = "<tool_call>";
-        const CLOSE: &str = "</tool_call>";
         self.buf.push_str(piece);
-        if let std::borrow::Cow::Owned(n) = normalize_call_tags(&self.buf) {
+        if let std::borrow::Cow::Owned(n) = normalize_alias_tags(&self.buf) {
             self.buf = n;
         }
         let mut out = String::new();
         loop {
-            if self.in_tool {
-                match self.buf.find(CLOSE) {
+            if let Some(close) = self.close {
+                match self.buf.find(close) {
                     Some(i) => {
-                        self.buf.drain(..i + CLOSE.len());
-                        self.in_tool = false;
+                        self.buf.drain(..i + close.len());
+                        self.close = None;
                     }
                     None => {
-                        let keep = partial_tag_suffix(&self.buf, CLOSE);
+                        let keep = partial_tag_suffix(&self.buf, close);
                         let cut = self.buf.len() - keep;
                         self.buf.drain(..cut);
                         return out;
                     }
                 }
             } else {
-                match self.buf.find(OPEN) {
-                    Some(i) => {
+                // A block opens with `<tool_call>`, or with Qwen3-Coder's bare `<function=`.
+                let tc = self.buf.find("<tool_call>");
+                let fc = self.buf.find("<function=");
+                let open = match (tc, fc) {
+                    (Some(t), Some(f)) if f < t => Some((f, "<function=".len(), "</function>")),
+                    (Some(t), _) => Some((t, "<tool_call>".len(), "</tool_call>")),
+                    (None, Some(f)) => Some((f, "<function=".len(), "</function>")),
+                    (None, None) => None,
+                };
+                match open {
+                    Some((i, len, close)) => {
                         out.push_str(&self.buf[..i]);
-                        self.buf.drain(..i + OPEN.len());
-                        self.in_tool = true;
+                        self.buf.drain(..i + len);
+                        self.close = Some(close);
                     }
                     None => {
                         let keep = partial_call_tag(&self.buf);
@@ -1405,6 +1481,31 @@ mod tests {
         let t = todos();
         assert_eq!(t.len(), 3);
         assert_eq!(t[1], ("fix bug".to_string(), TodoState::Doing));
+    }
+
+    #[test]
+    fn qwen3_coder_xml_calls() {
+        let text = "I'll run the tests.\n<tool_call>\n<function=run_command>\n<parameter=command>\ncargo test --release\n</parameter>\n<parameter=timeout>\n300\n</parameter>\n</function>\n</tool_call>";
+        let (calls, visible) = parse_tool_calls(text);
+        assert_eq!(visible, "I'll run the tests.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(calls[0].str_arg(&["command"]), Some("cargo test --release"));
+        assert_eq!(calls[0].num_arg(&["timeout"]), Some(300));
+        // Multi-line value, a JSON list value, and no <tool_call> wrapper.
+        let text = "<function=edit_file>\n<parameter=path>\nsrc/a.rs\n</parameter>\n<parameter=old_string>\n    let x = 1;\n    let y = 2;\n</parameter>\n<parameter=new_string>\n    let x = 3;\n</parameter>\n</function>\n<function=todo>\n<parameter=items>\n[{\"task\": \"a\", \"status\": \"done\"}]\n</parameter>\n</function>";
+        let (calls, visible) = parse_tool_calls(text);
+        assert_eq!(visible, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].str_arg(&["old_string"]), Some("    let x = 1;\n    let y = 2;"));
+        assert!(matches!(calls[1].args.get("items"), Some(Json::Arr(a)) if a.len() == 1));
+        // Streaming: the block never shows.
+        let mut f = ToolMarkupFilter::default();
+        let mut shown = String::new();
+        for p in ["Sure. ", "<func", "tion=read_file>\n<parameter=path>x</parameter>\n", "</function>", " ok"] {
+            shown.push_str(&f.push(p));
+        }
+        assert_eq!(shown, "Sure.  ok");
     }
 
     #[test]
