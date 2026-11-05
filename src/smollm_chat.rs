@@ -699,6 +699,16 @@ const PROMPT_CACHE_MAGIC: &[u8; 4] = b"SPKV";
 const PROMPT_CACHE_VERSION: u32 = 1;
 
 /// `key` combined with `extra`; unchanged when `extra` is 0.
+/// Cache-key tag for the matrix kernels in use (integer kernels round differently, so their
+/// KV entries are kept apart; float mode keeps the keys of earlier versions).
+fn kernel_tag() -> u64 {
+    if quant_q8k::enabled() {
+        0x51_38_4B // "Q8K"
+    } else {
+        0
+    }
+}
+
 fn mix_key(key: u64, extra: u64) -> u64 {
     if extra == 0 {
         return key;
@@ -3691,7 +3701,7 @@ impl SmolLm2Engine {
     /// can't leave a half file behind.
     pub fn save_prompt_kv(&self, key: u64, tokens: &[usize]) -> std::io::Result<()> {
         use std::io::Write;
-        let key = mix_key(key, self.resident_hash());
+        let key = mix_key(mix_key(key, self.resident_hash()), kernel_tag());
         let n = tokens.len();
         let kv = self.cfg.kv_dim;
         if n == 0 || n > self.max_seq || self.cur_pos < n {
@@ -3727,7 +3737,7 @@ impl SmolLm2Engine {
     /// same `key` and the same tokens. Returns false (and changes nothing) otherwise.
     pub fn load_prompt_kv(&mut self, key: u64, tokens: &[usize]) -> std::io::Result<bool> {
         use std::io::Read;
-        let key = mix_key(key, self.resident_hash());
+        let key = mix_key(mix_key(key, self.resident_hash()), kernel_tag());
         let n = tokens.len();
         let kv = self.cfg.kv_dim;
         if n == 0 || n > self.max_seq {
