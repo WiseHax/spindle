@@ -65,6 +65,9 @@ pub mod theme {
 }
 use theme::*;
 
+/// Background of selected text.
+const SELECT_BG: Rgb = Rgb(0x2a, 0x4a, 0x8a);
+
 // --------------------------------------------------------------------------- terminal
 
 /// Restores the console modes and screen when dropped (also on early return).
@@ -95,10 +98,10 @@ impl TerminalGuard {
                 & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0);
             let _ = SetConsoleMode(in_handle, CONSOLE_MODE(new_in));
             let mut out = io::stdout();
-            // Alternate screen, hidden cursor, no autowrap, mouse reporting in SGR form (so the
-            // wheel arrives as wheel events, not as arrow keys that would recall prompt
-            // history), bracketed paste. Hold Shift to select text with the mouse.
-            let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1000h\x1b[?1006h\x1b[?2004h");
+            // Alternate screen, hidden cursor, no autowrap, mouse reporting with drags in SGR
+            // form (the wheel arrives as wheel events, not as arrow keys that would recall
+            // prompt history; dragging selects text in spindle itself), bracketed paste.
+            let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?1002h\x1b[?1006h\x1b[?2004h");
             let _ = out.flush();
             Ok(Self { in_handle, out_handle, orig_in_mode, orig_out_mode })
         }
@@ -109,10 +112,184 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         unsafe {
             let mut out = io::stdout();
-            let _ = write!(out, "\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
+            let _ = write!(out, "\x1b[?2004l\x1b[?1007l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?7h\x1b[?25h\x1b[?1049l\x1b[0m");
             let _ = out.flush();
             let _ = SetConsoleMode(self.out_handle, self.orig_out_mode);
             let _ = SetConsoleMode(self.in_handle, self.orig_in_mode);
+        }
+    }
+}
+
+/// Puts the console back in the modes the interface needs (raw VT input, no quick-edit,
+/// mouse and paste reporting). A program started by a tool can change them; this runs after
+/// every tool so the prompt keeps working.
+pub fn reassert_console() {
+    unsafe {
+        let (Ok(in_h), Ok(out_h)) = (GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE)) else { return };
+        let mut m = CONSOLE_MODE(0);
+        if GetConsoleMode(out_h, &mut m).is_ok() {
+            let _ = SetConsoleMode(out_h, CONSOLE_MODE(m.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0));
+        }
+        if GetConsoleMode(in_h, &mut m).is_ok() {
+            const QUICK_EDIT: u32 = 0x0040;
+            const EXTENDED_FLAGS: u32 = 0x0080;
+            let want = ((m.0 | ENABLE_VIRTUAL_TERMINAL_INPUT.0 | EXTENDED_FLAGS) & !QUICK_EDIT)
+                & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0);
+            if want != m.0 {
+                let _ = SetConsoleMode(in_h, CONSOLE_MODE(want));
+            }
+        }
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b[?25l\x1b[?7l\x1b[?1002h\x1b[?1006h\x1b[?2004h");
+        let _ = out.flush();
+    }
+}
+
+/// Copies `text` to the Windows clipboard (UTF-16). Falls back to OSC 52, which Windows
+/// Terminal and most modern terminals accept, if the clipboard can't be opened.
+pub fn copy_to_clipboard(text: &str) -> bool {
+    use windows::Win32::{
+        Foundation::{HANDLE, HWND},
+        System::{
+            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+        },
+    };
+    const CF_UNICODETEXT: u32 = 13;
+    let wide: Vec<u16> = text.replace('\n', "\r\n").encode_utf16().chain(std::iter::once(0)).collect();
+    let ok = unsafe {
+        (|| -> windows::core::Result<()> {
+            OpenClipboard(HWND::default())?;
+            let r = (|| -> windows::core::Result<()> {
+                EmptyClipboard()?;
+                let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)?;
+                let p = GlobalLock(mem) as *mut u16;
+                if p.is_null() {
+                    return Err(windows::core::Error::from_win32());
+                }
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+                let _ = GlobalUnlock(mem);
+                SetClipboardData(CF_UNICODETEXT, HANDLE(mem.0))?;
+                Ok(())
+            })();
+            let _ = CloseClipboard();
+            r
+        })()
+        .is_ok()
+    };
+    if !ok {
+        let mut out = io::stdout();
+        let _ = write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+        let _ = out.flush();
+    }
+    true
+}
+
+fn base64(b: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(b.len().div_ceil(3) * 4);
+    for c in b.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        s.push(T[(n >> 18) as usize & 63] as char);
+        s.push(T[(n >> 12) as usize & 63] as char);
+        s.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        s.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    s
+}
+
+/// A mouse selection in screen cells, clipped to the pane where it started.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Selection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+    /// Columns `[x_min, x_max)` of the pane.
+    x_min: u16,
+    x_max: u16,
+}
+
+impl Selection {
+    /// Start and end in reading order.
+    fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, b) = (self.anchor, self.head);
+        if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) }
+    }
+
+    /// Columns selected on row `y` (end exclusive), like a terminal's stream selection.
+    fn cols(&self, y: u16) -> Option<(u16, u16)> {
+        let ((sx, sy), (ex, ey)) = self.ordered();
+        if y < sy || y > ey {
+            return None;
+        }
+        let from = if y == sy { sx.max(self.x_min) } else { self.x_min };
+        let to = if y == ey { (ex + 1).min(self.x_max) } else { self.x_max };
+        (from < to).then_some((from, to))
+    }
+}
+
+impl Canvas {
+    /// Text under a selection: one line per row, trailing spaces trimmed, box borders and
+    /// the transcript's bar glyphs dropped.
+    fn selected_text(&self, sel: &Selection) -> String {
+        let ((_, sy), (_, ey)) = sel.ordered();
+        let mut lines = Vec::new();
+        for y in sy..=ey.min(self.height.saturating_sub(1)) {
+            let Some((a, b)) = sel.cols(y) else { continue };
+            let mut line = String::new();
+            for x in a..b {
+                if let Some(c) = self.cell(x, y) {
+                    if c.ch != WIDE_TAIL {
+                        line.push(c.ch);
+                    }
+                }
+            }
+            // The transcript's bar glyph in front of a line is decoration, not text.
+            let lead = line.len() - line.trim_start().len();
+            let rest = &line[lead..];
+            let line = match rest.chars().next() {
+                Some(c @ ('│' | '┃' | '▌')) => format!("{} {}", &line[..lead], &rest[c.len_utf8()..]),
+                _ => line,
+            };
+            lines.push(line.trim_end().trim_end_matches(['│', '┃']).trim_end().to_string());
+        }
+        // Common leading indentation of the block (the transcript's left margin). A first row
+        // that starts mid-line has no margin, so it doesn't count.
+        let skip_first = sel.cols(sy).is_some_and(|(a, _)| a > sel.x_min);
+        let indent = lines
+            .iter()
+            .skip(skip_first as usize)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.len() - l.trim_start().len())
+            .min()
+            .unwrap_or(0);
+        let lines: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 && skip_first {
+                    l.clone()
+                } else if l.len() - l.trim_start().len() >= indent {
+                    l[indent..].to_string()
+                } else {
+                    l.trim_start().to_string()
+                }
+            })
+            .collect();
+        lines.join("\n").trim_matches('\n').to_string()
+    }
+
+    /// Paints the selection highlight over the frame.
+    fn highlight(&mut self, sel: &Selection) {
+        for y in 0..self.height {
+            if let Some((a, b)) = sel.cols(y) {
+                for x in a..b {
+                    let i = y as usize * self.width as usize + x as usize;
+                    if let Some(c) = self.grid.get_mut(i) {
+                        c.bg = SELECT_BG;
+                        c.fg = TEXT;
+                    }
+                }
+            }
         }
     }
 }
@@ -350,6 +527,10 @@ pub enum KeyAction {
     /// Jump to the top / bottom of the conversation (ctrl+home / ctrl+end).
     ScrollTop,
     ScrollBottom,
+    /// Left mouse button pressed / moved while pressed / released, at a 0-based cell.
+    MouseDown(u16, u16),
+    MouseDrag(u16, u16),
+    MouseUp(u16, u16),
     Escape,
     None,
 }
@@ -494,10 +675,17 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                 let fin = buf[j];
                 let params = std::str::from_utf8(&buf[i + 2..j]).unwrap_or("");
                 let action = if let Some(sgr) = params.strip_prefix('<') {
-                    let btn = sgr.split(';').next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                    let mut it = sgr.split(';').map(|s| s.parse::<u32>().unwrap_or(0));
+                    let btn = it.next().unwrap_or(0);
+                    let x = it.next().unwrap_or(1).saturating_sub(1).min(u16::MAX as u32) as u16;
+                    let y = it.next().unwrap_or(1).saturating_sub(1).min(u16::MAX as u32) as u16;
                     match btn & !(4 | 8 | 16) {
                         64 => KeyAction::ScrollUp(3),
                         65 => KeyAction::ScrollDown(3),
+                        0 if fin == b'm' => KeyAction::MouseUp(x, y),
+                        0 => KeyAction::MouseDown(x, y),
+                        32 => KeyAction::MouseDrag(x, y),
+                        _ if fin == b'm' && btn & 3 == 0 => KeyAction::MouseUp(x, y),
                         _ => KeyAction::None,
                     }
                 } else if fin == b'M' && params.is_empty() {
@@ -935,20 +1123,38 @@ fn spinner_frame(t0: Instant) -> char {
 
 /// Splits a raw (streaming) reply into `(thinking, visible)` and drops tool-call markup;
 /// `pending_tool` is true while a `<tool_call>` block is still being written.
+///
+/// Handles what Qwen models actually produce: several `<think>` blocks, a `</think>` with no
+/// opening tag (the chat template already wrote `<think>`, so everything before the close is
+/// reasoning), an unclosed `<think>` while streaming, and call blocks under other tag names.
 fn split_reply(raw: &str) -> (String, String, bool) {
+    let norm = crate::tools::normalize_call_tags(raw);
+    let mut rest: &str = &norm;
     let mut thinking = String::new();
     let mut visible = String::new();
-    let mut rest = raw;
-    if let Some(s) = rest.find("<think>") {
+    // A close tag before any open tag: the reply started inside a think block.
+    if let Some(c) = rest.find("</think>") {
+        if rest.find("<think>").map_or(true, |o| o > c) {
+            thinking.push_str(&rest[..c]);
+            rest = &rest[c + 8..];
+        }
+    }
+    loop {
+        let Some(s) = rest.find("<think>") else { break };
         visible.push_str(&rest[..s]);
         let after = &rest[s + 7..];
+        if !thinking.is_empty() {
+            thinking.push('\n');
+        }
         match after.find("</think>") {
             Some(e) => {
                 thinking.push_str(&after[..e]);
                 rest = &after[e + 8..];
             }
             None => {
-                thinking.push_str(after);
+                // Still thinking (streaming); hide a half-written close tag.
+                let keep = crate::tools::partial_tag_suffix(after, "</think>");
+                thinking.push_str(&after[..after.len() - keep]);
                 rest = "";
             }
         }
@@ -966,12 +1172,15 @@ fn split_reply(raw: &str) -> (String, String, bool) {
         }
     }
     visible.push_str(r);
-    // A tag still being streamed token by token ("<tool_c…") is not shown yet.
-    let partial = crate::tools::partial_tag_suffix(&visible, "<tool_call>");
+    // Tags still being streamed token by token ("<tool_c...", "<thi...") are not shown yet.
+    let call_part = crate::tools::partial_call_tag(&visible);
+    let partial = call_part.max(crate::tools::partial_tag_suffix(&visible, "<think>"));
     if partial >= 2 {
         visible.truncate(visible.len() - partial);
-        pending = true;
+        pending |= call_part >= 2;
     }
+    // A stray close tag left in the text (the model wrote one twice).
+    let visible = visible.replace("</think>", "").replace("</tool_call>", "");
     (thinking.trim().to_string(), visible.trim().to_string(), pending)
 }
 
@@ -1220,7 +1429,8 @@ Keys
   ctrl+z             undo an edit         esc                 interrupt reply / clear prompt
   wheel, pgup/pgdn   scroll               ctrl+home / ctrl+end  top / bottom
   ctrl+l             redraw               ctrl+c              quit (on an empty prompt)
-  shift+drag         select text with the mouse";
+  drag               select text; it is copied when you let go
+  shift+drag         the terminal's own selection";
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and keys"),
@@ -1304,6 +1514,13 @@ pub struct SpindleTui {
     view_h: usize,
     /// Transcript length last frame, to keep a scrolled-up view still while text streams in.
     last_lines: usize,
+    /// Mouse selection (drag to select; it is copied when the button is released).
+    selection: Option<Selection>,
+    selecting: bool,
+    /// Width of the main pane last frame (the sidebar starts there).
+    main_w: u16,
+    /// A short message in the status bar, e.g. "Copied 120 characters".
+    flash: Option<(String, Instant)>,
 }
 
 impl SpindleTui {
@@ -1328,6 +1545,10 @@ impl SpindleTui {
             draft: String::new(),
             view_h: 20,
             last_lines: 0,
+            selection: None,
+            selecting: false,
+            main_w: w,
+            flash: None,
         }
     }
 
@@ -1471,6 +1692,19 @@ impl SpindleTui {
     /// context usage on the right.
     fn draw_status(&mut self, x0: u16, y: u16, w: u16) {
         let max_x = x0 + w;
+        if let Some((msg, at)) = &self.flash {
+            if at.elapsed() < Duration::from_millis(2500) {
+                let msg = msg.clone();
+                self.canvas.text(x0 + 1, y, max_x.saturating_sub(24), &format!("✓ {msg}"), SUCCESS, BG, false);
+                let used = self.info.ctx_used;
+                let pct = used * 100 / self.info.ctx_max.max(1);
+                let right = format!("{} ({pct}%)", fmt_tokens(used));
+                let rx = (x0 + w).saturating_sub(right.chars().count() as u16 + 1);
+                self.canvas.text(rx, y, max_x, &right, MUTED, BG, false);
+                return;
+            }
+            self.flash = None;
+        }
         if self.generating {
             let mut x = self.canvas.text(x0 + 1, y, max_x, &format!("{} ", spinner_frame(self.t0)), PRIMARY, BG, false);
             x = self.canvas.text(x, y, max_x, "esc", TEXT, BG, true);
@@ -1584,9 +1818,13 @@ impl SpindleTui {
         self.canvas.resize(w, h);
         self.canvas.clear();
         if self.entries.is_empty() {
+            self.main_w = w;
             self.render_home(w, h);
         } else {
             self.render_session(w, h);
+        }
+        if let Some(sel) = self.selection {
+            self.canvas.highlight(&sel);
         }
         let _ = self.canvas.flush();
     }
@@ -1731,6 +1969,7 @@ impl SpindleTui {
             self.draw_sidebar(w - sidebar_w, sidebar_w, h);
         }
         let main_w = w - sidebar_w;
+        self.main_w = main_w;
         let x0 = 2u16;
         let col_w = main_w.saturating_sub(4);
         let (rows, cursor) = self.prompt_rows(col_w.saturating_sub(6) as usize);
@@ -1767,6 +2006,49 @@ impl SpindleTui {
 
     /// Applies a key to the prompt editor. Returns `Some(text)` when the user submits.
     fn handle_key(&mut self, key: KeyAction) -> Option<String> {
+        match key {
+            KeyAction::MouseDown(x, y) => {
+                let (x_min, x_max) = if x >= self.main_w { (self.main_w, self.canvas.width) } else { (0, self.main_w) };
+                self.selection = Some(Selection { anchor: (x, y), head: (x, y), x_min, x_max });
+                self.selecting = true;
+                return None;
+            }
+            KeyAction::MouseDrag(x, y) => {
+                if let (true, Some(sel)) = (self.selecting, self.selection.as_mut()) {
+                    sel.head = (x, y);
+                }
+                return None;
+            }
+            KeyAction::MouseUp(x, y) => {
+                if let (true, Some(mut sel)) = (self.selecting, self.selection) {
+                    sel.head = (x, y);
+                    self.selecting = false;
+                    if sel.anchor == sel.head {
+                        // A plain click clears the selection.
+                        self.selection = None;
+                        return None;
+                    }
+                    self.selection = Some(sel);
+                    let text = self.canvas.selected_text(&sel);
+                    if !text.trim().is_empty() {
+                        copy_to_clipboard(&text);
+                        let n = text.chars().count();
+                        self.flash = Some((format!("Copied {n} character{}", if n == 1 { "" } else { "s" }), Instant::now()));
+                    }
+                }
+                return None;
+            }
+            KeyAction::ScrollUp(_) | KeyAction::ScrollDown(_) | KeyAction::PageUp | KeyAction::PageDown | KeyAction::ScrollTop | KeyAction::ScrollBottom => {
+                // The highlight is in screen cells; scrolling would move the text under it.
+                self.selection = None;
+            }
+            KeyAction::None => {}
+            _ => {
+                if !self.selecting {
+                    self.selection = None;
+                }
+            }
+        }
         let popup = command_matches(&self.input.text);
         let page = self.view_h.saturating_sub(2).max(1);
         // Any edit makes the text the user's own: ↓ no longer replaces it with history.
@@ -1890,7 +2172,7 @@ impl SpindleTui {
                     self.input.clear();
                 }
             }
-            KeyAction::None => {}
+            KeyAction::None | KeyAction::MouseDown(..) | KeyAction::MouseDrag(..) | KeyAction::MouseUp(..) => {}
         }
         None
     }
@@ -1991,6 +2273,9 @@ fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts
                         tui.entries.push(Entry::Tool { icon, title, state: ToolState::Running, error: None, preview: None, block });
                     }
                     UiEvent::Agent(AgentEvent::ToolEnd(o)) => {
+                        if o.icon == "❯" {
+                            reassert_console();
+                        }
                         let block = o.icon == "❯" || (o.ok && o.preview.is_some());
                         let error = (!o.ok).then(|| o.output.lines().next().unwrap_or("").trim_start_matches("Error: ").to_string());
                         let entry = Entry::Tool {
@@ -2068,7 +2353,10 @@ fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts
                         | KeyAction::PageUp
                         | KeyAction::PageDown
                         | KeyAction::ScrollTop
-                        | KeyAction::ScrollBottom => {
+                        | KeyAction::ScrollBottom
+                        | KeyAction::MouseDown(..)
+                        | KeyAction::MouseDrag(..)
+                        | KeyAction::MouseUp(..) => {
                             tui.handle_key(key);
                         }
                         _ => {}
@@ -2421,10 +2709,34 @@ mod tests {
     }
 
     #[test]
+    fn selection_copies_the_text_under_it() {
+        let mut c = Canvas::new(30, 4);
+        c.text(2, 0, 30, "│ first line here", TEXT, BG, false);
+        c.text(2, 1, 30, "│ second line", TEXT, BG, false);
+        c.text(2, 2, 30, "│ third", TEXT, BG, false);
+        // Drag from "line" on row 0 to "second" on row 1, within a 0..30 pane.
+        let sel = Selection { anchor: (10, 0), head: (9, 1), x_min: 0, x_max: 30 };
+        assert_eq!(c.selected_text(&sel), "line here\nsecond");
+        // Dragging upwards selects the same text.
+        let up = Selection { anchor: (9, 1), head: (10, 0), x_min: 0, x_max: 30 };
+        assert_eq!(c.selected_text(&up), c.selected_text(&sel));
+        // Whole rows: the bar glyph and the common margin go.
+        let rows = Selection { anchor: (0, 1), head: (29, 2), x_min: 0, x_max: 30 };
+        assert_eq!(c.selected_text(&rows), "second line\nthird");
+        // A pane limit keeps the sidebar out.
+        assert_eq!(Selection { anchor: (0, 0), head: (29, 0), x_min: 0, x_max: 8 }.cols(0), Some((0, 8)));
+        assert_eq!(base64(b"hi!"), "aGkh");
+        assert_eq!(base64(b"hi"), "aGk=");
+    }
+
+    #[test]
     fn parse_input_handles_mouse_paste_and_ctrl_keys() {
-        let (a, n) = parse_input_bytes(b"\x1b[<0;77;27M\x1b[<0;77;27m");
-        assert_eq!(n, 22);
-        assert!(a.iter().all(|k| *k == KeyAction::None));
+        let (a, n) = parse_input_bytes(b"\x1b[<0;77;27M\x1b[<32;80;28M\x1b[<0;80;28m");
+        assert_eq!(n, 34);
+        // 1-based terminal cells become 0-based.
+        assert_eq!(a, vec![KeyAction::MouseDown(76, 26), KeyAction::MouseDrag(79, 27), KeyAction::MouseUp(79, 27)]);
+        // Right and middle buttons are ignored.
+        assert_eq!(parse_input_bytes(b"\x1b[<2;5;5M").0, vec![KeyAction::None]);
         assert_eq!(parse_input_bytes(b"\x1b[<64;7;7M").0, vec![KeyAction::ScrollUp(3)]);
         assert_eq!(parse_input_bytes(b"[<0;77;27M").0.len(), 0);
         let text: String = parse_input_bytes(b"hello\x1b[<0;10;10M world").0.into_iter().filter_map(|a| if let KeyAction::Char(c) = a { Some(c) } else { None }).collect();
@@ -2519,6 +2831,15 @@ mod tests {
     fn split_reply_hides_tool_markup_and_think() {
         let (t, v, p) = split_reply("<think>plan it</think>\n\nI'll read it.\n<tool_call>\n{\"name\":\"read_file\"");
         assert_eq!((t.as_str(), v.as_str(), p), ("plan it", "I'll read it.", true));
+        // Template already opened the think block.
+        let (t, v, _) = split_reply("let me check the file\n</think>\n\nHere it is.");
+        assert_eq!((t.as_str(), v.as_str()), ("let me check the file", "Here it is."));
+        // Two think blocks, and an alias call tag.
+        let (t, v, _) = split_reply("<think>a</think>x<think>b</think>y<function_call>{}</function_call>");
+        assert_eq!((t.as_str(), v.as_str()), ("a\nb", "xy"));
+        // Streaming a close tag.
+        let (t, v, _) = split_reply("<think>still going</thi");
+        assert_eq!((t.as_str(), v.as_str()), ("still going", ""));
         let (_, v, p) = split_reply("a<tool_call>{}</tool_call>b");
         assert_eq!((v.as_str(), p), ("ab", false));
     }

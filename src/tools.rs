@@ -208,9 +208,43 @@ fn call_from_json(v: Json) -> Option<ToolCall> {
     Some(ToolCall { name, args })
 }
 
+/// Other tag names models use for the same thing. Qwen is trained on `<tool_call>`, but it
+/// sometimes writes `<function_call>` (or `<tool_use>`) instead.
+const CALL_TAG_ALIASES: &[&str] = &["function_call", "tool_use", "functioncall"];
+
+/// Rewrites alias call tags (any case) to `<tool_call>` / `</tool_call>`.
+pub fn normalize_call_tags(text: &str) -> std::borrow::Cow<'_, str> {
+    let lower = text.to_ascii_lowercase();
+    if !CALL_TAG_ALIASES.iter().any(|a| lower.contains(&format!("<{a}")) || lower.contains(&format!("</{a}"))) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    'scan: while i < text.len() {
+        if text.as_bytes()[i] == b'<' {
+            for a in CALL_TAG_ALIASES {
+                for (close, pre) in [(false, "<"), (true, "</")] {
+                    let tag = format!("{pre}{a}>");
+                    if lower[i..].starts_with(&tag) {
+                        out.push_str(if close { "</tool_call>" } else { "<tool_call>" });
+                        i += tag.len();
+                        continue 'scan;
+                    }
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Extracts every tool call from a model reply, plus the reply with the call blocks removed
 /// (what the user should see).
 pub fn parse_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
+    let normalized = normalize_call_tags(text);
+    let text: &str = &normalized;
     let mut calls = Vec::new();
     let mut visible = String::new();
     let mut pos = 0;
@@ -265,6 +299,15 @@ pub struct ToolMarkupFilter {
     in_tool: bool,
 }
 
+/// Longest trailing partial opening call tag (`<tool_c`, `<function_ca`, ...) in `s`.
+pub fn partial_call_tag(s: &str) -> usize {
+    let mut n = partial_tag_suffix(s, "<tool_call>");
+    for a in CALL_TAG_ALIASES {
+        n = n.max(partial_tag_suffix(s, &format!("<{a}>")));
+    }
+    n
+}
+
 /// Length of the longest suffix of `s` that is a proper prefix of `tag`.
 pub fn partial_tag_suffix(s: &str, tag: &str) -> usize {
     (1..tag.len().min(s.len() + 1))
@@ -279,6 +322,9 @@ impl ToolMarkupFilter {
         const OPEN: &str = "<tool_call>";
         const CLOSE: &str = "</tool_call>";
         self.buf.push_str(piece);
+        if let std::borrow::Cow::Owned(n) = normalize_call_tags(&self.buf) {
+            self.buf = n;
+        }
         let mut out = String::new();
         loop {
             if self.in_tool {
@@ -302,7 +348,7 @@ impl ToolMarkupFilter {
                         self.in_tool = true;
                     }
                     None => {
-                        let keep = partial_tag_suffix(&self.buf, OPEN);
+                        let keep = partial_call_tag(&self.buf);
                         let cut = self.buf.len() - keep;
                         out.push_str(&self.buf[..cut]);
                         self.buf.drain(..cut);
@@ -1291,6 +1337,22 @@ mod tests {
         let out2 = read_file(&f.to_string_lossy(), Some(10), Some(5), 20_000);
         assert!(!out2.output.contains("Outline"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alias_call_tags_are_parsed_and_hidden() {
+        let text = "Running it.\n<function_call>\n{\"name\": \"run_command\", \"arguments\": {\"command\": \"python popup.py\"}}\n</function_call>";
+        let (calls, visible) = parse_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "run_command");
+        assert_eq!(visible, "Running it.");
+        let mut f = ToolMarkupFilter::default();
+        let mut shown = String::new();
+        for p in ["Ok ", "<func", "tion_call>{\"name\":1}", "</function_call>", " done"] {
+            shown.push_str(&f.push(p));
+        }
+        assert_eq!(shown, "Ok  done");
+        assert_eq!(normalize_call_tags("<TOOL_USE>x</Tool_Use>"), "<tool_call>x</tool_call>");
     }
 
     #[test]

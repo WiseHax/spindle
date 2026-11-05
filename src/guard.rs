@@ -151,69 +151,87 @@ pub fn check_path(path_str: &str, is_write: bool) -> GuardDecision {
 
 /// Executes a shell command inside a watchdog timer, returning `(stdout_stderr, exit_code)`.
 pub fn run_sandboxed(command: &str, timeout: Duration) -> std::io::Result<(String, i32)> {
+    use std::io::Read;
     let t0 = Instant::now();
 
+    // The command gets no stdin and no console. Sharing the console with the interface let
+    // a child read the keys typed into the prompt (a script waiting on input() swallowed
+    // them) and change the console mode under the full-screen UI, which then stopped seeing
+    // keys. GUI windows a script opens still work.
     #[cfg(target_os = "windows")]
-    let mut child = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", command])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+    let mut child = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", command])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?
+    };
 
     #[cfg(not(target_os = "windows"))]
     let mut child = Command::new("sh")
         .args(["-c", command])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    // Polling watchdog with 10ms granularity
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                let code = status.code().unwrap_or(0);
-                let mut out = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    let _ = stdout.read_to_end(&mut buf);
-                    out.push_str(&String::from_utf8_lossy(&buf));
-                }
-                if let Some(mut stderr) = child.stderr.take() {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    let _ = stderr.read_to_end(&mut buf);
-                    let err_str = String::from_utf8_lossy(&buf);
-                    if !err_str.is_empty() {
-                        if !out.is_empty() && !out.ends_with('\n') {
-                            out.push('\n');
-                        }
-                        out.push_str(&err_str);
-                    }
-                }
-                // Cap output to 32 KiB to avoid blowing context memory
-                const MAX_OUT: usize = 32 * 1024;
-                if out.len() > MAX_OUT {
-                    let truncated = format!(
-                        "\n... [output truncated: {} bytes total, showing first {} bytes] ...",
-                        out.len(),
-                        MAX_OUT
-                    );
-                    out.truncate(MAX_OUT);
-                    out.push_str(&truncated);
-                }
-                return Ok((out, code));
+    // Drain both pipes while the command runs. Reading only after it exits deadlocked any
+    // command that printed more than the pipe buffer: it blocked on write until the timeout.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
             }
-            None => {
-                if t0.elapsed() > timeout {
-                    let _ = child.kill();
-                    return Ok((
-                        format!("[spindle:guard] Command timed out after {:.1}s and was terminated.", timeout.as_secs_f32()),
-                        -1,
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(15));
+            buf
+        })
+    };
+    let out_t = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err_t = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if t0.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    let mut out = String::from_utf8_lossy(&out_t.join().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(&err_t.join().unwrap_or_default()).into_owned();
+    if !err.is_empty() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&err);
+    }
+    // Cap what is kept in memory; the agent shortens it further for the model.
+    const MAX_OUT: usize = 256 * 1024;
+    if out.len() > MAX_OUT {
+        let total = out.len();
+        let mut cut = MAX_OUT;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str(&format!("\n... [output truncated: {total} bytes total, first {MAX_OUT} kept] ..."));
+    }
+    match status {
+        Some(st) => Ok((out, st.code().unwrap_or(0))),
+        None => {
+            let mut msg = format!("[spindle:guard] Command timed out after {:.1}s and was terminated.", timeout.as_secs_f32());
+            if !out.trim().is_empty() {
+                msg.push_str("\nOutput before it was stopped:\n");
+                msg.push_str(&out);
             }
+            Ok((msg, -1))
         }
     }
 }
@@ -221,6 +239,20 @@ pub fn run_sandboxed(command: &str, timeout: Duration) -> std::io::Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// More output than a pipe buffer holds must not stall the command until the timeout,
+    /// and a command that reads stdin gets end-of-input instead of the user's keys.
+    #[test]
+    fn large_output_and_stdin_do_not_hang() {
+        let t = Instant::now();
+        let (out, code) = run_sandboxed("1..8000 | ForEach-Object { \"line $_ of the output\" }", Duration::from_secs(60)).unwrap();
+        assert_eq!(code, 0, "{}", &out[..out.len().min(300)]);
+        assert!(out.contains("line 8000 of the output"));
+        assert!(t.elapsed() < Duration::from_secs(30), "took {:?}", t.elapsed());
+        let t = Instant::now();
+        let _ = run_sandboxed("$x = [Console]::In.ReadLine(); \"got [$x]\"", Duration::from_secs(20)).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(15), "a stdin read waited for input");
+    }
 
     #[test]
     fn test_safe_developer_commands_allowed() {
