@@ -17,9 +17,12 @@ or take the whole machine down with them.
 ## What it does
 
 - **Two-PC inference.** The desktop runs some of the layers and the laptop runs the rest.
-  Qwen3-30B-A3B (17.3 GiB at Q4_K_M) runs at about 8 tok/s across a 16 GB desktop and an
-  8 GB laptop over Wi-Fi, with no disk paging on either machine. See
-  [docs/cluster.md](docs/cluster.md).
+  Qwen3-30B-A3B (17.3 GiB at Q4_K_M) runs at about 9 tok/s across a 16 GB desktop and an
+  8 GB laptop over Wi-Fi. Each PC keeps the experts it uses most in RAM when its share
+  doesn't fit. See [docs/cluster.md](docs/cluster.md).
+- **Integer kernels.** Q4_K and Q6_K weights are multiplied against 8-bit activations in
+  integer math, about 2x faster per matrix than float, with the same perplexity. The experts a
+  MoE layer picks run as one fused job.
 - **Speculative decoding with no draft model.** Draft tokens come from earlier text in the
   conversation, and the model checks them all in one batched pass. The output matches normal
   decoding exactly. This helps most when the reply repeats existing text, such as code edits
@@ -66,7 +69,7 @@ Invoke-WebRequest "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen
 On startup, spindle shows each loading step with a progress bar where it can measure one:
 
 ```
-  spindle 1.0.0
+  spindle 1.1.0
 
   ✓ Model      Qwen3 0.6B Instruct · 609 MiB · 28 layers  596 ms
   ✓ Weights    604 MiB in RAM · 1.7 GiB/s  353 ms
@@ -194,7 +197,7 @@ It reports the first token where the two differ:
 
 ## Status
 
-Version 1.0.0. The changes are listed in [CHANGELOG.md](CHANGELOG.md), and the next steps are
+Version 1.1.0. The changes are listed in [CHANGELOG.md](CHANGELOG.md), and the next steps are
 in [docs/roadmap.md](docs/roadmap.md).
 
 ## Contributing

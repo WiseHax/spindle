@@ -115,6 +115,14 @@ of draft tokens costs one round trip, not one per token.
 Frame types are only ever added. Existing types never change meaning, so a mismatched version
 fails with a clear message instead of misreading data.
 
+### Pipelined prompt processing
+
+A prompt goes to the worker in 64-token chunks. The client sends chunk `i+1` as soon as chunk
+`i`'s activations arrive, then runs its own layers on chunk `i`, so the worker is never idle
+waiting for the laptop. This only runs when the whole prompt fits in the context without a
+KV shift; otherwise chunks go one at a time. The worker needs no change: it answers prefill
+requests in order, as before. `SPINDLE_NO_PIPELINE=1` turns it off.
+
 ### Keeping the two KV caches in step
 
 Each machine stores the keys and values for its own layers, indexed by token position. The

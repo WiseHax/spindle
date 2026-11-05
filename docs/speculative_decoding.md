@@ -100,6 +100,24 @@ output, the copy-like steps dominate. On prose-only chats where every millisecon
 The stats line after each reply shows how many drafts were accepted, for example
 `speculation: 41/52 drafts accepted (79%), 18 verify steps`.
 
+## How long a draft is
+
+Since 1.1 the draft length is measured, not fixed. The engine keeps two numbers:
+
+- how often each kind of draft is accepted, per position: weak 2-gram lookups, 3-gram, 4-gram
+  and longer, and drafts from a draft model. The counts decay, so they follow the current
+  reply.
+- what one extra token in a verify pass costs, compared with a plain one-token step,
+  measured from real passes.
+
+A draft of `k` tokens accepted with probability `p` each yields `1 + p + … + p^k` tokens on
+average, for the cost of a `k+1`-token pass. The engine verifies the `k` with the most tokens
+per second, which is often 0 on MoE models: there, an extra token can route to experts no
+other token uses, and on Qwen3-30B-A3B across two PCs an extra token costs about as much as a
+whole step. Every 24 skipped drafts it tries a short one, so a rate that has improved gets
+measured again. `/timing` and `--bench` print both numbers. `SPINDLE_SPEC_FIXED=1` brings back
+the fixed length.
+
 ## Settings
 
 | | |

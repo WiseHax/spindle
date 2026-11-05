@@ -97,6 +97,13 @@ were measured with different settings:
 | | fp8 activations | 5.1–6.0 |
 | | 2-row Q6_K kernel, no allocations in the MoE router | 6.3–7.2 |
 | 1.0.0 | multi-vector kernels, `moe_prune = 4`, speculation | 7.2–8.2 |
+| 1.1.0 | integer kernels, fused MoE, hot experts in RAM, `moe_prune = 0.1` | 8.3–9.2 |
+
+The 1.1.0 row is at `moe_prune = 0.1`, which costs 3% in perplexity; 1.0.0's `moe_prune = 4`
+costs 28% (see [moe_pruning.md](moe_pruning.md)). Per forward pass, 1.1.0 takes 118 ms: 80 ms
+on the worker, 26 ms for the laptop's layers, 9 ms for the LM head and 3 ms on the network,
+with 3.6 GiB free on the laptop. With less free RAM the laptop pages, and its layers take
+about 40 ms.
 
 ## Kernels
 

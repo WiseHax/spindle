@@ -3,10 +3,10 @@
 The goal hasn't changed: run models much bigger than one cheap PC's RAM at a usable speed,
 without freezing the machine.
 
-## Where 1.0 stands
+## Where 1.1 stands
 
-- Qwen3-30B-A3B runs across a 16 GB desktop and an 8 GB laptop at 7–8 tok/s, with no disk
-  paging on either one.
+- Qwen3-30B-A3B runs across a 16 GB desktop and an 8 GB laptop at 8–9 tok/s, at `moe_prune
+  = 0.1` (3% perplexity cost). Prompt processing is 25 tok/s.
 - Small models run on one laptop at 40–170 tok/s.
 - The coding agent works with Qwen3 models, with confirmations and undo.
 - Output agrees with llama.cpp up to near-ties (`tools/golden.ps1`).
@@ -21,46 +21,41 @@ Done so far, in order:
 - Two-PC layer split with fp16/fp8 activations, KV-shift sync and context negotiation
 - Batched forward pass on multi-vector kernels
 - Prompt-lookup and draft-model speculative decoding, both exact
-- MoE expert pruning
+- MoE expert pruning, with its quality cost measured (`--ppl`)
 - Agent tools, guard, undo, full-screen interface, startup progress display
+- 1.1: per-phase timing (`/timing`, `--bench`), system prompt cache on disk, hot experts kept
+  in RAM, integer Q4_K/Q6_K kernels, fused MoE experts, measured draft lengths, pipelined
+  prompt processing across the two PCs
 
 ## Next
 
 Ordered by how much each item is expected to help, measured against what it costs to build.
 
-### 1. Find the missing 18 ms per token
+### 1. Make verification cheap on MoE
 
-On the two-PC setup, a token costs about 73 ms on the worker plus 31 ms on the laptop, which
-would allow 9.6 tok/s. The measured speed is 8.2 tok/s, so about 18 ms per token goes
-somewhere else. Candidates are sampling over a 151k vocabulary, detokenizing, drawing the
-interface, and network jitter.
+A verify pass costs about 110% of a step for every extra token, so speculation rarely pays on
+Qwen3-30B-A3B. The batched MoE path still runs each expert as three separate thread-pool jobs,
+and every extra token can route to experts the others don't use.
 
-- Add a per-phase breakdown to `/stats`: network wait, worker compute (reported by the
-  worker), local layers, LM head, sampling, interface.
-- Fix whatever dominates.
+- Fuse the batched MoE path the way the single-token path is fused (two passes per layer).
+- Measure the extra-token cost again (`--bench` prints it).
 
-Done when: the parts add up to the measured time per token, and the gap is under 5 ms.
+Done when: an extra verify token costs under 40% of a step.
 
-### 2. Measure what pruning costs
+### 2. More accepted tokens per pass
 
-`moe_prune = 4` is in daily use without a quality number.
+Only once verification is cheap: lookahead decoding (the model drafts n-grams for itself in
+the same pass) and tree verification (several candidate continuations in one batch).
 
-- Perplexity on a fixed text with pruning off, at 6, at 4, and at 0.05.
-- A small set of fixed coding prompts, comparing the replies.
+Done when: prose averages ≥ 1.25 tokens per pass with the output unchanged.
 
-Done when: docs/moe_pruning.md has a table and a recommended default.
+### 3. The laptop's share in RAM
 
-### 3. Keep both PCs busy
+The laptop needs 4.9 GiB for its layers and usually has 1.5–3.6 GiB free. Its layers take 26
+ms with 3.6 GiB free and about 40 ms when it pages.
 
-Right now the machines take turns: while the worker computes, the laptop waits, and the
-other way round. Options:
-
-- Overlap the laptop's LM head and sampling with the worker's next step, when a draft makes
-  the next token predictable.
-- Split by measured speed instead of by hand: time a few tokens at startup and suggest a
-  `layer_range`.
-
-Done when: both machines are busy more than 70% of the time during generation.
+- Smaller resident footprint for the LM head and attention (both are read every token).
+- Suggest a `layer_range` from measured speed and free RAM on both machines.
 
 ### 4. Usable by other people
 

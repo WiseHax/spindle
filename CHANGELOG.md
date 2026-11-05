@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 (2026-11-05)
+
+About 25% faster per token on the two-PC setup, at near-full quality, and prompt processing
+about 1.7x faster. A 1.1 worker and a 1.0 client (or the other way round) still work together:
+every new frame is optional.
 
 ### Speed
 

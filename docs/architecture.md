@@ -103,6 +103,22 @@ Scales are applied once per block or sub-block. For `Q4_K` each 32-weight sub-bl
 contributes `d*sc*sum(q*x) - dmin*mn*sum(x)` (same for `Q5_K`, and `Q4_1`/`Q5_1` use
 `d*sum(q*x) + m*sum(x)`).
 
+### Integer kernels (1.1)
+
+For `Q4_K` and `Q6_K`, `quant_q8k.rs` first quantizes the activation vector to `Q8_K`: per
+256 values one f32 scale (`max|x| / 127`), 256 int8 values and 16 sums of 16. That costs about
+a microsecond and is shared by every row. Each weight block is then multiplied in integers:
+`vpmaddubsw` multiplies the unsigned 4- or 6-bit weights by the signed activations into 16-bit
+pairs, `vpmaddwd` applies the sub-block scales and widens to 32 bits, and one float multiply
+per block applies `d * d_x`. The `Q4_K` mins and the `Q6_K` offset of 32 come out of the
+precomputed sums, so they cost 8 or 16 integer multiplies per block. One generic kernel serves
+1 to 8 vectors; a vector gets bit-identical results at any batch size, which keeps speculative
+verify equal to one-by-one decoding.
+
+The activation rounding is the only difference from the float path. On Qwen3-30B-A3B the
+perplexity was 9.207 with integer kernels and 9.224 with float ones. `--float-kernels`
+switches back.
+
 `dequant_row` is a plain scalar version of every format written from the ggml definitions.
 The test in `quant.rs` runs each SIMD kernel on random blocks through the real matvec
 dispatch and compares against it. It also serves embedding lookups.
