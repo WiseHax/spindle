@@ -1153,7 +1153,17 @@ fn parse_cli() -> CliConfig {
 fn load_weights(loader: &loading::Loader, engine: &smollm_chat::SmolLm2Engine) {
     let total = engine.resident_bytes();
     if total == 0 {
-        loader.step("Weights", "").done("larger than free RAM: read from disk as needed");
+        let (need, free) = (engine.share_bytes, engine.free_at_load);
+        let msg = if need > free {
+            format!(
+                "needs {}, {} free: reading from disk as needed (slower). Close other programs to fit it in RAM",
+                loading::fmt_bytes(need),
+                loading::fmt_bytes(free)
+            )
+        } else {
+            "read from disk as needed".to_string()
+        };
+        loader.step("Weights", "").done(&msg);
         return;
     }
     let step = loader.step("Weights", &format!("reading {} into RAM", loading::fmt_bytes(total)));

@@ -1103,6 +1103,9 @@ pub struct SmolLm2Engine {
     prefetcher: Option<Prefetcher>,
     /// `(offset, len)` of every tensor this node uses, when they fit in RAM (else empty).
     resident_ranges: Vec<(usize, usize)>,
+    /// Bytes of weights this node uses, and the free RAM when it loaded.
+    pub share_bytes: u64,
+    pub free_at_load: u64,
     /// Reads layers `first..` into private buffers when they don't fit in RAM.
     streamer: Option<crate::layer_stream::LayerStreamer>,
     /// Explicit in-RAM expert cache for streaming MoE weights from disk.
@@ -1347,8 +1350,17 @@ impl SmolLm2Engine {
         }
         // `SPINDLE_FORCE_STREAM=1` treats any model as too big for RAM, to test that path.
         let force_stream = std::env::var("SPINDLE_FORCE_STREAM").is_ok_and(|v| v == "1");
-        let sharded_ratio = n_local_layers as f64 / c.n_layers as f64;
-        let sharded_needed = (file_len as f64 * sharded_ratio) as u64;
+        // This node's share of the weights: its layers, plus the LM head on the last node.
+        let mut share = Vec::new();
+        for ly in &layers {
+            let (start, end, _) = layer_extent(ly, &c);
+            share.push((start, end - start));
+        }
+        if layer_range.end == c.n_layers {
+            share.push((lm_head.offset, lm_head.rows * row_bytes(lm_head.dtype, lm_head.cols).unwrap_or(0)));
+            share.push((output_norm, c.dim * 4));
+        }
+        let sharded_needed: u64 = share.iter().map(|&(_, n)| n as u64).sum();
         let avail_ram = crate::mmap_file::available_ram_bytes();
         let fits_in_ram = sharded_needed <= avail_ram.saturating_sub(128 * 1024 * 1024);
         // Filled when this node's share fits in RAM; `warm_weights` reads them in up front.
@@ -1356,16 +1368,7 @@ impl SmolLm2Engine {
         let prefetched = if force_stream {
             false
         } else if fits_in_ram {
-            let mut ranges = Vec::new();
-            for ly in &layers {
-                let (start, end, _) = layer_extent(ly, &c);
-                ranges.push((start, end - start));
-            }
-            if layer_range.end == c.n_layers {
-                ranges.push((lm_head.offset, lm_head.rows * row_bytes(lm_head.dtype, lm_head.cols).unwrap_or(0)));
-                ranges.push((output_norm, c.dim * 4));
-            }
-            resident_ranges = ranges;
+            resident_ranges = share;
             true
         } else {
             raw_bytes.prefetch_if_fits()
@@ -1448,6 +1451,8 @@ impl SmolLm2Engine {
         };
         let mut engine = Self {
             resident_ranges,
+            share_bytes: sharded_needed,
+            free_at_load: avail_ram,
             prefetcher,
             streamer: None,
             expert_cache: None,
