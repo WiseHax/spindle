@@ -16,6 +16,13 @@
   one parallel pass, then every output row in a second pass that also sums the experts. That
   is 2 thread-pool handoffs per layer instead of 3 per expert (24 for 8 experts), and the input
   is quantized once for all experts. Dense FFNs get the same two-pass form.
+- Speculative drafts are sized from measurements. The engine tracks how often each kind of
+  draft is accepted (2-gram, 3-gram and longer lookup matches, draft model) and what each extra
+  verify token costs compared with a plain step, and verifies the number of draft tokens that
+  gives the most tokens per second, or none. On a MoE model an extra verify token can cost a lot
+  (it may route to other experts), so weak drafts that rarely pay are skipped instead of
+  slowing the step down. Output is unchanged. `/timing` and `--bench` show the measured cost
+  and accept rates. `SPINDLE_SPEC_FIXED=1` restores the fixed draft length.
 - Batched verify and one-by-one decoding give bit-identical results on all-K-quant models: the
   integer kernels compute each vector the same way at any batch size, and F32 router matrices
   now run per vector in a batch too.

@@ -305,6 +305,9 @@ pub fn run_bench(engine: &mut SmolLm2Engine, runs: usize, max_tokens: usize) {
         for _ in 0..runs.max(1) {
             let _ = engine.restore_kv_branch("__bench");
             engine.lookup_corpus = corpus.clone();
+            // Same start for every run: accept rates from scratch (pass costs are kept, they
+            // describe the machines, not the text).
+            engine.spec_model.reset_rates();
             let t0 = engine.timing;
             let (_, secs, toks) = unsafe { engine.generate_reply(prompt, max_tokens, false, &mut |_| {}) };
             let d = engine.timing.since(&t0);
@@ -332,6 +335,9 @@ pub fn run_bench(engine: &mut SmolLm2Engine, runs: usize, max_tokens: usize) {
     let _ = engine.save_expert_stats();
     println!();
     println!("{}", Breakdown::from_timing(&all, all_secs).table(all_tokens));
+    if engine.speculate {
+        println!("Speculation: {}", engine.spec_model.summary());
+    }
     if engine.is_moe() {
         let picks1 = all_expert_picks(engine);
         let delta: Vec<_> = picks1
@@ -843,7 +849,12 @@ Spindle adds this file to the system prompt. Describe the project for the model:
                 println!("{}", dim("Reasoning will be collapsed to one line."));
             }
             "/timing" => match *last_timing.borrow() {
-                Some((b, t)) => println!("{}", dim(&b.table(t))),
+                Some((b, t)) => {
+                    println!("{}", dim(&b.table(t)));
+                    if engine.speculate {
+                        println!("{}", dim(&format!("Speculation: {}", engine.spec_model.summary())));
+                    }
+                }
                 None => println!("{}", dim("No reply yet. Send a message, then run /timing.")),
             },
             "/stats" => {

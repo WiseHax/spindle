@@ -2272,7 +2272,11 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
         }
         "/timing" | "/stats" => match &tui.info.last_timing {
             Some((b, tokens)) => {
-                let t = b.table(*tokens);
+                let mut t = b.table(*tokens);
+                if engine.speculate {
+                    t.push_str(&format!("
+Speculation: {}", engine.spec_model.summary()));
+                }
                 tui.notice(&t);
             }
             None => tui.notice("No reply yet. Send a message, then run /timing."),

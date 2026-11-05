@@ -1519,6 +1519,149 @@ pub struct SmolLm2Engine {
     pub lookup_corpus: Vec<usize>,
     /// LM-head logits for a whole verify batch (`[batch * vocab]`), reused across turns.
     pub batch_logits: Vec<f32>,
+    /// Measured accept rates and pass costs that decide each draft's length.
+    pub spec_model: SpecModel,
+}
+
+/// Decides how many draft tokens to verify, from measurements instead of a fixed length.
+///
+/// A verify pass of `b` tokens costs `t1 + extra · (b - 1)`, where `t1` is a plain one-token
+/// step and `extra` the measured cost of each additional token (on a MoE model every extra
+/// token can route to other experts, so this is far from free). Each drafted position is
+/// accepted with probability `p` (per draft source: weak 2-gram, 3-gram, 4+-gram, draft
+/// model), so a draft of length `k` yields `1 + p + p² + … + p^k` tokens on average. The
+/// length with the most tokens per unit of time wins; when that is 0, no verify is run and the
+/// step costs the same as without speculation. Accept counts decay, so the rates follow the
+/// current reply (prose vs a code edit).
+#[derive(Clone, Debug)]
+pub struct SpecModel {
+    acc: [f64; 4],
+    fail: [f64; 4],
+    t1_us: f64,
+    extra_us: f64,
+    have_t1: bool,
+    have_extra: bool,
+    since_try: u32,
+    /// `SPINDLE_SPEC_FIXED=1`: always verify the whole draft (the 1.0 behaviour).
+    fixed: bool,
+}
+
+impl Default for SpecModel {
+    fn default() -> Self {
+        Self {
+            acc: [1.0; 4],
+            fail: [1.0; 4],
+            t1_us: 100_000.0,
+            extra_us: 30_000.0,
+            have_t1: false,
+            have_extra: false,
+            since_try: 0,
+            fixed: std::env::var_os("SPINDLE_SPEC_FIXED").is_some_and(|v| !v.is_empty() && v != "0"),
+        }
+    }
+}
+
+impl SpecModel {
+    /// Draft source class: 0 = 2-gram lookup, 1 = 3-gram, 2 = 4+-gram, 3 = draft model.
+    pub fn class(ngram: usize) -> usize {
+        match ngram {
+            0 => 3,
+            1 | 2 => 0,
+            3 => 1,
+            _ => 2,
+        }
+    }
+
+    pub fn accept_rate(&self, c: usize) -> f64 {
+        self.acc[c] / (self.acc[c] + self.fail[c])
+    }
+
+    fn cost(&self, b: usize) -> f64 {
+        self.t1_us + self.extra_us * b.saturating_sub(1) as f64
+    }
+
+    /// Best number of drafts to verify out of `avail` from source class `c` (0 = none).
+    pub fn best_len(&mut self, c: usize, avail: usize) -> usize {
+        if self.fixed || avail == 0 {
+            return avail;
+        }
+        let p = self.accept_rate(c);
+        let mut best = (1.0 / self.cost(1), 0usize);
+        let (mut gain, mut pk) = (1.0, 1.0);
+        for k in 1..=avail {
+            pk *= p;
+            gain += pk;
+            let rate = gain / self.cost(k + 1);
+            if rate > best.0 {
+                best = (rate, k);
+            }
+        }
+        if best.1 == 0 {
+            // Re-check now and then, so a source that was poor earlier in the reply (or a
+            // pass cost that has since dropped) gets measured again.
+            self.since_try += 1;
+            if self.since_try >= 24 {
+                self.since_try = 0;
+                return avail.min(2);
+            }
+        }
+        best.1
+    }
+
+    /// Forgets the accept rates (keeps the measured pass costs).
+    pub fn reset_rates(&mut self) {
+        self.acc = [1.0; 4];
+        self.fail = [1.0; 4];
+        self.since_try = 0;
+    }
+
+    /// A verify of `drafted` tokens from class `c` accepted `accepted` of them.
+    pub fn record_draft(&mut self, c: usize, drafted: usize, accepted: usize) {
+        const DECAY: f64 = 0.97;
+        for i in 0..4 {
+            // Keep a floor of one pseudo-count each, so no rate is ever exactly 0 or 1.
+            self.acc[i] = (self.acc[i] * DECAY).max(0.5);
+            self.fail[i] = (self.fail[i] * DECAY).max(0.5);
+        }
+        self.acc[c] += accepted as f64;
+        if accepted < drafted {
+            self.fail[c] += 1.0;
+        }
+    }
+
+    /// A plain one-token step took `us`.
+    pub fn record_step(&mut self, us: u64) {
+        let us = us as f64;
+        self.t1_us = if self.have_t1 { 0.9 * self.t1_us + 0.1 * us } else { us };
+        if !self.have_extra {
+            // Until a verify is measured, assume each extra token costs 30% of a step.
+            self.extra_us = 0.3 * self.t1_us;
+        }
+        self.have_t1 = true;
+    }
+
+    /// A verify pass of `b` tokens took `us`.
+    pub fn record_verify(&mut self, b: usize, us: u64) {
+        if b < 2 || !self.have_t1 {
+            return;
+        }
+        // One slow pass (a page fault, a Wi-Fi hiccup) must not switch speculation off for the
+        // rest of the reply: clamp each sample before averaging.
+        let m = ((us as f64 - self.t1_us) / (b - 1) as f64).clamp(0.0, 1.5 * self.t1_us);
+        self.extra_us = if self.have_extra { 0.85 * self.extra_us + 0.15 * m } else { m };
+        self.have_extra = true;
+    }
+
+    /// Short summary for `/timing`: per-token verify cost relative to a step, accept rates.
+    pub fn summary(&self) -> String {
+        format!(
+            "each extra verify token costs {:.0}% of a step · accept rates: 2-gram {:.0}%, 3-gram {:.0}%, 4+-gram {:.0}%",
+            100.0 * self.extra_us / self.t1_us.max(1.0),
+            100.0 * self.accept_rate(0),
+            100.0 * self.accept_rate(1),
+            100.0 * self.accept_rate(2)
+        )
+    }
 }
 
 /// Where generation time goes, accumulated across calls (take differences to measure a
@@ -1847,6 +1990,7 @@ impl SmolLm2Engine {
             speculate: std::env::var("SPINDLE_SPEC").map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("off")),
             lookup_corpus: Vec::with_capacity(LOOKUP_CORPUS_MAX),
             batch_logits: Vec::new(),
+            spec_model: SpecModel::default(),
         };
         engine.format = engine.detect_format()?;
         // The token that closes an assistant turn always ends a reply.
@@ -3922,6 +4066,7 @@ impl SmolLm2Engine {
             };
             let k = k_dyn.min(budget.saturating_sub(1));
             let mut draft: Vec<usize> = Vec::new();
+            let mut draft_class = 3usize;
             let t_draft = std::time::Instant::now();
             if k > 0 && (skip == 0 || use_lookup) {
                 if let Some(d) = draft_engine.as_mut() {
@@ -3954,18 +4099,23 @@ impl SmolLm2Engine {
                     let (d, ng) = self.lookup_draft(k);
                     if skip == 0 || ng > LOOKUP_MIN_NGRAM {
                         draft = d;
+                        draft_class = SpecModel::class(ng);
                     }
                 }
             }
+            let keep = self.spec_model.best_len(draft_class, draft.len());
+            draft.truncate(keep);
             self.timing.draft_us += us_since(t_draft);
             skip = skip.saturating_sub(1);
 
             if draft.is_empty() {
                 self.ensure_kv_room(1);
                 let pos = self.cur_pos;
+                let t_step = std::time::Instant::now();
                 let h = self.step_token(tok, pos);
                 self.cur_pos += 1;
                 tok = self.sample_next_token(&h, penalty_window!(), generated < 2 || in_think, forbid_think);
+                self.spec_model.record_step(us_since(t_step));
                 continue;
             }
 
@@ -3974,8 +4124,10 @@ impl SmolLm2Engine {
             batch.extend_from_slice(&draft);
             self.ensure_kv_room(batch.len());
             let start = self.cur_pos;
+            let t_verify = std::time::Instant::now();
             let hiddens = self.verify_forward(&batch, start);
             self.compute_logits_batch(&hiddens);
+            self.spec_model.record_verify(batch.len(), us_since(t_verify));
             self.spec_stats.1 += draft.len();
             self.spec_stats.2 += 1;
 
@@ -3997,6 +4149,7 @@ impl SmolLm2Engine {
                 }
             }
             self.spec_stats.0 += accepted;
+            self.spec_model.record_draft(draft_class, draft.len(), accepted);
             if std::env::var_os("SPINDLE_SPEC_DEBUG").is_some() {
                 let show = |ts: &[usize]| ts.iter().map(|&t| format!("{:?}", String::from_utf8_lossy(&self.token_bytes(t)))).collect::<Vec<_>>().join(" ");
                 eprintln!("[spec] tok={} draft=[{}] accepted={accepted} correction={:?}", show(&[tok]), show(&draft), correction.map(|c| show(&[c])));
@@ -4337,6 +4490,35 @@ mod tests {
             println!("  {name:8} {us:7.0} us per layer = {:5.1} GB/s | 48 layers: {:.1} ms", mb * 1e3 / us, us * 48.0 / 1e3);
         }
         crate::quant_q8k::set_thread_override(None);
+    }
+
+    #[test]
+    fn spec_model_skips_drafts_that_do_not_pay() {
+        let mut m = SpecModel { fixed: false, ..Default::default() };
+        m.record_step(100_000);
+        // An extra verify token costs 40% of a step.
+        m.record_verify(5, 260_000);
+        // Rarely accepted 2-gram drafts: not worth a verify.
+        for _ in 0..40 {
+            m.record_draft(0, 2, 0);
+        }
+        assert_eq!(m.best_len(0, 2), 0);
+        // Long, usually accepted 4+-gram drafts: verify all of them.
+        for _ in 0..40 {
+            m.record_draft(2, 6, 6);
+        }
+        assert_eq!(m.best_len(2, 6), 6);
+        // A middling rate picks a short draft.
+        let mut m2 = m.clone();
+        m2.reset_rates();
+        for _ in 0..60 {
+            m2.record_draft(1, 3, 1);
+        }
+        let k = m2.best_len(1, 6);
+        assert!(k <= 2, "picked {k}");
+        // Fixed mode always takes the whole draft.
+        let mut f = SpecModel { fixed: true, ..Default::default() };
+        assert_eq!(f.best_len(0, 4), 4);
     }
 
     /// How far integer kernels move hidden states, compared with the seq/batch difference.
