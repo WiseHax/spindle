@@ -4,6 +4,11 @@
 
 ### Speed
 
+Measured on the two-PC setup (Qwen3-30B-A3B Q4_K_M, `moe_prune = 0.1`, `toolsench.ps1`):
+per forward pass 157 → 118 ms (worker 103 → 80 ms, laptop layers 39 → 26 ms, LM head 14.5 →
+8.7 ms); prose 7.5 → 9.2 tok/s, code edit 6.1 → 8.3, list 6.9 → 9.0; prompt processing 15 →
+25 tok/s.
+
 - Integer matrix kernels for Q4_K and Q6_K weights. The activation vector is quantized to
   8 bits once per matrix (one scale per 256 values), and the products run in integers
   (AVX2 `vpmaddubsw` / `vpmaddwd`) with one float multiply per block, the same scheme as
