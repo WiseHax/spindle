@@ -167,6 +167,7 @@ pub fn call_title(call: &ToolCall) -> (&'static str, String) {
         "fetch_url" => ("⇣", format!("Fetch {}", call.str_arg(&["url"]).unwrap_or(""))),
         "code_map" | "repo_map" | "outline" => ("⌕", "Code map".to_string()),
         "recall" => ("▸", format!("Recall {}", call.str_arg(&["id"]).unwrap_or(""))),
+        "todo" | "todo_write" | "tasks" => ("☐", "Tasks".to_string()),
         other => ("▪", other.to_string()),
     }
 }
@@ -204,6 +205,115 @@ fn context_note(engine: &SmolLm2Engine) -> Option<String> {
             "[Context: {used} of {max} tokens used. Prefer narrow reads (offset/limit, grep, code_map) and recall over re-reading whole files.]"
         )
     })
+}
+
+/// How much the agent may do without asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Risky actions ask first (the default).
+    Ask,
+    /// Read-only: the model explores and answers with a plan; edits and commands are refused.
+    Plan,
+    /// Everything the guard allows runs without asking (blocked commands stay blocked).
+    Auto,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Ask => "Agent",
+            Mode::Plan => "Plan",
+            Mode::Auto => "Auto",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Mode::Ask => Mode::Plan,
+            Mode::Plan => Mode::Auto,
+            Mode::Auto => Mode::Ask,
+        }
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Mode::Ask => "Agent mode: risky actions ask first.",
+            Mode::Plan => "Plan mode: read-only. The model looks around and answers with a plan; edits and commands are refused.",
+            Mode::Auto => "Auto mode: edits and commands run without asking (blocked commands stay blocked).",
+        }
+    }
+}
+
+static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn mode() -> Mode {
+    match MODE.load(Ordering::Relaxed) {
+        1 => Mode::Plan,
+        2 => Mode::Auto,
+        _ => Mode::Ask,
+    }
+}
+
+pub fn set_mode(m: Mode) {
+    MODE.store(
+        match m {
+            Mode::Ask => 0,
+            Mode::Plan => 1,
+            Mode::Auto => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn mutates(name: &str) -> bool {
+    matches!(name, "write_file" | "write" | "edit_file" | "edit" | "delete_file" | "run_command" | "bash" | "shell")
+}
+
+/// Text queued for the next turn (output of a `!command`, a resumed session's recap).
+static PENDING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+pub fn queue_context(text: String) {
+    PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+}
+
+fn take_pending() -> Vec<String> {
+    std::mem::take(&mut *PENDING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// `@path` in a prompt attaches that file: its content goes to the model after the message.
+/// Only paths that exist are attached; anything else (an e-mail address, `@user`) is left
+/// alone. Each file is capped so one mention can't fill the context.
+pub fn expand_mentions(prompt: &str, max_each: usize) -> (String, Vec<String>) {
+    let mut attached = Vec::new();
+    let mut extra = String::new();
+    for word in prompt.split_whitespace() {
+        let Some(raw) = word.strip_prefix('@') else { continue };
+        let path = raw.trim_end_matches(['.', ',', ';', ':', ')', '?', '!', '"', '\'']);
+        if path.is_empty() || attached.iter().any(|a| a == path) {
+            continue;
+        }
+        let p = std::path::Path::new(path);
+        if !p.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(p) else { continue };
+        if bytes.iter().take(4096).any(|&b| b == 0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let mut body = String::new();
+        for (i, l) in text.lines().enumerate() {
+            let row = format!("{:>5}\t{l}\n", i + 1);
+            if body.len() + row.len() > max_each {
+                body.push_str(&format!("(file continues: {} lines in total; read_file with offset for the rest)\n", text.lines().count()));
+                break;
+            }
+            body.push_str(&row);
+        }
+        extra.push_str(&format!("\n\n<file path=\"{path}\">\n{body}</file>"));
+        attached.push(path.to_string());
+    }
+    (format!("{prompt}{extra}"), attached)
 }
 
 /// State before one user turn, so `/rewind` can undo the whole turn.
@@ -270,10 +380,24 @@ pub fn run_turn(
     let t0 = Instant::now();
     let mut stats = TurnStats::default();
     let timing0 = engine.timing;
-    let mut input = prompt.to_string();
     let mut seen: HashMap<String, usize> = HashMap::new();
     let aborted = || abort.is_some_and(|a| a.load(Ordering::Relaxed));
     checkpoint(engine, prompt);
+    let mode = mode();
+    // What the model gets: queued context (a !command's output, a resumed session), the
+    // message with any @file attachments, and the mode's rules.
+    let mut input = String::new();
+    for p in take_pending() {
+        input.push_str(&p);
+        input.push_str("\n\n");
+    }
+    let budget0 = output_budget(engine, 1);
+    input.push_str(&expand_mentions(prompt, budget0).0);
+    if mode == Mode::Plan && engine.enable_tools {
+        input.push_str("\n\n[Plan mode: read-only. Explore with read_file, grep, glob and code_map as needed, then answer with a short step-by-step plan. Do not edit files or run commands.]");
+    }
+    let mut auto_yes = |_: &str| true;
+    let confirm: &mut dyn FnMut(&str) -> bool = if mode == Mode::Auto { &mut auto_yes } else { confirm };
 
     for step in 0..=opts.max_steps {
         if aborted() {
@@ -318,6 +442,18 @@ pub fn run_turn(
                 responses.push(out.output);
                 continue;
             }
+            if mode == Mode::Plan && mutates(&call.name) {
+                let out = ToolOutcome {
+                    ok: false,
+                    icon,
+                    title,
+                    output: "Error: plan mode is on, so nothing can be changed or run. Describe this step in your plan instead.".into(),
+                    preview: None,
+                };
+                on_event(AgentEvent::ToolEnd(out.clone()));
+                responses.push(out.output);
+                continue;
+            }
             on_event(AgentEvent::ToolStart { icon, title });
             let mut ctx = ToolCtx { confirm: &mut *confirm, max_chars: budget };
             let out = tools::execute(call, &mut ctx);
@@ -352,6 +488,24 @@ pub fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mentions_attach_existing_files_only() {
+        let dir = std::env::temp_dir().join(format!("spindle_mention_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("notes.txt");
+        std::fs::write(&f, "alpha\nbeta\n").unwrap();
+        let fp = f.to_string_lossy().replace('\\', "/");
+        let (text, att) = expand_mentions(&format!("look at @{fp}, and ping @someone"), 4000);
+        assert_eq!(att, vec![fp.clone()]);
+        assert!(text.contains("<file path=") && text.contains("    2\tbeta"));
+        assert!(text.starts_with("look at @"));
+        let (_, none) = expand_mentions("mail me at a@b.com", 4000);
+        assert!(none.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(Mode::Ask.next(), Mode::Plan);
+        assert!(mutates("edit_file") && !mutates("read_file"));
+    }
 
     /// `/rewind` puts the conversation back exactly where it was before the last turn, and a
     /// new conversation drops the rewind points.

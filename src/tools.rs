@@ -102,6 +102,28 @@ pub fn load_spindle_md() -> Option<String> {
     None
 }
 
+// ------------------------------------------------------------------------------ tasks
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TodoState {
+    Pending,
+    Doing,
+    Done,
+}
+
+static TODOS: Mutex<Vec<(String, TodoState)>> = Mutex::new(Vec::new());
+
+/// The model's current task list (for the sidebar).
+pub fn todos() -> Vec<(String, TodoState)> {
+    TODOS.lock().map(|t| t.clone()).unwrap_or_default()
+}
+
+pub fn clear_todos() {
+    if let Ok(mut t) = TODOS.lock() {
+        t.clear();
+    }
+}
+
 // ------------------------------------------------------------------------ definitions
 
 /// `(name, description, JSON-schema parameters)` for every tool the model is told about.
@@ -126,6 +148,8 @@ const TOOL_DEFS: &[(&str, &str, &str)] = &[
      r#"{"type":"object","properties":{"focus":{"type":"string"},"path":{"type":"string"}}}"#),
     ("recall", "Show more of a long tool result that was shortened. Its id (like v3) is in the note under the result. Give lines (\"120-180\") or find (a text to show with surrounding lines).",
      r#"{"type":"object","properties":{"id":{"type":"string"},"lines":{"type":"string"},"find":{"type":"string"}},"required":["id"]}"#),
+    ("todo", "Keep a short task list for multi-step work, shown to the user. Send the whole list each time, with each task's status: pending, doing or done. Use it for any request with 3 or more steps, and mark a task done as soon as it is.",
+     r#"{"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"task":{"type":"string"},"status":{"type":"string","enum":["pending","doing","done"]}},"required":["task","status"]}}},"required":["items"]}"#),
     ("web_search", "Search the web and return result titles and snippets.",
      r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
     ("fetch_url", "Download a web page and return its text.",
@@ -147,8 +171,14 @@ pub fn tools_system_prompt() -> String {
     s.push_str(
         "</tools>\n\nFor each function call, return a json object with function name and arguments \
          within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n\
-         Work step by step: inspect files before editing them, and after a tool result either call \
-         another tool or give the user a short final answer. Paths are relative to the project directory.",
+         How to work:\n\
+         - Find code with code_map or grep, then read only the lines you need (offset/limit).\n\
+         - Read a file before editing it; copy old_string exactly from what you read.\n\
+         - When a call needs the result of another, make one call and wait for its result.\n\
+         - For a request with 3 or more steps, keep a todo list and update it as you go.\n\
+         - A result that ends with \"saved as v…\" was shortened; use recall for the rest.\n\
+         - Never guess or invent a tool's output. After a result, call the next tool or give a short final answer.\n\
+         Paths are relative to the project directory.",
     );
     s
 }
@@ -525,6 +555,31 @@ pub fn execute(call: &ToolCall, ctx: &mut ToolCtx) -> ToolOutcome {
                 _ => "Code map".to_string(),
             };
             ToolOutcome::ok("⌕", title, code_map(if path.is_empty() { "." } else { &path }, focus, ctx.max_chars))
+        }
+        "todo" | "todo_write" | "tasks" => {
+            let items = match call.args.get("items").or_else(|| call.args.get("todos")).or_else(|| call.args.get("tasks")) {
+                Some(Json::Arr(a)) => a.clone(),
+                _ => return ToolOutcome::err("☐", "Tasks".into(), "expected 'items': a list of {\"task\", \"status\"}".into()),
+            };
+            let list: Vec<(String, TodoState)> = items
+                .iter()
+                .filter_map(|it| {
+                    let task = it.get("task").or_else(|| it.get("content")).or_else(|| it.get("text")).and_then(Json::as_str)?.trim().to_string();
+                    let st = match it.get("status").and_then(Json::as_str).unwrap_or("pending").to_ascii_lowercase().as_str() {
+                        "done" | "completed" | "complete" => TodoState::Done,
+                        "doing" | "in_progress" | "in progress" | "active" => TodoState::Doing,
+                        _ => TodoState::Pending,
+                    };
+                    (!task.is_empty()).then_some((task, st))
+                })
+                .take(20)
+                .collect();
+            let (d, g) = (list.iter().filter(|t| t.1 == TodoState::Done).count(), list.iter().filter(|t| t.1 == TodoState::Doing).count());
+            let n = list.len();
+            if let Ok(mut t) = TODOS.lock() {
+                *t = list;
+            }
+            ToolOutcome::ok("☐", format!("Tasks {d}/{n} done"), format!("Task list updated: {d} done, {g} in progress, {} pending.", n - d - g))
         }
         "recall" => {
             let id = call.str_arg(&["id", "ref"]).unwrap_or("");
@@ -1337,6 +1392,19 @@ mod tests {
         let out2 = read_file(&f.to_string_lossy(), Some(10), Some(5), 20_000);
         assert!(!out2.output.contains("Outline"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn todo_tool_keeps_the_list() {
+        let c = parse_tool_call("<tool_call>{\"name\": \"todo\", \"arguments\": {\"items\": [{\"task\": \"read main.rs\", \"status\": \"done\"}, {\"task\": \"fix bug\", \"status\": \"in_progress\"}, {\"task\": \"run tests\", \"status\": \"pending\"}]}}</tool_call>").unwrap();
+        let mut yes = |_: &str| true;
+        let mut ctx = ToolCtx { confirm: &mut yes, max_chars: 4000 };
+        let out = execute(&c, &mut ctx);
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.title, "Tasks 1/3 done");
+        let t = todos();
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[1], ("fix bug".to_string(), TodoState::Doing));
     }
 
     #[test]

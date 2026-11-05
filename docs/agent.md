@@ -46,6 +46,7 @@ when a small model spells the tags out token by token.
 | `run_command` | run a PowerShell command in the project folder (60 s default timeout, 600 s max) | for risky commands |
 | `code_map` | outline of the project's source files (functions, types, line numbers), ranked by optional focus words | no |
 | `recall` | show more of a shortened tool result: a line range, or the lines around a search text | no |
+| `todo` | the model's task list for multi-step work, shown in the sidebar as `○ pending`, `◐ doing`, `● done` | no |
 | `web_search` | search the web and return titles and snippets | no |
 | `fetch_url` | download a page and return its text | no |
 
@@ -81,6 +82,41 @@ seconds:
 - **Context note.** Once the context is 40% full, each round of results ends with a line saying
   how much is used.
 
+## Modes
+
+Shift+Tab (or `/mode`) switches between three modes, shown in the prompt box's border:
+
+| Mode | |
+|---|---|
+| **Agent** | the default: risky actions ask first |
+| **Plan** | read-only. The model may read, search and map the code, then answers with a step-by-step plan. Edits, deletes and commands are refused, and the model is told so |
+| **Auto** | everything the guard allows runs without asking. Commands the guard blocks stay blocked |
+
+## Talking to the agent
+
+- **`@path`** attaches a file to your message: `explain @src/vault.rs`. Its numbered lines go
+  to the model after your text, within the tool-output budget. Only paths that exist count,
+  so an e-mail address or `@someone` is left alone.
+- **`!command`** runs a command yourself, with the same guard as the agent's `run_command`:
+  `!cargo test`. The output shows as a block, and goes to the model with your next message
+  (as a digest if it is long).
+- **Selecting text.** Drag with the mouse to select; the text is copied to the clipboard when
+  you let go, and the status bar says how much. The selection stays in the pane where it
+  started, so the sidebar doesn't get mixed in. Shift+drag still gives the terminal's own
+  selection.
+- **When a long turn ends** (15 s or more), spindle rings the terminal bell, which makes
+  Windows Terminal flash its taskbar button.
+
+## Sessions
+
+Each conversation is saved to `.spindle/sessions/` in the project folder after every turn.
+
+| Command | |
+|---|---|
+| `/sessions` | list saved conversations, newest first |
+| `/resume [n]` | continue one (default: the newest). Its turns are shown again, and the model gets a compact recap of them with your next message: each prompt, the tools used and the answer, the newest kept in full when the recap would be too long. Old conversations cost a few hundred tokens to pick up, not their full length |
+| `/export [file]` | write this conversation as Markdown |
+
 ## Project notes
 
 If the folder has a `SPINDLE.md` (or `AGENTS.md`), its contents go into the system prompt.
@@ -100,6 +136,8 @@ The full-screen interface (default) and the line-based one (`--no-tui`) share mo
 | `/think on\|off\|show\|hide` | reasoning before answers, and whether it is shown |
 | `/undo` | revert the last file the agent changed (repeat to go further back) |
 | `/rewind` | undo the whole last turn: its file changes and the conversation, and put its prompt back |
+| `/mode [plan\|auto\|ask]` | switch mode (also shift+tab) |
+| `/sessions`, `/resume [n]`, `/export [file]` | saved conversations |
 | `/diff` | `git diff --stat` of the working tree |
 | `/review` | ask the model to review the uncommitted diff |
 | `/compact` | replace the conversation with a summary, to free context |
@@ -142,7 +180,9 @@ Keys in the full-screen interface:
 | ctrl+home / ctrl+end | jump to the top / bottom |
 | ctrl+l | redraw the screen |
 | ctrl+c | quit when the prompt is empty, otherwise clear it |
-| shift+drag | select text with the mouse |
+| shift+tab | switch mode: agent → plan → auto |
+| drag | select text; it is copied when you let go |
+| shift+drag | the terminal's own selection |
 
 While you are scrolled up, new text arriving at the bottom doesn't move what you are
 reading.

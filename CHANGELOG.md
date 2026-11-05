@@ -30,6 +30,34 @@ model can answer. At 25 tok/s a 6,000-token build log costs four minutes.
   resend. Both interfaces.
 - **Context note.** Once the context is 40% full, tool results end with a one-line note on how
   much is used, nudging the model toward narrow reads.
+- **Modes.** Shift+Tab or `/mode` switches between Agent (risky actions ask), Plan (read-only:
+  the model explores and answers with a plan; edits and commands are refused) and Auto (no
+  prompts; blocked commands stay blocked). The prompt box shows the mode.
+- **Task list.** A `todo` tool lets the model keep its plan for multi-step work; the sidebar
+  shows it (`○ ◐ ●`). The system prompt now gives short rules for using the tools well.
+- **`@file` and `!command`.** `@path` in a message attaches that file. `!command` runs a
+  command yourself (same guard as the agent) and gives its output to the model with your next
+  message.
+- **Sessions.** Every conversation is saved to `.spindle/sessions/` after each turn.
+  `/sessions` lists them, `/resume` continues one with a compact recap instead of replaying
+  it, `/export` writes it as Markdown.
+- **Mouse selection.** Drag to select text in the interface; it is copied to the clipboard on
+  release. Before, the interface captured the mouse and only shift+drag selected.
+- The terminal bell rings when a turn of 15 s or more finishes.
+
+### Fixed (agent and interface)
+
+- A command the agent ran could take over the interface: it shared the console, so a script
+  waiting for input read the keys typed into the prompt, and a program that changed the
+  console mode left the prompt unable to read keys. Commands now get no stdin and no console,
+  GUI windows they open still work, and the interface re-applies its console modes after each
+  command.
+- A command that printed more than about 64 KB stalled until its timeout, because its output
+  was only read after it exited. Output is now read while it runs.
+- Tool calls written as `<function_call>` or `<tool_use>` ran, but their markup showed in the
+  reply. They are now handled exactly like `<tool_call>`.
+- Thinking display: a reply whose chat template had already opened `<think>` showed its
+  reasoning as the answer, and a second think block leaked into the text. Both are handled.
 
 ### Speed
 

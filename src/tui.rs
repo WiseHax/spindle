@@ -505,6 +505,8 @@ pub enum KeyAction {
     ScrollUp(usize),
     ScrollDown(usize),
     Tab,
+    /// Shift+Tab: switch mode (Agent / Plan / Auto).
+    BackTab,
     CtrlC,
     CtrlD,
     CtrlP,
@@ -708,6 +710,7 @@ pub fn parse_input_bytes(buf: &[u8]) -> (Vec<KeyAction>, usize) {
                         b'D' if modified => KeyAction::WordLeft,
                         b'H' if modified => KeyAction::ScrollTop,
                         b'F' if modified => KeyAction::ScrollBottom,
+                        b'Z' => KeyAction::BackTab,
                         b'A' => KeyAction::Up,
                         b'B' => KeyAction::Down,
                         b'C' => KeyAction::Right,
@@ -1429,6 +1432,8 @@ Keys
   ctrl+z             undo an edit         esc                 interrupt reply / clear prompt
   wheel, pgup/pgdn   scroll               ctrl+home / ctrl+end  top / bottom
   ctrl+l             redraw               ctrl+c              quit (on an empty prompt)
+  shift+tab          switch mode: agent → plan (read-only) → auto (no prompts)
+  @path              attach a file to the message     !command  run it, output goes to the model
   drag               select text; it is copied when you let go
   shift+drag         the terminal's own selection";
 
@@ -1439,6 +1444,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/think", "reasoning: /think on|off|show|hide"),
     ("/undo", "revert the last file the agent changed"),
     ("/rewind", "undo the whole last turn: its file changes and the conversation"),
+    ("/mode", "agent, plan (read-only) or auto (no prompts): /mode plan|auto|ask"),
+    ("/sessions", "list saved conversations in this folder"),
+    ("/resume", "continue a saved conversation: /resume <number>"),
+    ("/export", "save this conversation as Markdown"),
     ("/diff", "git diff --stat of the working tree"),
     ("/review", "ask the model to review the uncommitted diff"),
     ("/compact", "summarize the conversation and restart from the summary"),
@@ -1521,6 +1530,8 @@ pub struct SpindleTui {
     main_w: u16,
     /// A short message in the status bar, e.g. "Copied 120 characters".
     flash: Option<(String, Instant)>,
+    /// This conversation, saved to `.spindle/sessions` after every turn.
+    session: crate::session::Session,
 }
 
 impl SpindleTui {
@@ -1549,6 +1560,7 @@ impl SpindleTui {
             selecting: false,
             main_w: w,
             flash: None,
+            session: crate::session::Session::default(),
         }
     }
 
@@ -1625,8 +1637,17 @@ impl SpindleTui {
             self.canvas.text(x, ky, max_x, " deny", MUTED, PANEL, false);
             return h;
         }
-        let mode = if self.info.tools { "Agent" } else { "Chat" };
-        let mut label = vec![(mode.to_string(), PRIMARY, true), (self.info.model.clone(), TEXT, false)];
+        let m = agent::mode();
+        let (mode, mode_fg) = if !self.info.tools {
+            ("Chat", PRIMARY)
+        } else {
+            match m {
+                agent::Mode::Ask => ("Agent", PRIMARY),
+                agent::Mode::Plan => ("Plan", ACCENT),
+                agent::Mode::Auto => ("Auto", WARNING),
+            }
+        };
+        let mut label = vec![(mode.to_string(), mode_fg, true), (self.info.model.clone(), TEXT, false)];
         label.push(match &self.info.cluster {
             Some(peer) => (format!("cluster {peer}"), MUTED, false),
             None => ("local".into(), MUTED, false),
@@ -1795,6 +1816,20 @@ impl SpindleTui {
             }
         }
         section(&mut self.canvas, &mut y, if self.info.cluster.is_some() { "Cluster" } else { "Node" }, node);
+        let todos = crate::tools::todos();
+        if !todos.is_empty() {
+            let done = todos.iter().filter(|t| t.1 == crate::tools::TodoState::Done).count();
+            let rows = todos
+                .iter()
+                .take(10)
+                .map(|(t, st)| match st {
+                    crate::tools::TodoState::Done => (format!("● {t}"), MUTED),
+                    crate::tools::TodoState::Doing => (format!("◐ {t}"), ACCENT),
+                    crate::tools::TodoState::Pending => (format!("○ {t}"), TEXT),
+                })
+                .collect();
+            section(&mut self.canvas, &mut y, &format!("Tasks {done}/{}", todos.len()), rows);
+        }
         let files = crate::tools::modified_files();
         if !files.is_empty() {
             let rows = files.into_iter().take(8).map(|f| (f, MUTED)).collect();
@@ -2038,6 +2073,12 @@ impl SpindleTui {
                 }
                 return None;
             }
+            KeyAction::BackTab => {
+                let m = agent::mode().next();
+                agent::set_mode(m);
+                self.flash = Some((m.describe().to_string(), Instant::now()));
+                return None;
+            }
             KeyAction::ScrollUp(_) | KeyAction::ScrollDown(_) | KeyAction::PageUp | KeyAction::PageDown | KeyAction::ScrollTop | KeyAction::ScrollBottom => {
                 // The highlight is in screen cells; scrolling would move the text under it.
                 self.selection = None;
@@ -2172,12 +2213,72 @@ impl SpindleTui {
                     self.input.clear();
                 }
             }
-            KeyAction::None | KeyAction::MouseDown(..) | KeyAction::MouseDrag(..) | KeyAction::MouseUp(..) => {}
+            KeyAction::None | KeyAction::BackTab | KeyAction::MouseDown(..) | KeyAction::MouseDrag(..) | KeyAction::MouseUp(..) => {}
         }
         None
     }
 
     /// Idle loop: renders and edits the prompt until the user submits (or quits).
+    /// Adds the turn that just ended (from the last user entry on) to the saved session.
+    fn record_turn(&mut self, prompt: &str) {
+        let Some(start) = self.entries.iter().rposition(|e| matches!(e, Entry::User(_))) else { return };
+        let mut turn = crate::session::Turn { user: prompt.to_string(), ..Default::default() };
+        for e in &self.entries[start + 1..] {
+            match e {
+                Entry::Assistant { raw, .. } => {
+                    let (_, v, _) = split_reply(raw);
+                    if !v.is_empty() {
+                        if !turn.reply.is_empty() {
+                            turn.reply.push_str("\n\n");
+                        }
+                        turn.reply.push_str(&v);
+                    }
+                }
+                Entry::Tool { title, .. } => turn.tools.push(title.clone()),
+                _ => {}
+            }
+        }
+        self.session.turns.push(turn);
+        let _ = self.session.save();
+    }
+
+    /// `!command`: runs it like the agent's run_command (same guard), shows the output, and
+    /// hands it to the model with the next message.
+    fn run_bang(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        let decision = crate::guard::check_command(cmd);
+        if let crate::guard::GuardDecision::Block(r) = &decision {
+            self.error(&format!("Refused: {r}"));
+            return;
+        }
+        if matches!(decision, crate::guard::GuardDecision::NeedConfirmation(_)) {
+            self.error("This command needs confirmation; ask the agent to run it, or run it in your own terminal.");
+            return;
+        }
+        self.entries.push(Entry::Tool { icon: "❯", title: cmd.to_string(), state: ToolState::Running, error: None, preview: None, block: true });
+        self.render();
+        let (out, code) = crate::guard::run_sandboxed(cmd, Duration::from_secs(120)).unwrap_or_else(|e| (format!("failed to start: {e}"), -1));
+        reassert_console();
+        let lines: Vec<&str> = out.trim_end().lines().collect();
+        let mut prev = lines.iter().take(14).copied().collect::<Vec<_>>().join("\n");
+        if lines.len() > 14 {
+            prev.push_str(&format!("\n… {} more lines", lines.len() - 14));
+        }
+        if code != 0 {
+            prev.push_str(&format!("\n(exit code {code})"));
+        }
+        if let Some(Entry::Tool { state, preview, .. }) = self.entries.last_mut() {
+            *state = if code == 0 { ToolState::Ok } else { ToolState::Failed };
+            *preview = Some(prev);
+        }
+        let body = crate::vault::fit(cmd, out.trim_end(), 6000, crate::vault::Kind::Log);
+        agent::queue_context(format!("[I ran `{cmd}` myself. Exit code {code}. Output:]\n{body}"));
+        self.flash = Some(("Output goes to the model with your next message".into(), Instant::now()));
+    }
+
     fn read_prompt(&mut self) -> Option<String> {
         if let Some(q) = self.queued.take() {
             return Some(q);
@@ -2214,6 +2315,10 @@ impl SpindleTui {
 
 /// Runs one agent turn on a worker thread while the UI stays live.
 fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts: AgentOpts) {
+    let prompt_for_session = prompt.to_string();
+    if tui.session.id.is_empty() {
+        tui.session = crate::session::Session::new(&tui.info.model);
+    }
     tui.entries.push(Entry::User(prompt.to_string()));
     tui.entries.push(Entry::Assistant { raw: String::new(), streaming: true });
     tui.scroll_offset = 0;
@@ -2309,6 +2414,12 @@ fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts
                     *streaming = false;
                 }
                 tui.info.ctx_used = cur_pos;
+                tui.record_turn(&prompt_for_session);
+                // A long turn finished while the user may be looking elsewhere: ring the bell
+                // (Windows Terminal flashes the taskbar button).
+                if stats.wall_secs >= 15.0 && !stats.aborted {
+                    let _ = io::stdout().write_all(b"\x07");
+                }
                 tui.info.last_tps = (stats.tokens > 0).then(|| stats.tok_per_sec());
                 if stats.breakdown.passes > 0 {
                     tui.info.last_timing = Some((stats.breakdown, stats.tokens));
@@ -2430,6 +2541,10 @@ pub fn run_tui(engine: &mut SmolLm2Engine, _governor: Option<&crate::memory_guar
         if matches!(text.as_str(), "/exit" | "/quit" | "/q") {
             break;
         }
+        if let Some(cmd) = text.strip_prefix('!') {
+            tui.run_bang(cmd);
+            continue;
+        }
         if text.starts_with('/') {
             if let Some(prompt) = handle_slash_command(&mut tui, engine, &text, &mut agent_opts) {
                 run_turn(&mut tui, engine, &prompt, agent_opts);
@@ -2463,6 +2578,9 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
         "/new" | "/clear" | "/reset" => {
             tui.entries.clear();
             restart_context(tui, engine);
+            tui.session = crate::session::Session::default();
+            crate::tools::clear_todos();
+            agent::clear_checkpoints();
         }
         "/tools" => {
             let on = match rest.as_str() {
@@ -2494,6 +2612,65 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
                 tui.notice(if opts.allow_think { "Reasoning on (<think> before answering)." } else { "Reasoning off (direct answers)." });
             }
         },
+        "/mode" => {
+            let m = match rest.as_str() {
+                "plan" => agent::Mode::Plan,
+                "auto" => agent::Mode::Auto,
+                "ask" | "agent" | "normal" => agent::Mode::Ask,
+                _ => agent::mode().next(),
+            };
+            agent::set_mode(m);
+            tui.notice(m.describe());
+        }
+        "/sessions" => {
+            let all = crate::session::list();
+            if all.is_empty() {
+                tui.notice("No saved sessions in this folder yet. Sessions are saved to .spindle/sessions after each turn.");
+            } else {
+                let mut s = String::from("Saved sessions (newest first). /resume <number> continues one, /export saves this one as Markdown.\n");
+                for (i, ss) in all.iter().take(15).enumerate() {
+                    s.push_str(&format!("\n  {:>2}. {}  ·  {} turn{}  ·  {}", i + 1, crate::session::fmt_time(ss.started), ss.turns.len(), if ss.turns.len() == 1 { "" } else { "s" }, ss.title()));
+                }
+                tui.notice(&s);
+            }
+        }
+        "/resume" | "/continue" => {
+            let key = if rest.is_empty() { "1".to_string() } else { rest.clone() };
+            match crate::session::find(&key) {
+                Some(old) if old.id == tui.session.id => tui.notice("That is the current session."),
+                Some(old) => {
+                    tui.entries.clear();
+                    restart_context(tui, engine);
+                    for t in &old.turns {
+                        tui.entries.push(Entry::User(t.user.clone()));
+                        for x in &t.tools {
+                            tui.entries.push(Entry::Tool { icon: "▪", title: x.clone(), state: ToolState::Ok, error: None, preview: None, block: false });
+                        }
+                        tui.entries.push(Entry::Assistant { raw: t.reply.clone(), streaming: false });
+                    }
+                    let budget = (engine.max_seq / 4).clamp(1000, 8000) * 3;
+                    agent::queue_context(old.recap(budget));
+                    tui.notice(&format!(
+                        "Resumed \"{}\" ({} turns). The model gets a recap of it with your next message.",
+                        old.title(),
+                        old.turns.len()
+                    ));
+                    tui.session = old;
+                }
+                None => tui.notice("No such session. /sessions lists them."),
+            }
+        }
+        "/export" => {
+            if tui.session.turns.is_empty() {
+                tui.notice("Nothing to export yet.");
+            } else {
+                let name = if rest.is_empty() { format!("spindle-session-{}.md", tui.session.id) } else { rest.clone() };
+                match std::fs::write(&name, tui.session.markdown()) {
+                    Ok(_) => tui.notice(&format!("Saved the conversation to {name}")),
+                    Err(e) => tui.error(&format!("could not write {name}: {e}")),
+                }
+            }
+        }
         "/rewind" => match agent::rewind(engine) {
             Some(rw) => {
                 if let Some(i) = tui.entries.iter().rposition(|e| matches!(e, Entry::User(_))) {

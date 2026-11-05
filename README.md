@@ -33,9 +33,11 @@ or take the whole machine down with them.
 - **A coding agent built for slow hardware.** The model can read, search, edit and delete
   files and run commands. Tool output is budgeted in seconds of prompt processing: long results
   come back as digests (errors, `file:line` locations, the end of the log) with the full text
-  kept for `recall`, and `code_map` finds code without reading whole files. Every risky action
-  asks you first; `/undo` reverts an edit and `/rewind` the whole last turn. See
-  [docs/agent.md](docs/agent.md) and [docs/security.md](docs/security.md).
+  kept for `recall`, and `code_map` finds code without reading whole files. Plan mode is
+  read-only, Auto mode skips the prompts, the model keeps a task list in the sidebar, `@file`
+  attaches files and `!command` runs your own. Every risky action asks you first; `/undo`
+  reverts an edit and `/rewind` the whole last turn. Conversations are saved and can be
+  resumed. See [docs/agent.md](docs/agent.md) and [docs/security.md](docs/security.md).
 - **Safe on small machines.** Weights are memory-mapped. The context is sized to fit free RAM,
   and a working-set governor stops a model larger than RAM from freezing the PC. See
   [docs/architecture.md](docs/architecture.md).

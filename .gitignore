@@ -36,3 +36,6 @@ __pycache__/
 
 # Benchmark logs from tools/bench.ps1
 bench-logs/
+
+# spindle session history
+.spindle/
