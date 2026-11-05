@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Speed
+
+- Integer matrix kernels for Q4_K and Q6_K weights. The activation vector is quantized to
+  8 bits once per matrix (one scale per 256 values), and the products run in integers
+  (AVX2 `vpmaddubsw` / `vpmaddwd`) with one float multiply per block, the same scheme as
+  llama.cpp's CPU backend. Per matrix this is 1.8–2.4x faster on one thread. One Qwen3-30B-A3B
+  MoE layer's expert work (8 experts, 24.5 MB) went from 2.3 ms to 0.94 ms on the laptop's 4
+  threads (10.7 → 26 GB/s). Perplexity on `tools/ppl_sample.txt` (Qwen3-30B-A3B, 256 tokens):
+  9.224 float, 9.207 integer. `--float-kernels` (or `float_kernels = true`,
+  `SPINDLE_FLOAT_KERNELS=1`) switches back; the startup display says which is in use.
+- The chosen experts of a MoE layer run as one fused job: every gate/up row of every expert in
+  one parallel pass, then every output row in a second pass that also sums the experts. That
+  is 2 thread-pool handoffs per layer instead of 3 per expert (24 for 8 experts), and the input
+  is quantized once for all experts. Dense FFNs get the same two-pass form.
+- Batched verify and one-by-one decoding give bit-identical results on all-K-quant models: the
+  integer kernels compute each vector the same way at any batch size, and F32 router matrices
+  now run per vector in a batch too.
+
 ### Fixed
 
 - `spindle.toml` values followed by a comment (`moe_prune = 4  # top 4 experts`) were

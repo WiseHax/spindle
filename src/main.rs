@@ -33,6 +33,7 @@ mod mmap_file;
 mod probe;
 mod quant;
 mod quant_multi;
+mod quant_q8k;
 mod transformer;
 
 use std::{
@@ -796,8 +797,19 @@ struct CliConfig {
     /// `--resident-experts` / `resident_experts = true`: route MoE tokens only among the
     /// experts locked in RAM when a share doesn't fit (changes output; measure with --ppl).
     resident_experts: bool,
+    /// `--float-kernels` / `float_kernels = true`: use the float matrix kernels instead of the
+    /// integer ones (8-bit activations) for Q4_K / Q6_K weights.
+    float_kernels: bool,
     /// `--tui`: launches the full-screen interface (the default; `--no-tui` turns it off).
     tui: bool,
+}
+
+fn kernels_label() -> &'static str {
+    if quant_q8k::enabled() {
+        "integer kernels"
+    } else {
+        "float kernels"
+    }
 }
 
 fn help_text() -> String {
@@ -830,6 +842,8 @@ Model and speed:
   --draft-len <n>             draft tokens per verify step (1..16, default 4)
   --resident-experts          when this PC's share doesn't fit in RAM, route MoE tokens only
                               among the experts kept in RAM (no disk reads; changes output)
+  --float-kernels             use float math for Q4_K/Q6_K weights instead of the faster
+                              integer kernels (8-bit activations, about 2x per matrix)
 
 Chat:
   --tools                     let the model read and edit files and run commands
@@ -954,6 +968,7 @@ fn load_config_file(cfg: &mut CliConfig) {
             "ctx" | "context" => cfg.ctx = num!(usize).or(cfg.ctx),
             "system_prompt" => cfg.system_prompt = Some(val.to_string()),
             "resident_experts" => cfg.resident_experts = flag!().unwrap_or(cfg.resident_experts),
+            "float_kernels" => cfg.float_kernels = flag!().unwrap_or(cfg.float_kernels),
             other => warn(line, format!("unknown setting {other:?}; ignored")),
         }
     }
@@ -1013,6 +1028,7 @@ fn parse_cli() -> CliConfig {
         bench: None,
         ppl: None,
         resident_experts: false,
+        float_kernels: false,
     };
 
     // Load defaults from spindle.toml if present in current directory
@@ -1163,6 +1179,14 @@ fn parse_cli() -> CliConfig {
             }
             "--all-experts" => {
                 cfg.resident_experts = false;
+                i += 1;
+            }
+            "--float-kernels" => {
+                cfg.float_kernels = true;
+                i += 1;
+            }
+            "--int-kernels" => {
+                cfg.float_kernels = false;
                 i += 1;
             }
             "--bench" => {
@@ -1352,6 +1376,9 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
     let cli = parse_cli();
+    if cli.float_kernels {
+        quant_q8k::set_enabled(false);
+    }
     if let Some(n) = cli.ctx {
         // Read by the engine when it sizes the KV-cache (before any worker threads exist).
         std::env::set_var("CHAT_CTX", n.to_string());
@@ -1463,7 +1490,7 @@ fn main() -> Result<()> {
                     engine.set_moe_prune(p);
                 }
                 if let Some(l) = loader.as_ref() {
-                    l.step("Threads", "").done(&format!("{n_threads} compute threads"));
+                    l.step("Threads", "").done(&format!("{n_threads} compute threads · {}", kernels_label()));
                 }
                 // Kept alive while the node serves.
                 let _governor = setup_memory(&cli, &mut engine, loader.as_ref());
@@ -1649,7 +1676,7 @@ fn main() -> Result<()> {
             }
             engine.set_sampler(cli.sampler);
             if let Some(l) = loader.as_ref() {
-                let mut parts = vec![format!("{n_threads} compute threads")];
+                let mut parts = vec![format!("{n_threads} compute threads"), kernels_label().into()];
                 if engine.speculate {
                     parts.push(if engine.draft_engine.is_some() { "draft-model speculation".into() } else { "prompt-lookup speculation".into() });
                 }
