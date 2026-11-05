@@ -854,54 +854,107 @@ Settings in ./spindle.toml are read first; command-line options override them.
     )
 }
 
+/// `key = value` lines of a spindle.toml, as `(line number, key, value)`. Handles `#`
+/// comments on their own line and after a value (outside quotes), and strips quotes.
+fn parse_config(content: &str) -> Vec<(usize, String, String)> {
+    let mut out = Vec::new();
+    for (i, raw) in content.lines().enumerate() {
+        // Cut a trailing comment, but not a '#' inside a quoted value.
+        let mut quote: Option<char> = None;
+        let mut end = raw.len();
+        for (j, ch) in raw.char_indices() {
+            match (quote, ch) {
+                (None, '"') | (None, '\'') => quote = Some(ch),
+                (Some(q), c) if c == q => quote = None,
+                (None, '#') => {
+                    end = j;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let line = raw[..end].trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let v = v.trim();
+            let v = v.strip_prefix('"').and_then(|x| x.strip_suffix('"')).or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\''))).unwrap_or(v);
+            out.push((i + 1, k.trim().to_string(), v.to_string()));
+        } else {
+            out.push((i + 1, line.to_string(), String::new()));
+        }
+    }
+    out
+}
+
 fn load_config_file(cfg: &mut CliConfig) {
     let content = match std::fs::read_to_string("spindle.toml") {
         Ok(s) => s,
         Err(_) => return,
     };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once('=') {
-            let key = k.trim();
-            let val = v.trim().trim_matches('"').trim_matches('\'');
-            match key {
-                "model" => cfg.path = val.to_string(),
-                "peer" => cfg.peer_addr = val.parse().ok(),
-                "layer_range" => {
-                    let parts: Vec<&str> = if val.contains("..") {
-                        val.split("..").collect()
-                    } else if val.contains('-') {
-                        val.split('-').collect()
-                    } else {
-                        vec![val]
-                    };
-                    if parts.len() == 2 {
-                        if let (Ok(s), Ok(e)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
-                            cfg.layer_range = Some(s..e);
-                        }
+    // A setting that doesn't parse is reported, never silently ignored.
+    let warn = |line: usize, msg: String| eprintln!("spindle.toml line {line}: {msg}");
+    for (line, key, val) in parse_config(&content) {
+        let val = val.as_str();
+        macro_rules! num {
+            ($t:ty) => {
+                match val.parse::<$t>() {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        warn(line, format!("{key} = {val:?} is not a number; ignored"));
+                        None
                     }
                 }
-                "wire_format" => match val.to_lowercase().as_str() {
-                    "fp8" => cfg.wire_format = cluster_net::WireFormat::Fp8,
-                    "fp32" => cfg.wire_format = cluster_net::WireFormat::Fp32,
-                    _ => cfg.wire_format = cluster_net::WireFormat::Fp16,
-                },
-                "threads" => cfg.threads = val.parse().ok(),
-                "moe_prune" => cfg.moe_prune = val.parse().ok(),
-                "tools" => cfg.tools = val.parse().unwrap_or(false),
-                "tui" => cfg.tui = val.parse().unwrap_or(false),
-                "think" => cfg.think = val.parse().unwrap_or(false),
-                "draft" => cfg.draft_path = Some(val.to_string()),
-                "draft_len" => cfg.draft_len = val.parse().ok(),
-                "speculate" => cfg.speculate = val.parse().ok(),
-                "ctx" | "context" => cfg.ctx = val.parse().ok(),
-                "system_prompt" => cfg.system_prompt = Some(val.to_string()),
-                "resident_experts" => cfg.resident_experts = val.parse().unwrap_or(false),
-                _ => {}
+            };
+        }
+        macro_rules! flag {
+            () => {
+                match val {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => {
+                        warn(line, format!("{key} = {val:?} must be true or false; ignored"));
+                        None
+                    }
+                }
+            };
+        }
+        match key.as_str() {
+            "model" => cfg.path = val.to_string(),
+            "peer" => match val.parse() {
+                Ok(p) => cfg.peer_addr = Some(p),
+                Err(_) => warn(line, format!("peer = {val:?} is not an ip:port address; ignored")),
+            },
+            "layer_range" => {
+                let parts: Vec<&str> = if val.contains("..") {
+                    val.split("..").collect()
+                } else {
+                    val.split('-').collect()
+                };
+                match (parts.len(), parts.first().map(|x| x.trim().parse::<usize>()), parts.get(1).map(|x| x.trim().parse::<usize>())) {
+                    (2, Some(Ok(a)), Some(Ok(b))) => cfg.layer_range = Some(a..b),
+                    _ => warn(line, format!("layer_range = {val:?} should look like \"35..48\"; ignored")),
+                }
             }
+            "wire_format" => match val.to_lowercase().as_str() {
+                "fp8" => cfg.wire_format = cluster_net::WireFormat::Fp8,
+                "fp16" => cfg.wire_format = cluster_net::WireFormat::Fp16,
+                "fp32" => cfg.wire_format = cluster_net::WireFormat::Fp32,
+                _ => warn(line, format!("wire_format = {val:?} must be fp8, fp16 or fp32; ignored")),
+            },
+            "threads" => cfg.threads = num!(usize).or(cfg.threads),
+            "moe_prune" => cfg.moe_prune = num!(f32).or(cfg.moe_prune),
+            "tools" => cfg.tools = flag!().unwrap_or(cfg.tools),
+            "tui" => cfg.tui = flag!().unwrap_or(cfg.tui),
+            "think" => cfg.think = flag!().unwrap_or(cfg.think),
+            "draft" => cfg.draft_path = Some(val.to_string()),
+            "draft_len" => cfg.draft_len = num!(usize).or(cfg.draft_len),
+            "speculate" => cfg.speculate = flag!().or(cfg.speculate),
+            "ctx" | "context" => cfg.ctx = num!(usize).or(cfg.ctx),
+            "system_prompt" => cfg.system_prompt = Some(val.to_string()),
+            "resident_experts" => cfg.resident_experts = flag!().unwrap_or(cfg.resident_experts),
+            other => warn(line, format!("unknown setting {other:?}; ignored")),
         }
     }
 }
@@ -1975,4 +2028,24 @@ fn main() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::parse_config;
+
+    #[test]
+    fn inline_comments_and_quotes() {
+        let c = "# header\nmodel = \"a#b.gguf\"  # the model\nmoe_prune = 4          # top 4\nctx = 8192 # both PCs\n\nthink = false\n";
+        let v: Vec<(String, String)> = parse_config(c).into_iter().map(|(_, k, v)| (k, v)).collect();
+        assert_eq!(
+            v,
+            vec![
+                ("model".into(), "a#b.gguf".into()),
+                ("moe_prune".into(), "4".into()),
+                ("ctx".into(), "8192".into()),
+                ("think".into(), "false".into()),
+            ]
+        );
+    }
 }

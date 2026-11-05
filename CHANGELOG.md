@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- `spindle.toml` values followed by a comment (`moe_prune = 4  # top 4 experts`) were
+  silently ignored, because the comment was read as part of the value. The `spindle.toml`
+  shipped with 1.0 had such comments, so `moe_prune`, `ctx`, `tools` and `speculate` from it
+  did not apply. Comments after a value now work (a `#` inside quotes is kept), and a value
+  that doesn't parse or an unknown setting prints a warning with its line number.
+
 ### Startup
 
 - The system prompt's KV entries are saved to disk after the first start (on the client and
