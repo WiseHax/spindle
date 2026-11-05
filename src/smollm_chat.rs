@@ -512,6 +512,8 @@ pub struct PinPlan {
     pub coverage: Option<f64>,
     /// Whether any usage history existed.
     pub has_stats: bool,
+    /// Whether the previous start's pin set was reused unchanged.
+    pub reused: bool,
 }
 
 impl PinPlan {
@@ -521,6 +523,7 @@ impl PinPlan {
 }
 
 const EXPERT_STATS_MAGIC: &[u8; 4] = b"SPEX";
+const PIN_LIST_MAGIC: &[u8; 4] = b"SPPN";
 
 /// Prompt cache file format (see `save_prompt_kv`). Bump the version when the layout or the
 /// numerics of the KV entries change.
@@ -2000,7 +2003,21 @@ impl SmolLm2Engine {
         let expert_budget = budget.saturating_sub(expert_headroom);
         let total_prior: u64 = self.prior_picks.iter().map(|&c| c as u64).sum();
         let mut covered = 0u64;
-        for (layer, e, count) in self.hot_experts() {
+        // Reuse the previous start's pin set when it still fits and fills most of the budget.
+        // A stable set keeps resident-only routing (and its prompt cache) the same from one
+        // start to the next; free RAM moving by a few hundred MB shouldn't change the routing.
+        let room = expert_budget.saturating_sub(total);
+        let saved = self.load_pin_list().filter(|list| {
+            let bytes: usize = list.iter().map(|&(l, e)| self.expert_bytes(l, e)).sum();
+            bytes <= room && bytes as f64 >= room as f64 * 0.85
+        });
+        let reused = saved.is_some();
+        let order: Vec<(usize, usize)> = match saved {
+            Some(list) => list,
+            None => self.hot_experts().into_iter().map(|(l, e, _)| (l, e)).collect(),
+        };
+        let n_expert = self.cfg.n_expert.max(1);
+        for (layer, e) in order {
             let FfnKind::Moe(m) = &self.layers[layer - self.layer_range.start].ffn else { continue };
             let spans = m.experts.expert(e).spans();
             let bytes: usize = spans.iter().map(|s| s.1).sum();
@@ -2011,7 +2028,11 @@ impl SmolLm2Engine {
             chosen.extend(spans);
             plan.experts += 1;
             plan.pinned.push((layer, e));
-            covered += count as u64;
+            covered += self.prior_picks.get(layer * n_expert + e).copied().unwrap_or(0) as u64;
+        }
+        plan.reused = reused;
+        if !reused && !plan.pinned.is_empty() {
+            let _ = self.save_pin_list(&plan.pinned);
         }
         if total == 0 || !crate::memory_guard::allow_locking((total + 64 * 1024 * 1024) as u64) {
             return plan;
@@ -2126,6 +2147,53 @@ impl SmolLm2Engine {
         }
         self.reset_kv();
         ((nll / scored.max(1) as f64).exp(), scored)
+    }
+
+    fn expert_bytes(&self, layer: usize, e: usize) -> usize {
+        match self.layer_range.contains(&layer).then(|| &self.layers[layer - self.layer_range.start].ffn) {
+            Some(FfnKind::Moe(m)) if e < m.n_expert => m.experts.expert(e).bytes(),
+            _ => usize::MAX / 4,
+        }
+    }
+
+    /// `<model>.pins-<layers>.bin`: the experts the last start kept in RAM.
+    fn pin_list_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.pins-{}-{}.bin", self.path, self.layer_range.start, self.layer_range.end))
+    }
+
+    fn load_pin_list(&self) -> Option<Vec<(usize, usize)>> {
+        let b = std::fs::read(self.pin_list_path()).ok()?;
+        if b.len() < 8 || &b[0..4] != PIN_LIST_MAGIC || (b.len() - 8) % 8 != 0 {
+            return None;
+        }
+        let n = u32::from_le_bytes(b[4..8].try_into().ok()?) as usize;
+        if b.len() != 8 + n * 8 {
+            return None;
+        }
+        let list: Vec<(usize, usize)> = (0..n)
+            .map(|i| {
+                let at = 8 + i * 8;
+                let l = u32::from_le_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+                let e = u32::from_le_bytes(b[at + 4..at + 8].try_into().unwrap()) as usize;
+                (l, e)
+            })
+            .collect();
+        // Every entry must be one of this node's experts.
+        list.iter().all(|&(l, e)| self.expert_bytes(l, e) < usize::MAX / 4).then_some(list)
+    }
+
+    fn save_pin_list(&self, list: &[(usize, usize)]) -> std::io::Result<()> {
+        let mut b = Vec::with_capacity(8 + list.len() * 8);
+        b.extend_from_slice(PIN_LIST_MAGIC);
+        b.extend_from_slice(&(list.len() as u32).to_le_bytes());
+        for &(l, e) in list {
+            b.extend_from_slice(&(l as u32).to_le_bytes());
+            b.extend_from_slice(&(e as u32).to_le_bytes());
+        }
+        let path = self.pin_list_path();
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &b)?;
+        std::fs::rename(&tmp, &path)
     }
 
     /// This node's experts that earlier sessions picked, most picked first:

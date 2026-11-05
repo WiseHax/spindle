@@ -40,6 +40,10 @@
   it on your model and split with `--ppl` before using it. With every expert resident it is
   exact (tested). On a cluster the worker restricts its own layers to its own pinned set
   (`FRAME_SET_EXPERT_MODE`, a new frame).
+- The set of experts kept in RAM is saved (`<model>.pins-<layers>.bin`) and reused on the
+  next start while it still fits and fills at least 85% of the budget. Resident-only routing
+  then stays the same from start to start, so its prompt cache keeps working. Before, the
+  set shifted slightly with free RAM, and every start recomputed the system prompt.
 
 ### Measuring (more)
 

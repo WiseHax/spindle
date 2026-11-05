@@ -1305,10 +1305,11 @@ fn setup_memory(cli: &CliConfig, engine: &mut smollm_chat::SmolLm2Engine, loader
             engine.set_resident_experts(&plan.pinned);
             let msg = match (plan.has_stats, plan.coverage) {
                 (true, Some(c)) => format!(
-                    "{} in RAM: attention + {} most-used experts ({:.0}% of past picks); the rest read from disk",
+                    "{} in RAM: attention + {} most-used experts ({:.0}% of past picks{}); the rest read from disk",
                     loading::fmt_bytes(pinned),
                     loading::fmt_count(plan.experts),
-                    c * 100.0
+                    c * 100.0,
+                    if plan.reused { ", same set as last start" } else { "" }
                 ),
                 _ => format!(
                     "{} in RAM (attention and routers{}). No expert history yet: it is recorded as you chat, and the next start keeps the most-used experts in RAM",
