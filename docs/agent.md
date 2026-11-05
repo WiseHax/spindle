@@ -44,11 +44,42 @@ when a small model spells the tags out token by token.
 | `edit_file` | replace an exact string, which must be unique unless `replace_all`; works with CRLF files and suggests near matches when the string isn't found | outside the project folder |
 | `delete_file` | delete a file | always |
 | `run_command` | run a PowerShell command in the project folder (60 s default timeout, 600 s max) | for risky commands |
+| `code_map` | outline of the project's source files (functions, types, line numbers), ranked by optional focus words | no |
+| `recall` | show more of a shortened tool result: a line range, or the lines around a search text | no |
 | `web_search` | search the web and return titles and snippets | no |
 | `fetch_url` | download a page and return its text | no |
 
 Every write, edit and delete first saves what was there before, so `/undo` can put it back.
-For a file the agent created, `/undo` removes it.
+For a file the agent created, `/undo` removes it. `/rewind` goes further: it undoes the whole
+last turn, every file it changed and the conversation itself, and puts the turn's prompt back
+in the input box. The conversation goes back without recomputing anything, because the KV
+cache from before the turn is still in memory; only the position moves. If the context window
+has slid since that turn, only the files are restored.
+
+## Made for slow hardware
+
+On a CPU the model has to process every token of tool output before it can answer, and on two
+PCs that runs at about 25 tok/s. So the agent treats tool output as a budget measured in
+seconds:
+
+- **Budget.** One round of tool results gets at most what this machine processes in about 30
+  seconds, measured from the session's own prompt speed (`SPINDLE_TOOL_SECS=n` changes it), and
+  at most a third of the free context. On a fast small model that is the old limit; on the
+  two-PC setup it is about 750 tokens.
+- **Vault.** Output that doesn't fit is not thrown away. The model gets a digest and a note like
+  `saved as v3`, and `recall {"id": "v3", "lines": "120-180"}` or
+  `recall {"id": "v3", "find": "panicked"}` brings back any part of it. The vault holds up to
+  16 MB per session.
+- **Digests that keep the signal.** For command output: the first lines, every line with an
+  error, warning, failure, panic, traceback or `file:line` location (plus one line around
+  each), and as much of the end as fits, with `…` where lines were dropped. A 600-line cargo
+  build with one type error comes back as about 20 lines that still name the error, the file
+  and the line.
+- **Find before reading.** `code_map` lists files with their declarations and line numbers,
+  ranked by focus words, and a long source file opened from the top starts with its outline.
+  Both let the model read 40 lines at the right offset instead of 4,000 from the top.
+- **Context note.** Once the context is 40% full, each round of results ends with a line saying
+  how much is used.
 
 ## Project notes
 
@@ -68,6 +99,7 @@ The full-screen interface (default) and the line-based one (`--no-tui`) share mo
 | `/tools on\|off` | turn tools on or off |
 | `/think on\|off\|show\|hide` | reasoning before answers, and whether it is shown |
 | `/undo` | revert the last file the agent changed (repeat to go further back) |
+| `/rewind` | undo the whole last turn: its file changes and the conversation, and put its prompt back |
 | `/diff` | `git diff --stat` of the working tree |
 | `/review` | ask the model to review the uncommitted diff |
 | `/compact` | replace the conversation with a summary, to free context |

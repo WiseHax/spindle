@@ -30,9 +30,12 @@ or take the whole machine down with them.
 - **MoE expert pruning.** Optionally run fewer of the routed experts per token, for example
   4 of Qwen3's 8. This trades a little quality for speed. See
   [docs/moe_pruning.md](docs/moe_pruning.md).
-- **A coding agent.** The model can read, search, edit and delete files and run commands.
-  Every risky action asks you first, and `/undo` reverts edits. See [docs/agent.md](docs/agent.md)
-  and [docs/security.md](docs/security.md).
+- **A coding agent built for slow hardware.** The model can read, search, edit and delete
+  files and run commands. Tool output is budgeted in seconds of prompt processing: long results
+  come back as digests (errors, `file:line` locations, the end of the log) with the full text
+  kept for `recall`, and `code_map` finds code without reading whole files. Every risky action
+  asks you first; `/undo` reverts an edit and `/rewind` the whole last turn. See
+  [docs/agent.md](docs/agent.md) and [docs/security.md](docs/security.md).
 - **Safe on small machines.** Weights are memory-mapped. The context is sized to fit free RAM,
   and a working-set governor stops a model larger than RAM from freezing the PC. See
   [docs/architecture.md](docs/architecture.md).

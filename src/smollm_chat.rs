@@ -2144,6 +2144,8 @@ impl SmolLm2Engine {
             draft.cur_pos = 0;
             draft.n_keep = 0;
         }
+        // Rewind points belong to the conversation that just ended.
+        self.kv_branches.retain(|k, _| !k.starts_with("__rewind_"));
     }
 
     /// Saves a named snapshot of the current KV-cache position for zero-cost branching.

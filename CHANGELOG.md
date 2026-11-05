@@ -6,6 +6,31 @@ About 25% faster per token on the two-PC setup, at near-full quality, and prompt
 about 1.7x faster. A 1.1 worker and a 1.0 client (or the other way round) still work together:
 every new frame is optional.
 
+### Agent
+
+Built around one fact: on a CPU, every token of tool output must be processed before the
+model can answer. At 25 tok/s a 6,000-token build log costs four minutes.
+
+- **Budgeted by seconds, not just by context.** Each round of tool results is limited to what
+  this machine processes in about 30 seconds (measured from the session's own prompt speed,
+  `SPINDLE_TOOL_SECS` to change), as well as to a third of the free context.
+- **Output vault and `recall`.** A result that doesn't fit is never just cut. The model gets a
+  digest, and the full text is kept for the session under a short id (`v3`). The new `recall`
+  tool shows any line range of it, or the lines around a search text. For command output the
+  digest keeps what matters: the command, every error, warning, failing test and `file:line`
+  location with a line of context, and as much of the end of the log as fits.
+- **`code_map` tool.** An outline of the project's source files with their functions and types
+  and line numbers, ranked by focus words (or by most recently changed), within the budget.
+  The model can find where things are without reading whole files.
+- **Outlines on long reads.** Opening a long source file from the top now starts with its
+  outline (declarations and line numbers), so the next read can jump to the right place.
+- **`/rewind`.** Undoes the whole last turn: every file it changed, and the conversation
+  itself. The conversation goes back for free, because the KV cache before the turn is still
+  there; nothing is recomputed. The turn's prompt goes back into the input box to edit and
+  resend. Both interfaces.
+- **Context note.** Once the context is 40% full, tool results end with a one-line note on how
+  much is used, nudging the model toward narrow reads.
+
 ### Speed
 
 Measured on the two-PC setup (Qwen3-30B-A3B Q4_K_M, `moe_prune = 0.1`, `toolsench.ps1`):

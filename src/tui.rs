@@ -1228,6 +1228,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tools", "toggle agent tools: /tools on|off"),
     ("/think", "reasoning: /think on|off|show|hide"),
     ("/undo", "revert the last file the agent changed"),
+    ("/rewind", "undo the whole last turn: its file changes and the conversation"),
     ("/diff", "git diff --stat of the working tree"),
     ("/review", "ask the model to review the uncommitted diff"),
     ("/compact", "summarize the conversation and restart from the summary"),
@@ -2204,6 +2205,38 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
                 tui.info.think = opts.allow_think;
                 tui.notice(if opts.allow_think { "Reasoning on (<think> before answering)." } else { "Reasoning off (direct answers)." });
             }
+        },
+        "/rewind" => match agent::rewind(engine) {
+            Some(rw) => {
+                if let Some(i) = tui.entries.iter().rposition(|e| matches!(e, Entry::User(_))) {
+                    tui.entries.truncate(i);
+                }
+                let mut msg = String::from(if rw.conversation {
+                    "Rewound the last turn: the conversation is back to before it"
+                } else {
+                    "Restored the files of the last turn (the context window has moved since, so the conversation stays)"
+                });
+                let n = rw.files.len();
+                msg.push_str(&match n {
+                    0 => ". It changed no files.".to_string(),
+                    1 => ", and 1 file change was undone.".to_string(),
+                    _ => format!(", and {n} file changes were undone."),
+                });
+                for r in &rw.files {
+                    match r {
+                        Ok(m) => msg.push_str(&format!("
+  {m}")),
+                        Err(e) => msg.push_str(&format!("
+  {e}")),
+                    }
+                }
+                tui.notice(&msg);
+                tui.input.snapshot();
+                tui.input.text.clear();
+                tui.input.cursor = 0;
+                tui.input.insert_str(&rw.prompt);
+            }
+            None => tui.notice("Nothing to rewind in this conversation."),
         },
         "/undo" => match crate::tools::pop_undo() {
             Some(Ok(m)) => tui.notice(&m),

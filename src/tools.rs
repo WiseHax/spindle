@@ -15,6 +15,7 @@ use std::{
 use crate::{
     guard::{self, GuardDecision},
     json::{self, Json},
+    vault,
 };
 
 // ------------------------------------------------------------------------------- undo
@@ -55,6 +56,23 @@ pub fn pop_undo_path(target_path: &str) -> Option<Result<String, String>> {
         stack.remove(idx)
     };
     Some(restore(path, prev))
+}
+
+/// Number of file changes recorded so far (a checkpoint for `undo_to`).
+pub fn undo_len() -> usize {
+    UNDO_STACK.lock().map_or(0, |s| s.len())
+}
+
+/// Reverts every file change made after checkpoint `len`, newest first.
+pub fn undo_to(len: usize) -> Vec<Result<String, String>> {
+    let mut out = Vec::new();
+    while undo_len() > len {
+        match pop_undo() {
+            Some(r) => out.push(r),
+            None => break,
+        }
+    }
+    out
 }
 
 /// Distinct files the agent changed this session (most recent first), for the UI sidebar.
@@ -104,6 +122,10 @@ const TOOL_DEFS: &[(&str, &str, &str)] = &[
      r#"{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"}},"required":["pattern"]}"#),
     ("run_command", "Run a shell command (PowerShell on Windows) in the project directory and return its output.",
      r#"{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"seconds (default 60, max 600)"}},"required":["command"]}"#),
+    ("code_map", "Outline of the project's source code: each file with its functions, types and line numbers, most relevant first. Use it to find where things are before reading files. Optional focus: words to rank files by, e.g. \"tokenizer cache\".",
+     r#"{"type":"object","properties":{"focus":{"type":"string"},"path":{"type":"string"}}}"#),
+    ("recall", "Show more of a long tool result that was shortened. Its id (like v3) is in the note under the result. Give lines (\"120-180\") or find (a text to show with surrounding lines).",
+     r#"{"type":"object","properties":{"id":{"type":"string"},"lines":{"type":"string"},"find":{"type":"string"}},"required":["id"]}"#),
     ("web_search", "Search the web and return result titles and snippets.",
      r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#),
     ("fetch_url", "Download a web page and return its text.",
@@ -438,7 +460,7 @@ pub fn execute(call: &ToolCall, ctx: &mut ToolCtx) -> ToolOutcome {
             let q = call.str_arg(&["query", "q"]).unwrap_or("");
             let title = format!("Search \"{q}\"");
             match tool_search_web(q) {
-                Ok(o) => ToolOutcome::ok("◎", title, truncate_middle(&o, ctx.max_chars)),
+                Ok(o) => ToolOutcome::ok("◎", title.clone(), vault::fit(&title, &o, ctx.max_chars, vault::Kind::Text)),
                 Err(e) => ToolOutcome::err("◎", title, e),
             }
         }
@@ -446,8 +468,25 @@ pub fn execute(call: &ToolCall, ctx: &mut ToolCtx) -> ToolOutcome {
             let url = call.str_arg(&["url"]).unwrap_or("");
             let title = format!("Fetch {url}");
             match fetch_url(url) {
-                Ok(o) => ToolOutcome::ok("⇣", title, truncate_middle(&o, ctx.max_chars)),
+                Ok(o) => ToolOutcome::ok("⇣", title.clone(), vault::fit(&title, &o, ctx.max_chars, vault::Kind::Text)),
                 Err(e) => ToolOutcome::err("⇣", title, e),
+            }
+        }
+        "code_map" | "repo_map" | "outline" => {
+            let focus = call.str_arg(&["focus", "query", "pattern"]);
+            let title = match focus {
+                Some(f) if !f.trim().is_empty() => format!("Code map \"{}\"", f.trim()),
+                _ => "Code map".to_string(),
+            };
+            ToolOutcome::ok("⌕", title, code_map(if path.is_empty() { "." } else { &path }, focus, ctx.max_chars))
+        }
+        "recall" => {
+            let id = call.str_arg(&["id", "ref"]).unwrap_or("");
+            let lines = call.str_arg(&["lines", "range"]);
+            let find = call.str_arg(&["find", "query", "pattern"]);
+            match vault::recall(id, lines, find, ctx.max_chars) {
+                Ok((t, body)) => ToolOutcome::ok("▸", format!("Recall {id} ({t})"), body),
+                Err(e) => ToolOutcome::err("▸", format!("Recall {id}"), e),
             }
         }
         other => ToolOutcome::err(
@@ -493,6 +532,15 @@ fn read_file(path: &str, offset: Option<usize>, limit: Option<usize>, max_chars:
     let start = (first - 1).min(total);
     let count = limit.unwrap_or(250).min(total - start);
     let mut out = String::new();
+    // A long file opened from the top: lead with its outline, so the next read can jump
+    // straight to the right place instead of paging through the whole file.
+    if offset.is_none() && limit.is_none() && total > count {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let outline = file_outline(&lines, ext, max_chars / 3);
+        if !outline.is_empty() {
+            out.push_str(&format!("Outline of {path} ({total} lines):\n{outline}\nFirst lines:\n"));
+        }
+    }
     let mut shown = 0;
     for (i, line) in lines[start..start + count].iter().enumerate() {
         let l: String = if line.chars().count() > 400 { line.chars().take(400).chain("…".chars()).collect() } else { line.to_string() };
@@ -807,7 +855,8 @@ fn grep_tool(pattern: &str, path: &str, include: Option<&str>, max_chars: usize)
     if n == 0 {
         out = format!("No matches for '{pattern}'.\n");
     }
-    ToolOutcome::ok("⌕", format!("{title} ({n} {})", if n == 1 { "match" } else { "matches" }), truncate_middle(&out, max_chars))
+    let body = vault::fit(&title, &out, max_chars, vault::Kind::Text);
+    ToolOutcome::ok("⌕", format!("{title} ({n} {})", if n == 1 { "match" } else { "matches" }), body)
 }
 
 // ------------------------------------------------------------------- shell and web
@@ -828,7 +877,7 @@ fn run_command(cmd: &str, timeout_s: usize, ctx: &mut ToolCtx) -> ToolOutcome {
     }
     match guard::run_sandboxed(cmd, Duration::from_secs(timeout_s as u64)) {
         Ok((out, code)) => {
-            let body = truncate_middle(out.trim_end(), ctx.max_chars.saturating_sub(64).max(512));
+            let body = vault::fit(cmd, out.trim_end(), ctx.max_chars.saturating_sub(64).max(512), vault::Kind::Log);
             let mut o = ToolOutcome {
                 ok: code == 0,
                 icon: "❯",
@@ -1009,6 +1058,142 @@ fn strip_html(input: &str) -> String {
 // ------------------------------------------------------------------- symbol search
 
 /// Scans source files for declarations (fn/struct/class/...) whose line contains `pattern`.
+const SOURCE_EXTS: &[&str] = &["rs", "py", "js", "ts", "jsx", "tsx", "go", "c", "cpp", "h", "hpp"];
+
+/// Top-level declarations of one file as `line: text` rows, within `max` bytes.
+fn file_outline(lines: &[&str], ext: &str, max: usize) -> String {
+    if !SOURCE_EXTS.contains(&ext) {
+        return String::new();
+    }
+    let mut rows = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let indent = line.len() - line.trim_start().len();
+        let t = line.trim();
+        // Top level and one level in (methods inside impl / class blocks).
+        if indent <= 4 && is_decl_line(t, ext) {
+            let t = t.trim_end_matches('{').trim_end();
+            let t: String = t.chars().take(110).collect();
+            rows.push(format!("{:>5}: {}{t}", i + 1, if indent > 0 { "  " } else { "" }));
+        }
+    }
+    let mut out = String::new();
+    for (k, r) in rows.iter().enumerate() {
+        if out.len() + r.len() + 1 > max {
+            out.push_str(&format!("  … {} more\n", rows.len() - k));
+            break;
+        }
+        out.push_str(r);
+        out.push('\n');
+    }
+    out
+}
+
+/// The `code_map` tool: source files with their outlines, ranked by the focus words (or by
+/// most recently changed), within `max` bytes. Files that don't fit are listed by name.
+pub fn code_map(path: &str, focus: Option<&str>, max: usize) -> String {
+    let root = Path::new(path);
+    if !root.exists() {
+        return format!("Error: path '{path}' does not exist");
+    }
+    let words: Vec<String> = focus
+        .unwrap_or("")
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| w.len() >= 2)
+        .map(|w| w.to_lowercase())
+        .collect();
+    struct F {
+        path: String,
+        lines: usize,
+        outline: Vec<(usize, String)>,
+        score: f64,
+        mtime: std::time::SystemTime,
+    }
+    let mut files = Vec::new();
+    for f in walk_files(root, 20_000) {
+        let ext = f.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if !SOURCE_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&f) else { continue };
+        if meta.len() > 4 << 20 {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&f) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        let mut outline = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let indent = line.len() - line.trim_start().len();
+            let t = line.trim();
+            if indent <= 4 && is_decl_line(t, &ext) {
+                let t = t.trim_end_matches('{').trim_end();
+                outline.push((i + 1, format!("{}{}", if indent > 0 { "  " } else { "" }, t.chars().take(100).collect::<String>())));
+            }
+        }
+        let dp = display_path(&f);
+        let mut score = 0.0;
+        if !words.is_empty() {
+            let lp = dp.to_lowercase();
+            let lt = text.to_lowercase();
+            for w in &words {
+                if lp.contains(w.as_str()) {
+                    score += 6.0;
+                }
+                score += 2.0 * outline.iter().filter(|(_, d)| d.to_lowercase().contains(w.as_str())).count().min(10) as f64;
+                score += (lt.matches(w.as_str()).count().min(20)) as f64 * 0.25;
+            }
+        }
+        files.push(F { path: dp, lines: lines.len(), outline, score, mtime: meta.modified().unwrap_or(std::time::UNIX_EPOCH) });
+    }
+    if files.is_empty() {
+        return format!("No source files under '{path}'.");
+    }
+    if words.is_empty() {
+        files.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    } else {
+        files.sort_by(|a, b| b.score.total_cmp(&a.score).then(b.mtime.cmp(&a.mtime)));
+    }
+    let mut out = format!("{} source files under {path}{}:\n", files.len(), if words.is_empty() { ", most recently changed first" } else { ", most relevant first" });
+    let mut rest = Vec::new();
+    for f in &files {
+        if !words.is_empty() && f.score == 0.0 {
+            rest.push(f.path.clone());
+            continue;
+        }
+        let mut block = format!("\n{} ({} lines)\n", f.path, f.lines);
+        // With a focus, the matching declarations first; at most 25 rows per file.
+        let mut rows: Vec<&(usize, String)> = f.outline.iter().collect();
+        if !words.is_empty() {
+            rows.sort_by_key(|(l, d)| (!words.iter().any(|w| d.to_lowercase().contains(w.as_str())), *l));
+        }
+        for (l, d) in rows.iter().take(25) {
+            block.push_str(&format!("{l:>6}: {d}\n"));
+        }
+        if f.outline.len() > 25 {
+            block.push_str(&format!("        … {} more (read_file shows the full outline)\n", f.outline.len() - 25));
+        }
+        if out.len() + block.len() + 64 > max {
+            rest.push(f.path.clone());
+        } else {
+            out.push_str(&block);
+        }
+    }
+    if !rest.is_empty() {
+        let mut names = String::new();
+        for (k, r) in rest.iter().enumerate() {
+            if out.len() + names.len() + r.len() + 48 > max {
+                names.push_str(&format!(" and {} more", rest.len() - k));
+                break;
+            }
+            if !names.is_empty() {
+                names.push_str(", ");
+            }
+            names.push_str(r);
+        }
+        out.push_str(&format!("\nOther files: {names}\n"));
+    }
+    out
+}
+
 pub fn tool_search_symbols(pattern: &str, path_opt: Option<&str>, symbol_type: Option<&str>) -> Result<String, String> {
     let p = path_opt.unwrap_or(".").trim();
     let root = Path::new(if p.is_empty() { "." } else { p });
@@ -1063,6 +1248,49 @@ mod tests {
 
     fn ctx_yes() -> impl FnMut(&str) -> bool {
         |_| true
+    }
+
+    #[test]
+    fn code_map_ranks_by_focus_and_fits() {
+        let dir = std::env::temp_dir().join(format!("spindle_codemap_{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join("src"));
+        fs::write(dir.join("src/tokenizer.rs"), "pub struct Tokenizer {}\nimpl Tokenizer {\n    pub fn encode(&self) {}\n}\nfn merge_pairs() {}\n").unwrap();
+        fs::write(dir.join("src/net.rs"), "pub fn connect() {}\npub fn send() {}\n").unwrap();
+        let root = dir.to_string_lossy().to_string();
+        let m = code_map(&root, Some("tokenizer encode"), 4000);
+        let t = m.find("tokenizer.rs").expect("tokenizer listed");
+        assert!(m.contains("pub fn encode"));
+        assert!(m[t..].contains("3:"), "line numbers missing: {m}");
+        // net.rs doesn't match the focus: named only, after the matching file.
+        let n = m.find("net.rs").expect("net listed");
+        assert!(n > t && m.contains("Other files"));
+        // Tiny budget: still valid, still names the files.
+        let small = code_map(&root, None, 120);
+        assert!(small.contains("source files"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_file_read_starts_with_outline() {
+        let dir = std::env::temp_dir().join(format!("spindle_outline_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let mut text = String::new();
+        for i in 0..400 {
+            if i % 100 == 0 {
+                text.push_str(&format!("pub fn part_{i}() {{\n"));
+            } else {
+                text.push_str("    let x = 1;\n");
+            }
+        }
+        let f = dir.join("long.rs");
+        fs::write(&f, &text).unwrap();
+        let out = read_file(&f.to_string_lossy(), None, None, 20_000);
+        assert!(out.output.starts_with("Outline of"), "{}", &out.output[..80]);
+        assert!(out.output.contains("301: pub fn part_300()"));
+        // With an offset, no outline.
+        let out2 = read_file(&f.to_string_lossy(), Some(10), Some(5), 20_000);
+        assert!(!out2.output.contains("Outline"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

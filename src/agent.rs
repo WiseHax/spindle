@@ -165,15 +165,96 @@ pub fn call_title(call: &ToolCall) -> (&'static str, String) {
         "run_command" | "bash" | "shell" => ("❯", call.str_arg(&["command", "cmd"]).unwrap_or("").to_string()),
         "web_search" | "search_web" => ("◎", format!("Search \"{}\"", call.str_arg(&["query"]).unwrap_or(""))),
         "fetch_url" => ("⇣", format!("Fetch {}", call.str_arg(&["url"]).unwrap_or(""))),
+        "code_map" | "repo_map" | "outline" => ("⌕", "Code map".to_string()),
+        "recall" => ("▸", format!("Recall {}", call.str_arg(&["id"]).unwrap_or(""))),
         other => ("▪", other.to_string()),
     }
 }
 
-/// Characters of tool output the model can take right now: about a third of the free
-/// context (≈3.5 chars/token), split across this round's calls.
+/// Seconds of prompt processing one round of tool results may cost (`SPINDLE_TOOL_SECS`).
+fn tool_secs() -> f64 {
+    std::env::var("SPINDLE_TOOL_SECS").ok().and_then(|v| v.parse().ok()).filter(|v: &f64| *v > 0.0).unwrap_or(30.0)
+}
+
+/// Characters of tool output the model can take right now, split across this round's calls:
+/// - at most about a third of the free context (≈3.5 chars per token), and
+/// - at most what this machine processes in `tool_secs()` seconds, measured from this
+///   session's prompt processing. On two PCs at 25 tok/s that is about 750 tokens per round,
+///   so one build log can't stall the agent for minutes. Longer results are shortened to a
+///   digest and kept in full in the vault (see `vault.rs`), where `recall` can reach them.
 fn output_budget(engine: &SmolLm2Engine, n_calls: usize) -> usize {
+    let n = n_calls.max(1);
     let free_tokens = engine.max_seq.saturating_sub(engine.cur_pos);
-    (free_tokens * 7 / 6 / n_calls.max(1)).clamp(1200, 24_000)
+    let by_context = free_tokens * 7 / 6 / n;
+    let t = engine.timing;
+    let by_time = if t.prefill_tokens >= 64 && t.prefill_us > 0 {
+        let tok_per_s = t.prefill_tokens as f64 / (t.prefill_us as f64 / 1e6);
+        ((tok_per_s * tool_secs() * 3.5) as usize / n).max(2400)
+    } else {
+        usize::MAX
+    };
+    by_context.min(by_time).clamp(1200, 24_000)
+}
+
+/// A line telling the model how full its context is, once that starts to matter.
+fn context_note(engine: &SmolLm2Engine) -> Option<String> {
+    let (used, max) = (engine.cur_pos, engine.max_seq.max(1));
+    (used * 100 / max >= 40).then(|| {
+        format!(
+            "[Context: {used} of {max} tokens used. Prefer narrow reads (offset/limit, grep, code_map) and recall over re-reading whole files.]"
+        )
+    })
+}
+
+/// State before one user turn, so `/rewind` can undo the whole turn.
+struct Checkpoint {
+    undo_len: usize,
+    kv_shifts: u64,
+    branch: String,
+    prompt: String,
+}
+
+static CHECKPOINTS: std::sync::Mutex<Vec<Checkpoint>> = std::sync::Mutex::new(Vec::new());
+
+fn checkpoint(engine: &mut SmolLm2Engine, prompt: &str) {
+    let mut cps = CHECKPOINTS.lock().unwrap_or_else(|e| e.into_inner());
+    let branch = format!("__rewind_{}", cps.len());
+    engine.save_kv_branch(&branch);
+    cps.push(Checkpoint { undo_len: tools::undo_len(), kv_shifts: engine.kv_shift_count(), branch, prompt: prompt.to_string() });
+}
+
+/// Forgets all checkpoints (a new conversation).
+pub fn clear_checkpoints() {
+    CHECKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// What `/rewind` did.
+pub struct Rewind {
+    /// The prompt of the turn that was undone (the interface puts it back in the input box).
+    pub prompt: String,
+    /// One line per file restored or removed.
+    pub files: Vec<Result<String, String>>,
+    /// Whether the conversation went back too. It can't when the context window slid since
+    /// that turn; then only the files are restored.
+    pub conversation: bool,
+}
+
+/// Undoes the last user turn: every file it changed, and the conversation itself. The
+/// conversation goes back for free: the KV cache before that turn is still there, so only
+/// the position moves and nothing is recomputed.
+pub fn rewind(engine: &mut SmolLm2Engine) -> Option<Rewind> {
+    let mut cps = CHECKPOINTS.lock().unwrap_or_else(|e| e.into_inner());
+    // A new conversation since then drops the rewind points (see `reset_kv`).
+    if cps.last().is_some_and(|cp| !engine.kv_branches.contains_key(&cp.branch)) {
+        cps.clear();
+        return None;
+    }
+    let cp = cps.pop()?;
+    drop(cps);
+    let files = tools::undo_to(cp.undo_len);
+    let conversation = cp.kv_shifts == engine.kv_shift_count() && engine.restore_kv_branch(&cp.branch).is_ok();
+    engine.kv_branches.remove(&cp.branch);
+    Some(Rewind { prompt: cp.prompt, files, conversation })
 }
 
 /// Runs one user turn to completion. `confirm` answers permission prompts; `abort` stops
@@ -192,6 +273,7 @@ pub fn run_turn(
     let mut input = prompt.to_string();
     let mut seen: HashMap<String, usize> = HashMap::new();
     let aborted = || abort.is_some_and(|a| a.load(Ordering::Relaxed));
+    checkpoint(engine, prompt);
 
     for step in 0..=opts.max_steps {
         if aborted() {
@@ -247,6 +329,10 @@ pub fn run_turn(
             break;
         }
         input = responses.iter().map(|r| format!("<tool_response>\n{}\n</tool_response>", r.trim_end())).collect::<Vec<_>>().join("\n");
+        if let Some(note) = context_note(engine) {
+            input.push('\n');
+            input.push_str(&note);
+        }
         if step + 1 == opts.max_steps {
             input.push_str("\n\nTool-call limit for this turn reached. Do not call more tools; summarize what you did and what is left.");
         }
@@ -261,4 +347,32 @@ pub fn run_turn(
     }
     stats.wall_secs = t0.elapsed().as_secs_f64();
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/rewind` puts the conversation back exactly where it was before the last turn, and a
+    /// new conversation drops the rewind points.
+    #[test]
+    fn rewind_restores_the_conversation_position() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let mut e = SmolLm2Engine::load(path).expect("load");
+        let opts = AgentOpts { max_tokens: 8, allow_think: false, max_steps: 1 };
+        let mut yes = |_: &str| true;
+        run_turn(&mut e, "Say hello.", opts, None, &mut |_| {}, &mut yes);
+        let after_first = e.cur_pos;
+        run_turn(&mut e, "Now say goodbye.", opts, None, &mut |_| {}, &mut yes);
+        assert!(e.cur_pos > after_first);
+        let rw = rewind(&mut e).expect("a turn to rewind");
+        assert_eq!(rw.prompt, "Now say goodbye.");
+        assert!(rw.conversation);
+        assert_eq!(e.cur_pos, after_first);
+        e.reset_kv();
+        assert!(rewind(&mut e).is_none(), "rewind points must not survive a new conversation");
+    }
 }

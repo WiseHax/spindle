@@ -15,6 +15,7 @@ Commands
   /tools [on|off]           let the model read/edit files and run commands
   /think [on|off|show|hide] reasoning before answers, and whether it is shown
   /undo                     revert the last file the model changed
+  /rewind                   undo the whole last turn: its file changes and the conversation
   /diff                     show uncommitted changes (git diff)
   /review                   ask the model to review the uncommitted diff
   /git <args>               run a git command
@@ -763,6 +764,26 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
                     Err(e) => println!("{}", crate::ui::warn(&format!("could not run git: {e}"))),
                 }
             }
+            "/rewind" => match crate::agent::rewind(engine) {
+                Some(rw) => {
+                    println!(
+                        "{}",
+                        dim(if rw.conversation {
+                            "Rewound the last turn: the conversation is back to before it."
+                        } else {
+                            "Restored the files of the last turn (the context window has moved since, so the conversation stays)."
+                        })
+                    );
+                    for r in &rw.files {
+                        match r {
+                            Ok(m) => println!("{}", dim(&format!("  {m}"))),
+                            Err(e) => println!("{}", crate::ui::warn(&format!("  {e}"))),
+                        }
+                    }
+                    println!("{}", dim(&format!("The prompt was: {}", rw.prompt)));
+                }
+                None => println!("{}", dim("Nothing to rewind in this conversation.")),
+            },
             "/undo" => {
                 match crate::tools::pop_undo() {
                     Some(Ok(msg)) => println!("{}", dim(&msg)),

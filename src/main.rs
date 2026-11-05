@@ -25,6 +25,7 @@ mod smollm_chat;
 mod tools;
 mod tui;
 mod ui;
+mod vault;
 mod worker_pool;
 mod memory_guard;
 mod layer_stream;
