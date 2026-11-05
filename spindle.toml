@@ -10,7 +10,7 @@ layer_range = "35..48"
 wire_format = "fp8"
 
 threads = 4
-moe_prune = 4          # run the top 4 of the 8 routed experts per token
+moe_prune = 0.1        # drop experts only when the router is confident: +3% perplexity, ~13% faster than all 8 (see docs/moe_pruning.md)
 tools = true           # let the model read and edit files and run commands
 think = false
 

@@ -29,19 +29,29 @@ model prune the same way. A change made during a chat applies to both.
 Pruning changes the model's computation, so it changes the output. Unlike speculative
 decoding, it is not exact.
 
-Measured with `spindle --ppl tools/ppl_sample.txt` (883 tokens of prose and code) on
-Qwen3-30B-A3B Q4_K_M, split across two PCs with fp8 activations. Lower perplexity is better:
+Measured on Qwen3-30B-A3B Q4_K_M split across two PCs (16 GB desktop running layers 0..35, 8 GB
+laptop running 35..48, fp8 activations). Quality is `spindle --ppl tools/ppl_sample.txt` (883
+tokens of prose and code; lower is better). Speed is `spindle --bench`: the time per forward
+pass is the fair comparison, because tok/s also depends on how many drafts a reply accepts.
 
-| Setting | Perplexity | vs all 8 experts |
-|---|---|---|
-| all 8 experts (`moe_prune = 0`) | 6.357 | — |
-| top 4 (`moe_prune = 4`) | 8.169 | +28.5% |
-| top 4 with `--resident-experts` | 8.520 | +34.0% |
+| Setting | Perplexity | vs all 8 | ms per pass | prose tok/s |
+|---|---|---|---|---|
+| all 8 experts (`0`) | 6.357 | — | 180.6 | 7.0 |
+| `0.1` | 6.557 | +3.1% | 157.0 | 7.2 |
+| top 6 (`6`) | 6.654 | +4.7% | 156.9 | 7.8 |
+| top 4 (`4`) | 8.169 | +28.5% | 130.1 | 9.1 |
+| top 4 + `--resident-experts` | 8.520 | +34.0% | 128.2 | 9.1 |
 
-Running half the experts costs noticeably more quality than the router weights suggest. For
-work where answers matter (code, reasoning, tool use), keep all experts unless speed is the
-only goal. A fraction such as `0.1` drops experts only when the router concentrates its weight,
-which should cost less. Measure it with `--ppl` the same way before relying on it.
+- **`0.1` is the recommended setting**, and the one in the shipped `spindle.toml`. It costs 3%
+  in perplexity and makes each pass 13% faster than running all 8 experts. It is as fast as
+  top 6 and loses less.
+- **Top 4 is a noticeable loss** (+28.5%) for a further 17% of speed. Use it only when speed is
+  all that matters.
+- Running half the experts costs much more than the router weights suggest, so measure any
+  new setting with `--ppl` before relying on it.
+
+The 0.1 and 6 rows come from single benchmark runs, so their tok/s differ by noise. Their time
+per pass is the same.
 
 Also checked: a unit test (`test_dynamic_moe_pruning`) runs a small random layer with and
 without pruning and checks that the output stays finite.
@@ -52,6 +62,6 @@ Expert weights are read straight from the memory-mapped file. A pruned expert is
 touched, and when the model streams from disk, it is never prefetched either. With 4 of 8
 experts, a Qwen3-30B-A3B token reads roughly a quarter fewer bytes. The experts are about
 1.8 of the 3.3 billion weights a token uses. How much of that becomes speed depends on what
-else the step waits for, such as attention, the LM head and the network. On the two-PC setup,
-top 4 on both PCs ran at 9.1 tok/s on prose. The same benchmark with all 8 experts on both
-PCs hasn't been measured yet.
+else the step waits for, such as attention, the LM head and the network. On the two-PC setup
+most of the saving lands on the desktop worker: its time per pass went from 117 ms with all
+8 experts to 103 ms at `0.1` and 81 ms at top 4.
