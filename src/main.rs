@@ -789,6 +789,8 @@ struct CliConfig {
     ctx: Option<usize>,
     /// `--tools`: enables agentic tools (file operations, web search, sandboxed execution).
     tools: bool,
+    /// `--bench [runs]`: run the fixed benchmark prompts and exit.
+    bench: Option<usize>,
     /// `--tui`: launches the full-screen interface (the default; `--no-tui` turns it off).
     tui: bool,
 }
@@ -803,6 +805,7 @@ Usage:
   spindle node <model.gguf> [options]   serve a range of layers to another PC
   spindle <model.gguf> --prompt \"...\"   answer one prompt and exit
   spindle <file> --probe                measure RAM and disk read speed
+  spindle [model.gguf] --bench [runs]   run fixed benchmark prompts (default 3 runs each)
 
 Cluster:
   --peer <ip:port>            worker to connect to (client side)
@@ -945,6 +948,7 @@ fn parse_cli() -> CliConfig {
         ctx: None,
         tools: false,
         tui: true,
+        bench: None,
     };
 
     // Load defaults from spindle.toml if present in current directory
@@ -1084,6 +1088,11 @@ fn parse_cli() -> CliConfig {
             "--draft-len" if i + 1 < args.len() => {
                 cfg.draft_len = args[i + 1].parse().ok();
                 i += 2;
+            }
+            "--bench" => {
+                let runs = args.get(i + 1).and_then(|v| v.parse::<usize>().ok());
+                cfg.bench = Some(runs.unwrap_or(3).clamp(1, 20));
+                i += if runs.is_some() { 2 } else { 1 };
             }
             "--no-spec" => {
                 cfg.speculate = Some(false);
@@ -1554,7 +1563,7 @@ fn main() -> Result<()> {
             // Process the system prompt now, while a progress display is up, rather than as a
             // silent pause before the first reply. The full-screen UI does this on its own
             // loading screen; the line-based chat and one-shot prompts do it here.
-            let uses_tui = cli.tui && cli.chat_mode && cli.raw.is_none();
+            let uses_tui = cli.tui && cli.chat_mode && cli.raw.is_none() && cli.bench.is_none();
             if cli.raw.is_none() && !uses_tui {
                 let step = loader.as_ref().map(|l| l.step("Prompt", "processing the system prompt"));
                 let mut total = 0;
@@ -1579,6 +1588,11 @@ fn main() -> Result<()> {
                 "[chat] {n_threads} threads, temp={} top_k={} top_p={} min_p={} repeat_penalty={} seed={}",
                 sc.temperature, sc.top_k, sc.top_p, sc.min_p, sc.repeat_penalty, sc.seed
             );
+            if let Some(runs) = cli.bench {
+                let n = if cli.max_tokens == 32 { 128 } else { cli.max_tokens };
+                chat_cli::run_bench(&mut engine, runs, n);
+                return Ok(());
+            }
             if let Some(text) = &cli.raw {
                 use std::io::Write;
                 engine.complete_raw(text, cli.max_tokens, &mut |p| {

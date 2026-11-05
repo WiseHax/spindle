@@ -241,6 +241,114 @@ fn stats_line(secs: f64, tokens: usize, engine: &mut SmolLm2Engine, governor: Op
     parts.join(" · ")
 }
 
+/// Fixed prompts for `--bench`: fresh prose, a copy-heavy code edit, and a list. Together they
+/// show both the plain decode speed and what speculation adds when text repeats.
+const BENCH_PROMPTS: &[(&str, &str)] = &[
+    ("prose", "Write a short paragraph about how rivers shape valleys."),
+    (
+        "code edit",
+        "Rename the variable `count` to `total` in this function and output only the full updated code:\n\n\
+```rust\n\
+fn summarize(values: &[i64]) -> (i64, usize, f64) {\n\
+    let mut count = 0;\n\
+    let mut sum = 0;\n\
+    for v in values {\n\
+        if *v >= 0 {\n\
+            sum += v;\n\
+            count += 1;\n\
+        }\n\
+    }\n\
+    let mean = if count > 0 { sum as f64 / count as f64 } else { 0.0 };\n\
+    println!(\"{count} non-negative values, sum {sum}, mean {mean:.2}\");\n\
+    (sum, count, mean)\n\
+}\n\
+```",
+    ),
+    ("list", "List the eight planets of the solar system, one line each with one fact."),
+];
+
+/// `--bench`: runs the fixed prompts `runs` times each in this session, greedy, each from the
+/// same starting point (the cached system prompt), and prints speed and a time breakdown.
+pub fn run_bench(engine: &mut SmolLm2Engine, runs: usize, max_tokens: usize) {
+    use crate::agent::Breakdown;
+    unsafe { engine.prefill_system() };
+    let saved_sampler = engine.sampler;
+    let mut greedy = saved_sampler;
+    greedy.temperature = 0.0;
+    engine.set_sampler(greedy);
+    engine.save_kv_branch("__bench");
+    let corpus = engine.lookup_corpus.clone();
+    let where_ = match engine.cluster_client.as_ref() {
+        Some(c) => format!(
+            "worker layers {}..{} + local layers {}..{}",
+            c.worker_range.0, c.worker_range.1, engine.layer_range.start, engine.layer_range.end
+        ),
+        None => "single PC".to_string(),
+    };
+    println!("{}", bold(&format!("Benchmark: {} · {where_}", engine.idx.model_name)));
+    println!(
+        "{}",
+        dim(&format!(
+            "{} run(s) per prompt · greedy · up to {max_tokens} tokens · speculation {}",
+            runs,
+            if engine.speculate { "on" } else { "off" }
+        ))
+    );
+    println!();
+    let mut all = crate::smollm_chat::StepTiming::default();
+    let mut all_secs = 0.0;
+    let mut all_tokens = 0usize;
+    for (name, prompt) in BENCH_PROMPTS {
+        let mut speeds = Vec::new();
+        let mut accepted = (0usize, 0usize);
+        for _ in 0..runs.max(1) {
+            let _ = engine.restore_kv_branch("__bench");
+            engine.lookup_corpus = corpus.clone();
+            let t0 = engine.timing;
+            let (_, secs, toks) = unsafe { engine.generate_reply(prompt, max_tokens, false, &mut |_| {}) };
+            let d = engine.timing.since(&t0);
+            all = add_timing(&all, &d);
+            all_secs += secs;
+            all_tokens += toks;
+            accepted.0 += engine.spec_stats.0;
+            accepted.1 += engine.spec_stats.1;
+            speeds.push(toks as f64 / secs.max(1e-6));
+        }
+        speeds.sort_by(|a, b| a.total_cmp(b));
+        let median = speeds[speeds.len() / 2];
+        let spec = if accepted.1 > 0 { format!(" · drafts {}/{} accepted", accepted.0, accepted.1) } else { String::new() };
+        println!(
+            "  {:<10} {:>6.1} tok/s   (min {:.1}, max {:.1}){spec}",
+            name,
+            median,
+            speeds[0],
+            speeds[speeds.len() - 1]
+        );
+    }
+    let _ = engine.restore_kv_branch("__bench");
+    engine.lookup_corpus = corpus;
+    engine.set_sampler(saved_sampler);
+    println!();
+    println!("{}", Breakdown::from_timing(&all, all_secs).table(all_tokens));
+}
+
+fn add_timing(a: &crate::smollm_chat::StepTiming, b: &crate::smollm_chat::StepTiming) -> crate::smollm_chat::StepTiming {
+    crate::smollm_chat::StepTiming {
+        worker_us: a.worker_us + b.worker_us,
+        local_us: a.local_us + b.local_us,
+        steps: a.steps + b.steps,
+        passes: a.passes + b.passes,
+        head_us: a.head_us + b.head_us,
+        sample_us: a.sample_us + b.sample_us,
+        draft_us: a.draft_us + b.draft_us,
+        emit_us: a.emit_us + b.emit_us,
+        prefill_us: a.prefill_us + b.prefill_us,
+        prefill_tokens: a.prefill_tokens + b.prefill_tokens,
+        worker_compute_us: a.worker_compute_us + b.worker_compute_us,
+        worker_requests: a.worker_requests + b.worker_requests,
+    }
+}
+
 /// Runs `opts.first_prompt` (if any), then the interactive loop.
 pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOptions) {
     if opts.tui && opts.interactive {

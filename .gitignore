@@ -33,3 +33,6 @@ Thumbs.db
 .DS_Store
 __pycache__/
 *.pyc
+
+# Benchmark logs from tools/bench.ps1
+bench-logs/
