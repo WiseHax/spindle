@@ -1194,6 +1194,78 @@ fn load_weights(loader: &loading::Loader, engine: &smollm_chat::SmolLm2Engine) {
     step.done(&format!("{} in RAM · {}/s", loading::fmt_bytes(read), loading::fmt_bytes((read as f64 / secs) as u64)));
 }
 
+/// For a model share that doesn't fit in RAM: locks the weights every token reads, then the
+/// experts earlier sessions used most, within what free RAM allows (keeping `--reserve` free
+/// for other programs, plus headroom so rare experts can still page in). Then starts the
+/// working-set governor. Returns the governor, which must stay alive.
+fn setup_memory(cli: &CliConfig, engine: &mut smollm_chat::SmolLm2Engine, loader: Option<&loading::Loader>) -> Option<memory_guard::Governor> {
+    let reserve = cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB);
+    let ceiling = cli.ram_budget_mib.map(|m| m * memory_guard::MIB);
+    let mut private = engine.private_bytes_estimate();
+    let mut pinned = 0u64;
+    if engine.is_streaming() && std::env::var("SPINDLE_NO_PIN").map_or(true, |v| v != "1") {
+        let (ws, _, _) = memory_guard::process_counters();
+        let target = ceiling.unwrap_or((ws + mmap_file::available_ram_bytes()).saturating_sub(reserve));
+        let pin_budget = target.saturating_sub(private + 128 * memory_guard::MIB) as usize;
+        if cli.stream_layers || !engine.is_moe() {
+            let (p, first_streamed) = engine.plan_residency(pin_budget, cli.stream_layers);
+            pinned = p as u64;
+            if let Some(f) = first_streamed {
+                vlog!("[memory] pinned {} MiB (LM head + layers 0..{f}); streaming layers {f}.. from disk", pinned / memory_guard::MIB);
+            }
+            if let Some(l) = loader {
+                l.step("Pinning", "").done(&format!("{} of the weights every token reads kept in RAM", loading::fmt_bytes(pinned)));
+            }
+        } else {
+            // Leave room for rare experts to page in without pushing out pinned ones.
+            let headroom = (pin_budget / 8).max(256 * memory_guard::MIB as usize);
+            let step = loader.map(|l| l.step("Pinning", "locking the most-used weights in RAM"));
+            let plan = engine.pin_weights(pin_budget, headroom, &mut |done, all| {
+                if let Some(s) = step.as_ref() {
+                    s.progress(done, all, format!("{} / {}", loading::fmt_bytes(done), loading::fmt_bytes(all)));
+                }
+            });
+            pinned = plan.total() as u64;
+            let msg = match (plan.has_stats, plan.coverage) {
+                (true, Some(c)) => format!(
+                    "{} in RAM: attention + {} most-used experts ({:.0}% of past picks); the rest read from disk",
+                    loading::fmt_bytes(pinned),
+                    loading::fmt_count(plan.experts),
+                    c * 100.0
+                ),
+                _ => format!(
+                    "{} in RAM (attention and routers{}). No expert history yet: it is recorded as you chat, and the next start keeps the most-used experts in RAM",
+                    loading::fmt_bytes(pinned),
+                    if engine.layer_range.end == engine.cfg.n_layers { ", LM head" } else { "" }
+                ),
+            };
+            if let Some(s) = step {
+                s.done(&msg);
+            }
+        }
+    }
+    // Stream buffers were allocated by the planner; count them as private memory.
+    private = engine.private_bytes_estimate();
+    let budget = memory_guard::Budget {
+        reserve,
+        floor: private + pinned + 128 * memory_guard::MIB,
+        ceiling,
+        min_ws: pinned + 32 * memory_guard::MIB,
+    };
+    // A model that fits in RAM needs no cap: its clean, file-backed pages are cheap for
+    // Windows to reclaim. The cap matters when the model is bigger than free memory, or
+    // when the user asked for a hard budget.
+    let governor = if engine.is_streaming() || budget.ceiling.is_some() {
+        memory_guard::Governor::start(budget)
+    } else {
+        None
+    };
+    if governor.is_none() && (engine.is_streaming() || budget.ceiling.is_some()) {
+        ui::note("Windows refused the working-set limit; running without the memory governor");
+    }
+    governor
+}
+
 // --------------------------------------------------------------------- main
 
 fn main() -> Result<()> {
@@ -1315,6 +1387,8 @@ fn main() -> Result<()> {
                 if let Some(l) = loader.as_ref() {
                     l.step("Threads", "").done(&format!("{n_threads} compute threads"));
                 }
+                // Kept alive while the node serves.
+                let _governor = setup_memory(&cli, &mut engine, loader.as_ref());
 
                 let bind_addr = cli.bind_addr;
                 let listener = match std::net::TcpListener::bind(bind_addr) {
@@ -1462,59 +1536,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            let reserve = cli.reserve_mib.map_or(memory_guard::DEFAULT_RESERVE, |m| m * memory_guard::MIB);
-            let ceiling = cli.ram_budget_mib.map(|m| m * memory_guard::MIB);
-            let mut private = engine.private_bytes_estimate();
-            // When the model doesn't fit, lock as much of it as the budget allows (see
-            // `pin_hot_weights`), keeping 128 MiB of the budget for the pages that still stream.
-            let mut pinned = 0u64;
-            if engine.is_streaming() && std::env::var("SPINDLE_NO_PIN").map_or(true, |v| v != "1") {
-                let (ws, _, _) = memory_guard::process_counters();
-                let target = ceiling.unwrap_or((ws + mmap_file::available_ram_bytes()).saturating_sub(reserve));
-                let pin_budget = target.saturating_sub(private + 128 * memory_guard::MIB);
-                let (p, first_streamed) = engine.plan_residency(pin_budget as usize, cli.stream_layers);
-                pinned = p as u64;
-                match first_streamed {
-                    Some(f) => vlog!(
-                        "[memory] pinned {} MiB in RAM (LM head + layers 0..{f}); streaming layers {f}..{} from disk",
-                        pinned / memory_guard::MIB,
-                        engine.cfg.n_layers
-                    ),
-                    None => vlog!(
-                        "[memory] pinned {} MiB of hot weights in RAM; the rest pages in as needed",
-                        pinned / memory_guard::MIB
-                    ),
-                }
-            }
-            // Stream buffers were allocated by the planner; count them as private memory.
-            private = engine.private_bytes_estimate();
-            let budget = memory_guard::Budget {
-                reserve,
-                floor: private + pinned + 128 * memory_guard::MIB,
-                ceiling,
-                min_ws: pinned + 32 * memory_guard::MIB,
-            };
-            // A model that fits in RAM needs no cap: its clean, file-backed pages are cheap for
-            // Windows to reclaim. The cap matters when the model is bigger than free memory,
-            // or when the user asked for a hard budget.
-            let governor = if engine.is_streaming() || budget.ceiling.is_some() {
-                memory_guard::Governor::start(budget)
-            } else {
-                vlog!("[memory] model fits in RAM, no working-set cap needed (use --ram-budget to force one)");
-                None
-            };
-            match &governor {
-                Some(g) => vlog!(
-                    "[memory] governor on: keeping {} MiB free for other apps, current cap {} MiB{}",
-                    budget.reserve / memory_guard::MIB,
-                    g.status.cap.load(std::sync::atomic::Ordering::Relaxed) / memory_guard::MIB,
-                    budget.ceiling.map_or(String::new(), |c| format!(", hard ceiling {} MiB", c / memory_guard::MIB))
-                ),
-                None if engine.is_streaming() || budget.ceiling.is_some() => {
-                    ui::note("Windows refused the working-set limit; running without the memory governor")
-                }
-                None => {}
-            }
+            let governor = setup_memory(&cli, &mut engine, loader.as_ref());
             // One thread per physical P-core (main on compute_cores[0], helpers on the rest).
             // Override with `--threads N` or `$env:CHAT_THREADS = "1"`.
             let n_threads = cli.threads.unwrap_or_else(|| {

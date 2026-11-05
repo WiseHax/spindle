@@ -329,6 +329,7 @@ pub fn run_bench(engine: &mut SmolLm2Engine, runs: usize, max_tokens: usize) {
     let _ = engine.restore_kv_branch("__bench");
     engine.lookup_corpus = corpus;
     engine.set_sampler(saved_sampler);
+    let _ = engine.save_expert_stats();
     println!();
     println!("{}", Breakdown::from_timing(&all, all_secs).table(all_tokens));
     if engine.is_moe() {
@@ -396,6 +397,7 @@ fn add_timing(a: &crate::smollm_chat::StepTiming, b: &crate::smollm_chat::StepTi
 pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOptions) {
     if opts.tui && opts.interactive {
         crate::tui::run_tui(engine, governor, opts);
+        let _ = engine.save_expert_stats();
         return;
     }
 
@@ -477,6 +479,7 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
         reply(engine, p, allow_think, show_think, detailed, max_tokens);
     }
     if !opts.interactive {
+        let _ = engine.save_expert_stats();
         return;
     }
 
@@ -867,4 +870,5 @@ Spindle adds this file to the system prompt. Describe the project for the model:
             }
         }
     }
+    let _ = engine.save_expert_stats();
 }

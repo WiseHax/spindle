@@ -476,6 +476,28 @@ pub struct MoeStats {
     pub timing: MoeTiming,
 }
 
+/// What `pin_weights` locked into RAM.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PinPlan {
+    /// Attention, norms, routers, shared experts and the LM head.
+    pub dense_bytes: usize,
+    /// Routed experts, chosen by earlier usage.
+    pub expert_bytes: usize,
+    pub experts: usize,
+    /// Share of earlier picks that the pinned experts cover.
+    pub coverage: Option<f64>,
+    /// Whether any usage history existed.
+    pub has_stats: bool,
+}
+
+impl PinPlan {
+    pub fn total(&self) -> usize {
+        self.dense_bytes + self.expert_bytes
+    }
+}
+
+const EXPERT_STATS_MAGIC: &[u8; 4] = b"SPEX";
+
 /// Prompt cache file format (see `save_prompt_kv`). Bump the version when the layout or the
 /// numerics of the KV entries change.
 const PROMPT_CACHE_MAGIC: &[u8; 4] = b"SPKV";
@@ -1199,6 +1221,11 @@ pub struct SmolLm2Engine {
     /// Bytes of weights this node uses, and the free RAM when it loaded.
     pub share_bytes: u64,
     pub free_at_load: u64,
+    /// Expert pick counts loaded from earlier sessions (`<model>.experts-<layers>.bin`),
+    /// before this session added to them. Used to choose which experts to keep in RAM.
+    pub prior_picks: Vec<u32>,
+    /// When the pick counts were last written to disk.
+    stats_saved_at: Option<std::time::Instant>,
     /// Reads layers `first..` into private buffers when they don't fit in RAM.
     streamer: Option<crate::layer_stream::LayerStreamer>,
     /// Explicit in-RAM expert cache for streaming MoE weights from disk.
@@ -1546,6 +1573,8 @@ impl SmolLm2Engine {
             resident_ranges,
             share_bytes: sharded_needed,
             free_at_load: avail_ram,
+            prior_picks: Vec::new(),
+            stats_saved_at: None,
             prefetcher,
             streamer: None,
             expert_cache: None,
@@ -1606,6 +1635,9 @@ impl SmolLm2Engine {
             if let Ok(p) = v.parse::<f32>() {
                 engine.set_moe_prune(p);
             }
+        }
+        if engine.is_moe() {
+            engine.load_expert_stats();
         }
         Ok(engine)
     }
@@ -1885,6 +1917,13 @@ impl SmolLm2Engine {
     /// pinned matters less than how many; dense weights that every token reads come first,
     /// MoE experts (each used by only some tokens) are never pinned.
     pub fn pin_hot_weights(&self, budget: usize) -> usize {
+        self.pin_weights(budget, 0, &mut |_, _| {}).total()
+    }
+
+    /// `pin_hot_weights`, then the most-used MoE experts (by the counts of earlier sessions)
+    /// while they fit, leaving `expert_headroom` bytes of the budget unpinned so rare experts
+    /// still have room to page in. `progress(done, total)` reports locked bytes.
+    pub fn pin_weights(&self, budget: usize, expert_headroom: usize, progress: &mut dyn FnMut(u64, u64)) -> PinPlan {
         let c = self.cfg;
         let mut spans = vec![span(&self.lm_head), (self.output_norm, c.dim * 4)];
         for ly in &self.layers {
@@ -1912,10 +1951,105 @@ impl SmolLm2Engine {
             total += s.1;
             chosen.push(s);
         }
-        if total == 0 || !crate::memory_guard::allow_locking((total + 64 * 1024 * 1024) as u64) {
-            return 0;
+        let dense = total;
+        // Experts, most picked first. Only experts that were actually picked before count.
+        let mut plan = PinPlan::default();
+        let expert_budget = budget.saturating_sub(expert_headroom);
+        let total_prior: u64 = self.prior_picks.iter().map(|&c| c as u64).sum();
+        let mut covered = 0u64;
+        for (layer, e, count) in self.hot_experts() {
+            let FfnKind::Moe(m) = &self.layers[layer - self.layer_range.start].ffn else { continue };
+            let spans = m.experts.expert(e).spans();
+            let bytes: usize = spans.iter().map(|s| s.1).sum();
+            if total + bytes > expert_budget {
+                break;
+            }
+            total += bytes;
+            chosen.extend(spans);
+            plan.experts += 1;
+            covered += count as u64;
         }
-        self.raw_bytes.lock_ranges(&chosen)
+        if total == 0 || !crate::memory_guard::allow_locking((total + 64 * 1024 * 1024) as u64) {
+            return plan;
+        }
+        // Lock in pieces so the startup display can show progress.
+        let mut locked = 0usize;
+        for piece in chosen.chunks(48) {
+            locked += self.raw_bytes.lock_ranges(piece);
+            progress(locked as u64, total as u64);
+        }
+        plan.dense_bytes = locked.min(dense);
+        plan.expert_bytes = locked.saturating_sub(dense);
+        plan.coverage = (total_prior > 0).then(|| covered as f64 / total_prior as f64);
+        plan.has_stats = total_prior > 0;
+        plan
+    }
+
+    /// This node's experts that earlier sessions picked, most picked first:
+    /// `(global layer, expert, picks)`.
+    fn hot_experts(&self) -> Vec<(usize, usize, u32)> {
+        let n_expert = self.cfg.n_expert.max(1);
+        let mut v: Vec<(usize, usize, u32)> = self
+            .prior_picks
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(i, &c)| (i / n_expert, i % n_expert, c))
+            .filter(|&(l, _, _)| self.layer_range.contains(&l) && matches!(self.layers[l - self.layer_range.start].ffn, FfnKind::Moe(_)))
+            .collect();
+        v.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        v
+    }
+
+    /// `<model>.experts-<layers>.bin`: expert pick counts kept across sessions.
+    fn expert_stats_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.experts-{}-{}.bin", self.path, self.layer_range.start, self.layer_range.end))
+    }
+
+    /// Reads the counts saved by earlier sessions into `prior_picks` and the live counters.
+    /// A missing or mismatched file just means no history.
+    fn load_expert_stats(&mut self) {
+        let Ok(b) = std::fs::read(self.expert_stats_path()) else { return };
+        let total = self.cfg.n_layers * self.cfg.n_expert;
+        if b.len() != 12 + total * 4 || &b[0..4] != EXPERT_STATS_MAGIC {
+            return;
+        }
+        let rd = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+        if rd(4) as usize != self.cfg.n_layers || rd(8) as usize != self.cfg.n_expert {
+            return;
+        }
+        let counts: Vec<u32> = (0..total).map(|i| rd(12 + i * 4)).collect();
+        for (dst, &c) in self.moe_stats.picks.iter_mut().zip(&counts) {
+            *dst = dst.saturating_add(c);
+        }
+        self.prior_picks = counts;
+    }
+
+    /// Writes the pick counts (earlier sessions plus this one). Atomic: temp file + rename.
+    pub fn save_expert_stats(&mut self) -> std::io::Result<()> {
+        if !self.is_moe() {
+            return Ok(());
+        }
+        let mut b = Vec::with_capacity(12 + self.moe_stats.picks.len() * 4);
+        b.extend_from_slice(EXPERT_STATS_MAGIC);
+        b.extend_from_slice(&(self.cfg.n_layers as u32).to_le_bytes());
+        b.extend_from_slice(&(self.cfg.n_expert as u32).to_le_bytes());
+        for &c in &self.moe_stats.picks {
+            b.extend_from_slice(&c.to_le_bytes());
+        }
+        let path = self.expert_stats_path();
+        let tmp = path.with_extension("bin.tmp");
+        std::fs::write(&tmp, &b)?;
+        std::fs::rename(&tmp, &path)?;
+        self.stats_saved_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Saves the pick counts at most once a minute (a 24 KB write for Qwen3-30B-A3B).
+    pub fn maybe_save_expert_stats(&mut self) {
+        if self.stats_saved_at.map_or(true, |t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+            let _ = self.save_expert_stats();
+        }
     }
 
     /// Decides what lives in RAM for a model that doesn't fit, given `budget` bytes for
@@ -1934,6 +2068,10 @@ impl SmolLm2Engine {
             (Some(s), true) => s.clone(),
             _ => return (self.pin_hot_weights(budget), None),
         };
+        self.plan_layer_stream(budget, spans)
+    }
+
+    fn plan_layer_stream(&mut self, budget: usize, spans: Vec<(usize, usize)>) -> (usize, Option<usize>) {
         let n = spans.len();
         let max_span = spans.iter().map(|s| s.1).max().unwrap_or(0);
         // Two stream buffers, unless everything ends up pinned anyway.
@@ -3499,6 +3637,9 @@ impl SmolLm2Engine {
             reply.push_str(&piece);
         }
         let gen_secs = t_gen.elapsed().as_secs_f64();
+        if self.is_moe() {
+            self.maybe_save_expert_stats();
+        }
         if let Some((c0, r0)) = worker_t0 {
             if let Some((c1, r1)) = self.cluster_client.as_mut().and_then(|c| c.worker_timing()) {
                 self.timing.worker_compute_us += c1.saturating_sub(c0);

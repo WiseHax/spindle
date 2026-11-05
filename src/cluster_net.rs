@@ -907,6 +907,7 @@ pub fn serve_worker_connection(
             Ok(h) => h,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 println!("  Client disconnected.");
+                let _ = engine.save_expert_stats();
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -914,6 +915,7 @@ pub fn serve_worker_connection(
             }
             Err(e) => {
                 eprintln!("  Connection lost: {e}");
+                let _ = engine.save_expert_stats();
                 return Err(e);
             }
         };
@@ -1030,9 +1032,13 @@ pub fn serve_worker_connection(
                 compute_us += t_req.elapsed().as_micros() as u64;
                 requests += 1;
                 cs.send_frame(FRAME_STEP_RESP, wire_format, &pack_scratch)?;
+                if requests % 512 == 0 {
+                    engine.maybe_save_expert_stats();
+                }
             }
             FRAME_SHUTDOWN => {
                 println!("  Client ended the session.");
+                let _ = engine.save_expert_stats();
                 break;
             }
             other => {

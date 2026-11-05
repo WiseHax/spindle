@@ -12,6 +12,19 @@
   any change computes it again. A test checks that the reply is identical either way. Set
   `SPINDLE_NO_PROMPT_CACHE=1` to turn it off.
 
+### Memory
+
+- When a PC's share of the model doesn't fit in RAM, spindle now keeps the experts that
+  earlier sessions used most locked in RAM, after the weights every token reads (attention,
+  routers, LM head). Rare experts still read from disk. Usage counts are kept next to the
+  model (`<model>.experts-<layers>.bin`, 24 KB for Qwen3-30B-A3B) and updated as you chat.
+  The first start after this change has no history yet and says so. On Qwen3-30B-A3B the
+  benchmark prompts needed 93 of 128 experts per layer (11.9 GiB) for 99% of picks.
+- The worker now gets the same pinning and working-set governor as the client. Before, it
+  had neither.
+- A "Pinning" step on the loading screen shows the progress, what was kept in RAM, and the
+  share of past expert picks it covers.
+
 ### Measuring (more)
 
 - `--bench` on MoE models reports expert usage: how many experts per layer cover 50%, 90%,
