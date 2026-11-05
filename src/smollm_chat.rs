@@ -1158,7 +1158,7 @@ pub struct SmolLm2Engine {
     /// Saved KV-cache branches for zero-cost hypothesis rollout and rewinding in RAM.
     pub kv_branches: HashMap<String, (usize, usize, Option<usize>, Option<usize>)>,
     /// Cluster execution timing breakdown per token.
-    pub cluster_timing: ClusterTiming,
+    pub timing: StepTiming,
     /// Atomic abort signal to cancel generation early when user hits Escape or Ctrl+C.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Pre-allocated buffer for LM head logits to eliminate 600 KiB heap allocation per token.
@@ -1177,11 +1177,59 @@ pub struct SmolLm2Engine {
     pub batch_logits: Vec<f32>,
 }
 
+/// Where generation time goes, accumulated across calls (take differences to measure a
+/// span). All times in microseconds on the client.
 #[derive(Default, Clone, Copy, Debug)]
-pub struct ClusterTiming {
+pub struct StepTiming {
+    /// Waiting for the worker: send, its compute, and the reply (cluster only).
     pub worker_us: u64,
+    /// This machine's layers (all layers when standalone).
     pub local_us: u64,
+    /// Round trips to the worker.
     pub steps: u64,
+    /// Forward passes (single tokens and verify batches), with or without a worker.
+    pub passes: u64,
+    /// LM head: hidden state to logits.
+    pub head_us: u64,
+    /// Turning logits into a token (penalties, top-k, top-p, the draw).
+    pub sample_us: u64,
+    /// Finding draft tokens.
+    pub draft_us: u64,
+    /// Decoding tokens to text and handing them to the interface.
+    pub emit_us: u64,
+    /// Processing prompts (system prompt, user message, tool results) before generating.
+    pub prefill_us: u64,
+    pub prefill_tokens: u64,
+    /// Compute time the worker reported for this machine's generation passes, and how many
+    /// requests that covers (see `FRAME_TIMING`; zero when the worker doesn't report it).
+    pub worker_compute_us: u64,
+    pub worker_requests: u64,
+}
+
+impl StepTiming {
+    /// `self - earlier`, field by field.
+    pub fn since(&self, e: &StepTiming) -> StepTiming {
+        StepTiming {
+            worker_us: self.worker_us - e.worker_us,
+            local_us: self.local_us - e.local_us,
+            steps: self.steps - e.steps,
+            passes: self.passes - e.passes,
+            head_us: self.head_us - e.head_us,
+            sample_us: self.sample_us - e.sample_us,
+            draft_us: self.draft_us - e.draft_us,
+            emit_us: self.emit_us - e.emit_us,
+            prefill_us: self.prefill_us - e.prefill_us,
+            prefill_tokens: self.prefill_tokens - e.prefill_tokens,
+            worker_compute_us: self.worker_compute_us - e.worker_compute_us,
+            worker_requests: self.worker_requests - e.worker_requests,
+        }
+    }
+}
+
+/// Microseconds since `t`.
+#[inline]
+fn us_since(t: std::time::Instant) -> u64 {
+    t.elapsed().as_micros() as u64
 }
 
 /// How a conversation is framed in tokens. Built once at load from the model's special
@@ -1437,7 +1485,7 @@ impl SmolLm2Engine {
             spec_stats: (0, 0, 0),
             cluster_client: None,
             kv_branches: HashMap::new(),
-            cluster_timing: ClusterTiming::default(),
+            timing: StepTiming::default(),
             abort_signal: None,
             logits_buf: vec![0.0f32; c.vocab],
             cand_buf: Vec::with_capacity(c.vocab),
@@ -1716,12 +1764,12 @@ impl SmolLm2Engine {
 
     /// Takes the average cluster timing breakdown (worker_ms, local_ms) for the completed turn.
     pub fn take_cluster_timing(&mut self) -> Option<(f64, f64)> {
-        if self.cluster_timing.steps == 0 {
+        if self.timing.steps == 0 {
             return None;
         }
-        let w_avg_ms = (self.cluster_timing.worker_us as f64 / self.cluster_timing.steps as f64) / 1000.0;
-        let l_avg_ms = (self.cluster_timing.local_us as f64 / self.cluster_timing.steps as f64) / 1000.0;
-        self.cluster_timing = ClusterTiming::default();
+        let w_avg_ms = (self.timing.worker_us as f64 / self.timing.steps as f64) / 1000.0;
+        let l_avg_ms = (self.timing.local_us as f64 / self.timing.steps as f64) / 1000.0;
+        self.timing = StepTiming::default();
         Some((w_avg_ms, l_avg_ms))
     }
 
@@ -2044,12 +2092,17 @@ impl SmolLm2Engine {
             self.cluster_client = Some(client);
             let t_l = std::time::Instant::now();
             let h = self.forward_batch_slice(None, Some(&w), start_pos);
-            self.cluster_timing.worker_us += w_us;
-            self.cluster_timing.local_us += t_l.elapsed().as_micros() as u64;
-            self.cluster_timing.steps += 1;
+            self.timing.worker_us += w_us;
+            self.timing.local_us += t_l.elapsed().as_micros() as u64;
+            self.timing.steps += 1;
+            self.timing.passes += 1;
             h
         } else {
-            self.forward_batch(batch, start_pos)
+            let t_l = std::time::Instant::now();
+            let h = self.forward_batch(batch, start_pos);
+            self.timing.local_us += us_since(t_l);
+            self.timing.passes += 1;
+            h
         }
     }
 
@@ -2106,12 +2159,17 @@ impl SmolLm2Engine {
             let act = self.forward_slice(None, Some(&worker_act), pos);
             let l_us = t_l.elapsed().as_micros() as u64;
 
-            self.cluster_timing.worker_us += w_us;
-            self.cluster_timing.local_us += l_us;
-            self.cluster_timing.steps += 1;
+            self.timing.worker_us += w_us;
+            self.timing.local_us += l_us;
+            self.timing.steps += 1;
+            self.timing.passes += 1;
             act
         } else {
-            self.forward_hidden(token_id, pos)
+            let t_l = std::time::Instant::now();
+            let h = self.forward_hidden(token_id, pos);
+            self.timing.local_us += us_since(t_l);
+            self.timing.passes += 1;
+            h
         }
     }
 
@@ -2560,8 +2618,13 @@ impl SmolLm2Engine {
         if self.penalized_mask.len() != c.vocab {
             self.penalized_mask.resize(c.vocab, 0);
         }
+        let t = std::time::Instant::now();
         matvec(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, hidden, &mut self.logits_buf);
-        self.sample_from_logits(recent, forbid_stop, forbid_think)
+        self.timing.head_us += us_since(t);
+        let t = std::time::Instant::now();
+        let tok = self.sample_from_logits(recent, forbid_stop, forbid_think);
+        self.timing.sample_us += us_since(t);
+        tok
     }
 
     /// LM-head logits for every hidden state of a verify batch in ONE shared-decode pass over
@@ -2573,9 +2636,11 @@ impl SmolLm2Engine {
         if self.batch_logits.len() < need {
             self.batch_logits.resize(need, 0.0);
         }
+        let t = std::time::Instant::now();
         let xr = as_refs(hiddens);
         let mut outs: Vec<&mut [f32]> = self.batch_logits[..need].chunks_mut(vocab).collect();
         matvec_multi(self.pool.as_ref(), self.raw_bytes.as_ptr(), &self.lm_head, &xr, &mut outs);
+        self.timing.head_us += us_since(t);
     }
 
     /// Samples from row `i` of `batch_logits` with exactly the same rules (and RNG draw) as
@@ -2589,8 +2654,11 @@ impl SmolLm2Engine {
         if self.penalized_mask.len() != vocab {
             self.penalized_mask.resize(vocab, 0);
         }
+        let t = std::time::Instant::now();
         self.logits_buf.copy_from_slice(&self.batch_logits[i * vocab..(i + 1) * vocab]);
-        self.sample_from_logits(recent, forbid_stop, forbid_think)
+        let tok = self.sample_from_logits(recent, forbid_stop, forbid_think);
+        self.timing.sample_us += us_since(t);
+        tok
     }
 
     /// The sampling half of `sample_next_token`, on logits already in `logits_buf`.
@@ -2941,8 +3009,10 @@ impl SmolLm2Engine {
         let t0 = Instant::now();
         self.spec_stats = (0, 0, 0);
         let mut draft_engine = self.draft_engine.take();
+        let mut prefill_tokens = 0u64;
         if self.n_keep == 0 {
             let sys = self.encode_system();
+            prefill_tokens += sys.len() as u64;
             self.feed(&sys);
             self.n_keep = self.cur_pos;
             if let Some(draft) = draft_engine.as_mut() {
@@ -2956,10 +3026,15 @@ impl SmolLm2Engine {
         if turn_ids.len() > max_turn {
             turn_ids.drain(..turn_ids.len() - max_turn);
         }
+        prefill_tokens += turn_ids.len() as u64;
         let last_hidden = self.feed(&turn_ids);
         if let Some(draft) = draft_engine.as_mut() {
             draft.feed(&turn_ids);
         }
+        self.timing.prefill_us += us_since(t0);
+        self.timing.prefill_tokens += prefill_tokens;
+        // Worker compute is measured over the generation passes only (prefill excluded).
+        let worker_t0 = self.cluster_client.as_mut().and_then(|c| c.worker_timing());
         let reply_start = self.cur_pos;
         let shifts_before = self.kv_shifts;
         let t_gen = Instant::now();
@@ -2985,6 +3060,7 @@ impl SmolLm2Engine {
         // Emits one committed token: think-state tracking, UTF-8 streaming, history.
         macro_rules! emit {
             ($tok:expr) => {{
+                let t_emit = std::time::Instant::now();
                 let tok: usize = $tok;
                 match self.think_ids {
                     Some((open, _)) if tok == open => in_think = true,
@@ -3007,6 +3083,7 @@ impl SmolLm2Engine {
                 recent.push(tok);
                 generated += 1;
                 self.remember_tokens(&[tok]);
+                self.timing.emit_us += us_since(t_emit);
             }};
         }
         macro_rules! penalty_window {
@@ -3051,6 +3128,7 @@ impl SmolLm2Engine {
             };
             let k = k_dyn.min(budget.saturating_sub(1));
             let mut draft: Vec<usize> = Vec::new();
+            let t_draft = std::time::Instant::now();
             if k > 0 && (skip == 0 || use_lookup) {
                 if let Some(d) = draft_engine.as_mut() {
                     if self.kv_shifts == shifts_before && d.kv_shifts == draft_shifts && d.cur_pos >= reply_start {
@@ -3085,6 +3163,7 @@ impl SmolLm2Engine {
                     }
                 }
             }
+            self.timing.draft_us += us_since(t_draft);
             skip = skip.saturating_sub(1);
 
             if draft.is_empty() {
@@ -3154,6 +3233,12 @@ impl SmolLm2Engine {
             reply.push_str(&piece);
         }
         let gen_secs = t_gen.elapsed().as_secs_f64();
+        if let Some((c0, r0)) = worker_t0 {
+            if let Some((c1, r1)) = self.cluster_client.as_mut().and_then(|c| c.worker_timing()) {
+                self.timing.worker_compute_us += c1.saturating_sub(c0);
+                self.timing.worker_requests += r1.saturating_sub(r0);
+            }
+        }
         // Qwen3's chat template keeps only the final answer of earlier turns, not their
         // reasoning. Rewind the cache to the start of this reply and re-feed just the answer,
         // which also saves context (the reasoning is usually the longer part). Skipped if the

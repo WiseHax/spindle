@@ -54,6 +54,91 @@ pub struct TurnStats {
     pub worker_ms: f64,
     pub local_ms: f64,
     pub aborted: bool,
+    /// Where the generation time went, averaged per forward pass.
+    pub breakdown: Breakdown,
+}
+
+/// Average time per forward pass (one token, or one verify batch), in milliseconds.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct Breakdown {
+    pub passes: u64,
+    pub wall_ms: f64,
+    /// Waiting for the worker (its compute plus the network).
+    pub worker_ms: f64,
+    /// The worker's own compute, when it reports it.
+    pub worker_compute_ms: Option<f64>,
+    pub local_ms: f64,
+    pub head_ms: f64,
+    pub sample_ms: f64,
+    pub draft_ms: f64,
+    pub emit_ms: f64,
+    /// Prompt processing speed for this turn (tokens per second).
+    pub prefill_tok_s: Option<f64>,
+}
+
+impl Breakdown {
+    pub fn from_timing(t: &crate::smollm_chat::StepTiming, gen_secs: f64) -> Self {
+        let n = t.passes.max(1) as f64;
+        let ms = |us: u64| us as f64 / 1e3 / n;
+        Breakdown {
+            passes: t.passes,
+            wall_ms: gen_secs * 1e3 / n,
+            worker_ms: ms(t.worker_us),
+            worker_compute_ms: (t.worker_requests > 0).then(|| t.worker_compute_us as f64 / 1e3 / t.worker_requests as f64),
+            local_ms: ms(t.local_us),
+            head_ms: ms(t.head_us),
+            sample_ms: ms(t.sample_us),
+            draft_ms: ms(t.draft_us),
+            emit_ms: ms(t.emit_us),
+            prefill_tok_s: (t.prefill_us > 0 && t.prefill_tokens > 0).then(|| t.prefill_tokens as f64 / (t.prefill_us as f64 / 1e6)),
+        }
+    }
+
+    /// Time per pass not covered by any measured part.
+    pub fn other_ms(&self) -> f64 {
+        (self.wall_ms - self.worker_ms - self.local_ms - self.head_ms - self.sample_ms - self.draft_ms - self.emit_ms).max(0.0)
+    }
+
+    /// Multi-line table for `/timing` and `--bench`.
+    pub fn table(&self, tokens: usize) -> String {
+        if self.passes == 0 {
+            return "No generation yet.".into();
+        }
+        let per_tok = if tokens > 0 { self.passes as f64 / tokens as f64 } else { 1.0 };
+        let mut rows: Vec<(String, f64)> = Vec::new();
+        if self.worker_ms > 0.0 {
+            match self.worker_compute_ms {
+                Some(c) => {
+                    rows.push(("worker compute".into(), c));
+                    rows.push(("network".into(), (self.worker_ms - c).max(0.0)));
+                }
+                None => rows.push(("worker + network".into(), self.worker_ms)),
+            }
+        }
+        rows.push((if self.worker_ms > 0.0 { "local layers".into() } else { "layers".into() }, self.local_ms));
+        rows.push(("LM head".into(), self.head_ms));
+        rows.push(("sampling".into(), self.sample_ms));
+        rows.push(("drafts".into(), self.draft_ms));
+        rows.push(("text + interface".into(), self.emit_ms));
+        rows.push(("unaccounted".into(), self.other_ms()));
+        let mut out = format!(
+            "Per forward pass ({} passes, {:.2} tokens each): {:.1} ms\n",
+            self.passes,
+            1.0 / per_tok.max(1e-9),
+            self.wall_ms
+        );
+        for (name, v) in rows {
+            let pct = if self.wall_ms > 0.0 { v / self.wall_ms * 100.0 } else { 0.0 };
+            out.push_str(&format!("  {name:<18} {v:>7.1} ms  {pct:>3.0}%\n"));
+        }
+        if let Some(p) = self.prefill_tok_s {
+            out.push_str(&format!("Prompt processing: {p:.0} tok/s\n"));
+        }
+        if self.worker_ms > 0.0 && self.worker_compute_ms.is_none() {
+            out.push_str("(the worker doesn't report its compute time; update it to split worker and network)\n");
+        }
+        out.trim_end().to_string()
+    }
 }
 
 impl TurnStats {
@@ -103,7 +188,7 @@ pub fn run_turn(
 ) -> TurnStats {
     let t0 = Instant::now();
     let mut stats = TurnStats::default();
-    let timing0 = engine.cluster_timing;
+    let timing0 = engine.timing;
     let mut input = prompt.to_string();
     let mut seen: HashMap<String, usize> = HashMap::new();
     let aborted = || abort.is_some_and(|a| a.load(Ordering::Relaxed));
@@ -167,7 +252,8 @@ pub fn run_turn(
         }
     }
 
-    let t = engine.cluster_timing;
+    let t = engine.timing;
+    stats.breakdown = Breakdown::from_timing(&t.since(&timing0), stats.gen_secs);
     stats.round_trips = t.steps - timing0.steps;
     if stats.round_trips > 0 {
         stats.worker_ms = (t.worker_us - timing0.worker_us) as f64 / 1e3 / stats.round_trips as f64;

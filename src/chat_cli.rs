@@ -31,6 +31,7 @@ Commands
   /model                    model, memory and context details
   /bench [n]                measure generation speed (default 32 tokens)
   /stats                    toggle detailed timing after each reply
+  /timing                   where the last reply's time went, per forward pass
   /max <n>                  maximum tokens per reply
   /exit                     quit";
 
@@ -257,6 +258,7 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
         2048.min(engine.max_seq)
     };
 
+    let last_timing: std::cell::RefCell<Option<(crate::agent::Breakdown, usize)>> = std::cell::RefCell::new(None);
     let reply = |engine: &mut SmolLm2Engine, text: &str, allow_think: bool, show_think: bool, detailed: bool, max: usize| {
         let mut r = Render::new(show_think);
         let opts = crate::agent::AgentOpts { max_tokens: max, allow_think, ..Default::default() };
@@ -300,11 +302,17 @@ pub fn run(engine: &mut SmolLm2Engine, governor: Option<&Governor>, opts: ChatOp
             },
             &mut confirm,
         );
+        *last_timing.borrow_mut() = Some((stats.breakdown, stats.tokens));
         let mut line = stats_line(stats.gen_secs.max(1e-3), stats.tokens, engine, governor, detailed);
         if stats.tool_calls > 0 {
             line.push_str(&format!(" · {} tool call{}", stats.tool_calls, if stats.tool_calls == 1 { "" } else { "s" }));
         }
         println!("{}", dim(&format!("  {line}")));
+        if detailed && stats.breakdown.passes > 0 {
+            for l in stats.breakdown.table(stats.tokens).lines() {
+                println!("{}", dim(&format!("  {l}")));
+            }
+        }
     };
 
     if engine.n_keep == 0 {
@@ -680,6 +688,10 @@ Spindle adds this file to the system prompt. Describe the project for the model:
                 show_think = false;
                 println!("{}", dim("Reasoning will be collapsed to one line."));
             }
+            "/timing" => match *last_timing.borrow() {
+                Some((b, t)) => println!("{}", dim(&b.table(t))),
+                None => println!("{}", dim("No reply yet. Send a message, then run /timing.")),
+            },
             "/stats" => {
                 detailed = !detailed;
                 println!("{}", dim(if detailed { "Detailed stats on." } else { "Detailed stats off." }));

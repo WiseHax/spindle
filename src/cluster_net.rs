@@ -42,6 +42,12 @@ pub const FRAME_KV_SHIFT: u8 = 0x0B;
 /// Master -> worker (empty): asks for the worker's KV capacity. Reply: `FRAME_KV_INFO` with
 /// `max_seq: u32 LE`. Additive: workers that predate it simply don't answer (master times out).
 pub const FRAME_KV_INFO: u8 = 0x0C;
+/// Client -> worker (empty): asks how long the worker has spent computing. Reply:
+/// `FRAME_TIMING` with `compute_us: u64 LE, requests: u64 LE`, both counted since the
+/// connection opened (STEP and PREFILL requests, from receiving the request to sending the
+/// answer). The client subtracts this from its round-trip time to get the network's share.
+/// Workers older than 1.1 don't answer; the client then stops asking.
+pub const FRAME_TIMING: u8 = 0x0D;
 pub const FRAME_SHUTDOWN: u8 = 0xFF;
 
 #[repr(u8)]
@@ -471,6 +477,8 @@ pub struct ClusterClient {
     pub scratch_payload: Vec<u8>,
     /// Worker KV-cache capacity in positions (`None` = worker too old to report it).
     pub peer_max_seq: Option<usize>,
+    /// Whether the worker answers `FRAME_TIMING` (`None` = not asked yet).
+    pub timing_supported: Option<bool>,
 }
 
 impl ClusterClient {
@@ -529,6 +537,7 @@ impl ClusterClient {
             dim,
             scratch_payload: Vec::with_capacity(32 * 1024),
             peer_max_seq: None,
+            timing_supported: None,
         };
         client.peer_max_seq = client.query_kv_info();
         Ok(client)
@@ -549,6 +558,37 @@ impl ClusterClient {
                 Some(u32::from_le_bytes(p[0..4].try_into().unwrap()) as usize)
             }
             _ => None,
+        }
+    }
+
+    /// The worker's cumulative `(compute_us, requests)`, or `None` if it doesn't report them.
+    /// The first call waits at most 2 s for an answer; after a worker fails to answer once,
+    /// later calls return `None` right away.
+    pub fn worker_timing(&mut self) -> Option<(u64, u64)> {
+        if self.timing_supported == Some(false) {
+            return None;
+        }
+        let first = self.timing_supported.is_none();
+        if first {
+            self.stream.stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        }
+        let res = self
+            .stream
+            .send_frame(FRAME_TIMING, WireFormat::Fp32, &[])
+            .and_then(|_| self.stream.recv_frame());
+        if first {
+            let _ = self.stream.stream.set_read_timeout(None);
+        }
+        match res {
+            Ok((hdr, p)) if hdr.frame_type == FRAME_TIMING && p.len() >= 16 => {
+                self.timing_supported = Some(true);
+                let rd = |i: usize| u64::from_le_bytes(p[i..i + 8].try_into().unwrap());
+                Some((rd(0), rd(8)))
+            }
+            _ => {
+                self.timing_supported = Some(false);
+                None
+            }
         }
     }
 
@@ -748,6 +788,8 @@ pub fn serve_worker_connection(
 
     // Inference loop
     let mut pack_scratch = Vec::new();
+    // Time spent answering STEP and PREFILL requests, reported by FRAME_TIMING.
+    let (mut compute_us, mut requests) = (0u64, 0u64);
     let mut payload = Vec::with_capacity(32 * 1024);
     loop {
         let hdr = match cs.recv_frame_into(&mut payload) {
@@ -783,6 +825,12 @@ pub fn serve_worker_connection(
             FRAME_KV_INFO => {
                 cs.send_frame(FRAME_KV_INFO, WireFormat::Fp32, &(engine.max_seq as u32).to_le_bytes())?;
             }
+            FRAME_TIMING => {
+                let mut p = [0u8; 16];
+                p[0..8].copy_from_slice(&compute_us.to_le_bytes());
+                p[8..16].copy_from_slice(&requests.to_le_bytes());
+                cs.send_frame(FRAME_TIMING, WireFormat::Fp32, &p)?;
+            }
             FRAME_KV_SHIFT => {
                 if payload.len() >= 12 {
                     let rd = |i: usize| u32::from_le_bytes(payload[i..i + 4].try_into().unwrap()) as usize;
@@ -797,6 +845,7 @@ pub fn serve_worker_connection(
                 if payload.len() < 8 {
                     continue;
                 }
+                let t_req = Instant::now();
                 let n_tokens = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
                 let start_pos = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
                 if payload.len() < 8 + n_tokens * 4 {
@@ -823,6 +872,8 @@ pub fn serve_worker_connection(
                     resp_payload.extend_from_slice(&pack_scratch);
                 }
 
+                compute_us += t_req.elapsed().as_micros() as u64;
+                requests += 1;
                 cs.send_frame(FRAME_PREFILL_RESP, wire_format, &resp_payload)?;
             }
             FRAME_STEP_REQ => {
@@ -831,11 +882,14 @@ pub fn serve_worker_connection(
                     None => continue,
                 };
 
+                let t_req = Instant::now();
                 check_kv_bounds(engine, req.pos, 1)?;
                 let act = unsafe { engine.forward_slice(Some(req.token_id), None, req.pos) };
                 engine.cur_pos = req.pos + 1;
 
                 pack_activation(&act, wire_format, &mut pack_scratch);
+                compute_us += t_req.elapsed().as_micros() as u64;
+                requests += 1;
                 cs.send_frame(FRAME_STEP_RESP, wire_format, &pack_scratch)?;
             }
             FRAME_SHUTDOWN => {
@@ -1031,7 +1085,7 @@ mod tests {
         m.speculate = speculate;
         m.set_sampler(crate::smollm_chat::SamplerConfig { temperature: 0.0, repeat_penalty: 1.0, seed: 1, ..Default::default() });
         let (reply, secs, toks) = unsafe { m.generate_reply(prompt, n, false, &mut |_| {}) };
-        let stats = (m.spec_stats, m.cluster_timing.steps);
+        let stats = (m.spec_stats, m.timing.steps);
         if let Some(mut c) = m.cluster_client.take() {
             let _ = c.stream.send_frame(FRAME_SHUTDOWN, WireFormat::Fp32, &[]);
         }

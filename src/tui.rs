@@ -1234,6 +1234,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/init", "create an AGENTS.md / SPINDLE.md with project instructions"),
     ("/model", "model, memory and KV-cache details"),
     ("/cluster", "cluster status and round-trip latency"),
+    ("/timing", "where the last reply's time went, per forward pass"),
     ("/spec", "speculative decoding: /spec on|off|<draft len>"),
     ("/moe-prune", "MoE expert pruning: /moe-prune <n experts | fraction>"),
     ("/system", "show or set the system prompt"),
@@ -1267,6 +1268,8 @@ struct SessionInfo {
     last_tps: Option<f64>,
     spec: (usize, usize),
     branch: Option<String>,
+    /// Timing of the last reply, for /timing: (breakdown, tokens generated).
+    last_timing: Option<(crate::agent::Breakdown, usize)>,
 }
 
 enum UiEvent {
@@ -2021,6 +2024,9 @@ fn run_turn(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, prompt: &str, opts
                 }
                 tui.info.ctx_used = cur_pos;
                 tui.info.last_tps = (stats.tokens > 0).then(|| stats.tok_per_sec());
+                if stats.breakdown.passes > 0 {
+                    tui.info.last_timing = Some((stats.breakdown, stats.tokens));
+                }
                 tui.info.spec = (tui.info.spec.0 + stats.spec_accepted, tui.info.spec.1 + stats.spec_drafted);
                 let mut detail = vec![tui.info.model.clone(), format!("{:.1}s", stats.wall_secs)];
                 if stats.tokens > 0 {
@@ -2114,6 +2120,7 @@ pub fn run_tui(engine: &mut SmolLm2Engine, _governor: Option<&crate::memory_guar
         think: opts.allow_think,
         speculate: engine.speculate,
         last_tps: None,
+        last_timing: None,
         spec: (0, 0),
         branch: SpindleTui::git_branch(),
     };
@@ -2263,6 +2270,13 @@ fn handle_slash_command(tui: &mut SpindleTui, engine: &mut SmolLm2Engine, line: 
                 crate::chat_cli::describe_prune(engine.moe_prune()),
             ));
         }
+        "/timing" | "/stats" => match &tui.info.last_timing {
+            Some((b, tokens)) => {
+                let t = b.table(*tokens);
+                tui.notice(&t);
+            }
+            None => tui.notice("No reply yet. Send a message, then run /timing."),
+        },
         "/cluster" | "/nodes" => match engine.cluster_client.as_mut() {
             Some(c) => {
                 let rtt = c.ping().map(|d| format!("{:.2} ms", d.as_secs_f64() * 1e3)).unwrap_or_else(|e| format!("ping failed: {e}"));
@@ -2346,6 +2360,7 @@ mod tests {
             think: false,
             speculate: true,
             last_tps: Some(11.0),
+            last_timing: None,
             spec: (3, 4),
             branch: None,
         }
