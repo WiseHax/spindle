@@ -73,7 +73,7 @@ seconds:
 - **Digests that keep the signal.** For command output: the first lines, every line with an
   error, warning, failure, panic, traceback or `file:line` location (plus one line around
   each), and as much of the end as fits, with `…` where lines were dropped. A 600-line cargo
-  build with one type error comes back as about 20 lines that still name the error, the file
+  build with one type error comes back as a few dozen lines that still name the error, the file
   and the line.
 - **Find before reading.** `code_map` lists files with their declarations and line numbers,
   ranked by focus words, and a long source file opened from the top starts with its outline.
