@@ -471,7 +471,97 @@ pub struct MoeStats {
     pub expert_bytes: usize,
     /// One flag per `(layer, expert)`: was it used this turn?
     pub touched: Vec<bool>,
+    /// How many times each `(layer, expert)` was picked since load (never reset).
+    pub picks: Vec<u32>,
     pub timing: MoeTiming,
+}
+
+/// Prompt cache file format (see `save_prompt_kv`). Bump the version when the layout or the
+/// numerics of the KV entries change.
+const PROMPT_CACHE_MAGIC: &[u8; 4] = b"SPKV";
+const PROMPT_CACHE_VERSION: u32 = 1;
+
+/// 64-bit FNV-1a, for cache keys.
+struct Fnv64(u64);
+
+impl Fnv64 {
+    fn new() -> Self {
+        Fnv64(0xcbf2_9ce4_8422_2325)
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0 ^ x as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    fn u64(&mut self, v: u64) {
+        self.bytes(&v.to_le_bytes());
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Pick counts for one MoE layer (see `SmolLm2Engine::expert_picks`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpertPicks {
+    pub layer: usize,
+    pub picks: Vec<u32>,
+    pub expert_bytes: u64,
+}
+
+impl ExpertPicks {
+    /// Counts gathered since `earlier` (same layer).
+    pub fn since(&self, earlier: &ExpertPicks) -> ExpertPicks {
+        let picks = self.picks.iter().zip(&earlier.picks).map(|(a, b)| a.saturating_sub(*b)).collect();
+        ExpertPicks { layer: self.layer, picks, expert_bytes: self.expert_bytes }
+    }
+}
+
+/// How concentrated expert use is: for each share of all picks, how many experts per layer
+/// (on average) cover it, and how many bytes those experts take across all layers.
+#[derive(Clone, Debug, Default)]
+pub struct ExpertCoverage {
+    pub layers: usize,
+    pub n_expert: usize,
+    pub total_picks: u64,
+    /// `(share, average experts per layer, bytes for those experts in all layers)`.
+    pub rows: Vec<(f64, f64, u64)>,
+    /// Experts picked at least once, on average per layer.
+    pub used_per_layer: f64,
+    /// Bytes of every expert in these layers.
+    pub all_bytes: u64,
+}
+
+pub fn expert_coverage(layers: &[ExpertPicks], shares: &[f64]) -> ExpertCoverage {
+    let mut cov = ExpertCoverage { layers: layers.len(), ..Default::default() };
+    if layers.is_empty() {
+        return cov;
+    }
+    cov.n_expert = layers[0].picks.len();
+    let mut per_share = vec![(0usize, 0u64); shares.len()];
+    let mut used = 0usize;
+    for l in layers {
+        let mut sorted = l.picks.clone();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let total: u64 = sorted.iter().map(|&c| c as u64).sum();
+        cov.total_picks += total;
+        cov.all_bytes += l.expert_bytes * sorted.len() as u64;
+        used += sorted.iter().filter(|&&c| c > 0).count();
+        for (si, &share) in shares.iter().enumerate() {
+            let target = (total as f64 * share).ceil() as u64;
+            let (mut k, mut cum) = (0usize, 0u64);
+            while k < sorted.len() && cum < target {
+                cum += sorted[k] as u64;
+                k += 1;
+            }
+            per_share[si].0 += k;
+            per_share[si].1 += k as u64 * l.expert_bytes;
+        }
+    }
+    let n = layers.len() as f64;
+    cov.used_per_layer = used as f64 / n;
+    cov.rows = shares.iter().zip(per_share).map(|(&sh, (k, b))| (sh, k as f64 / n, b)).collect();
+    cov
 }
 
 /// Multi-token Mixture-of-Experts FFN: runs the router for every token in `xs`, takes the
@@ -687,6 +777,7 @@ unsafe fn moe_forward_batch(
             if let Some((s, _)) = stats.as_mut() {
                 s.expert_bytes += m.experts.expert(e).bytes();
                 s.touched[layer * m.n_expert + e] = true;
+                s.picks[layer * m.n_expert + e] = s.picks[layer * m.n_expert + e].saturating_add(1);
             }
         }
     }
@@ -869,6 +960,7 @@ unsafe fn moe_forward(
             if let Some((s, _)) = stats.as_mut() {
                 s.expert_bytes += m.experts.expert(e).bytes();
                 s.touched[layer * m.n_expert + e] = true;
+                s.picks[layer * m.n_expert + e] = s.picks[layer * m.n_expert + e].saturating_add(1);
             }
         }
         miss_us += t_rem.map_or(0, |t| t.elapsed().as_micros() as u64);
@@ -885,6 +977,7 @@ unsafe fn moe_forward(
             if let Some((s, _)) = stats.as_mut() {
                 s.expert_bytes += m.experts.expert(e).bytes();
                 s.touched[layer * m.n_expert + e] = true;
+                s.picks[layer * m.n_expert + e] = s.picks[layer * m.n_expert + e].saturating_add(1);
             }
         }
         (0, t_matvec.map_or(0, |t| t.elapsed().as_micros() as u64))
@@ -1485,7 +1578,11 @@ impl SmolLm2Engine {
             system_prompt,
             draft_len,
             enable_tools: false,
-            moe_stats: MoeStats { touched: vec![false; c.n_layers * c.n_expert], ..Default::default() },
+            moe_stats: MoeStats {
+                touched: vec![false; c.n_layers * c.n_expert],
+                picks: vec![0; c.n_layers * c.n_expert],
+                ..Default::default()
+            },
             draft_engine: None,
             spec_stats: (0, 0, 0),
             cluster_client: None,
@@ -1893,6 +1990,20 @@ impl SmolLm2Engine {
 
     pub fn is_moe(&self) -> bool {
         self.cfg.n_expert > 0
+    }
+
+    /// Expert pick counts for this node's MoE layers since load: `(global layer, picks per
+    /// expert, bytes of one expert)`.
+    pub fn expert_picks(&self) -> Vec<ExpertPicks> {
+        let mut out = Vec::new();
+        for (i, ly) in self.layers.iter().enumerate() {
+            if let FfnKind::Moe(m) = &ly.ffn {
+                let layer = self.layer_range.start + i;
+                let row = &self.moe_stats.picks[layer * m.n_expert..(layer + 1) * m.n_expert];
+                out.push(ExpertPicks { layer, picks: row.to_vec(), expert_bytes: m.experts.expert(0).bytes() as u64 });
+            }
+        }
+        out
     }
 
     /// `(MiB of expert weights read per token, experts touched, total experts, timing)` for the
@@ -2787,10 +2898,31 @@ impl SmolLm2Engine {
     }
 
     /// `prefill_system`, calling `progress(done, total)` (in tokens) after every chunk.
-    pub unsafe fn prefill_system_with(&mut self, progress: &mut dyn FnMut(usize, usize)) {
+    /// Returns true when the KV entries came from the on-disk prompt cache instead of being
+    /// computed (see `load_prompt_kv`). On a miss the prompt is computed and then saved.
+    pub unsafe fn prefill_system_with(&mut self, progress: &mut dyn FnMut(usize, usize)) -> bool {
         if self.n_keep == 0 {
             let sys = self.encode_system();
             if !sys.is_empty() {
+                // The cache covers this engine and the worker; a draft model would need its own.
+                let cacheable = self.draft_engine.is_none()
+                    && sys.len() <= self.max_seq
+                    && std::env::var("SPINDLE_NO_PROMPT_CACHE").map_or(true, |v| v != "1");
+                let key = self.prompt_cache_key(&sys);
+                if cacheable {
+                    let local = self.load_prompt_kv(key, &sys).unwrap_or(false);
+                    let worker = match self.cluster_client.as_mut() {
+                        None => true,
+                        Some(c) => c.prompt_cache(crate::cluster_net::PROMPT_CACHE_LOAD, key, &sys) == Some(true),
+                    };
+                    if local && worker {
+                        progress(sys.len(), sys.len());
+                        return true;
+                    }
+                    // A partial hit is no use: compute everything (this overwrites both sides).
+                    self.cur_pos = 0;
+                    self.n_keep = 0;
+                }
                 let mut done = 0;
                 progress(0, sys.len());
                 for chunk in sys.chunks(128) {
@@ -2805,8 +2937,137 @@ impl SmolLm2Engine {
                     draft.n_keep = self.cur_pos;
                 }
                 self.n_keep = self.cur_pos;
+                if cacheable {
+                    if let Err(e) = self.save_prompt_kv(key, &sys) {
+                        crate::vlog!("[prompt-cache] not saved: {e}");
+                    }
+                    if let Some(c) = self.cluster_client.as_mut() {
+                        let _ = c.prompt_cache(crate::cluster_net::PROMPT_CACHE_SAVE, key, &sys);
+                    }
+                }
             }
         }
+        false
+    }
+
+    /// Identifies a cached system prompt: everything that changes its KV entries on this
+    /// node or the worker (spindle version, model file, layer split, MoE pruning, wire
+    /// format, the prompt tokens). Any difference gives a different key, so a stale cache is
+    /// never used.
+    pub fn prompt_cache_key(&self, tokens: &[usize]) -> u64 {
+        let mut h = Fnv64::new();
+        h.bytes(env!("CARGO_PKG_VERSION").as_bytes());
+        h.u64(PROMPT_CACHE_VERSION as u64);
+        h.bytes(self.idx.model_name.as_bytes());
+        h.u64(self.raw_bytes.len() as u64);
+        h.u64(self.cfg.n_layers as u64);
+        h.u64(self.cfg.kv_dim as u64);
+        h.u64(self.moe_prune().to_bits() as u64);
+        if let Some(c) = self.cluster_client.as_ref() {
+            h.u64(c.wire_format as u64);
+            h.u64(c.worker_range.0 as u64);
+            h.u64(c.worker_range.1 as u64);
+        }
+        h.u64(self.layer_range.start as u64);
+        h.u64(self.layer_range.end as u64);
+        for &t in tokens {
+            h.u64(t as u64);
+        }
+        h.finish()
+    }
+
+    /// `<model>.kv-<layers>.bin`: one prompt cache file per layer range, next to the model.
+    fn prompt_cache_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(format!("{}.kv-{}-{}.bin", self.path, self.layer_range.start, self.layer_range.end))
+    }
+
+    /// Writes the KV entries of positions `0..tokens.len()` for this node's layers. The file
+    /// is replaced atomically (written to a temp name, then renamed), so a crash mid-write
+    /// can't leave a half file behind.
+    pub fn save_prompt_kv(&self, key: u64, tokens: &[usize]) -> std::io::Result<()> {
+        use std::io::Write;
+        let n = tokens.len();
+        let kv = self.cfg.kv_dim;
+        if n == 0 || n > self.max_seq || self.cur_pos < n {
+            return Err(Error::new(ErrorKind::InvalidInput, "prompt not fully in the cache"));
+        }
+        let path = self.prompt_cache_path();
+        let tmp = path.with_extension("bin.tmp");
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        f.write_all(PROMPT_CACHE_MAGIC)?;
+        for v in [PROMPT_CACHE_VERSION as u64, key, n as u64, self.layers.len() as u64, kv as u64] {
+            f.write_all(&v.to_le_bytes())?;
+        }
+        for &t in tokens {
+            f.write_all(&(t as u32).to_le_bytes())?;
+        }
+        for cache in [&self.k_cache, &self.v_cache] {
+            for l in 0..self.layers.len() {
+                let start = l * self.max_seq * kv;
+                let part = &cache[start..start + n * kv];
+                // SAFETY: u16 has no padding; little-endian on x86-64.
+                let bytes = unsafe { std::slice::from_raw_parts(part.as_ptr() as *const u8, part.len() * 2) };
+                f.write_all(bytes)?;
+            }
+        }
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)?;
+        crate::vlog!("[prompt-cache] saved {n} tokens to {}", path.display());
+        Ok(())
+    }
+
+    /// Fills positions `0..tokens.len()` from the prompt cache file if it was saved with the
+    /// same `key` and the same tokens. Returns false (and changes nothing) otherwise.
+    pub fn load_prompt_kv(&mut self, key: u64, tokens: &[usize]) -> std::io::Result<bool> {
+        use std::io::Read;
+        let n = tokens.len();
+        let kv = self.cfg.kv_dim;
+        if n == 0 || n > self.max_seq {
+            return Ok(false);
+        }
+        let path = self.prompt_cache_path();
+        let Ok(file) = std::fs::File::open(&path) else { return Ok(false) };
+        let mut f = std::io::BufReader::new(file);
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        let mut hdr = [0u64; 5];
+        for v in hdr.iter_mut() {
+            let mut b = [0u8; 8];
+            f.read_exact(&mut b)?;
+            *v = u64::from_le_bytes(b);
+        }
+        if &magic != PROMPT_CACHE_MAGIC
+            || hdr != [PROMPT_CACHE_VERSION as u64, key, n as u64, self.layers.len() as u64, kv as u64]
+        {
+            return Ok(false);
+        }
+        let mut tb = vec![0u8; n * 4];
+        f.read_exact(&mut tb)?;
+        if tb.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize).ne(tokens.iter().copied()) {
+            return Ok(false);
+        }
+        // Read everything before touching the live cache, so a short file changes nothing.
+        let per_layer = n * kv;
+        let mut data = vec![0u16; 2 * self.layers.len() * per_layer];
+        {
+            // SAFETY: plain u16 buffer viewed as bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data.len() * 2) };
+            f.read_exact(bytes)?;
+        }
+        let n_layers = self.layers.len();
+        for (ci, cache) in [&mut self.k_cache, &mut self.v_cache].into_iter().enumerate() {
+            for l in 0..n_layers {
+                let src = &data[(ci * n_layers + l) * per_layer..(ci * n_layers + l + 1) * per_layer];
+                let start = l * self.max_seq * kv;
+                cache[start..start + per_layer].copy_from_slice(src);
+            }
+        }
+        self.cur_pos = n;
+        self.n_keep = n;
+        self.remember_tokens(tokens);
+        crate::vlog!("[prompt-cache] loaded {n} tokens from {}", path.display());
+        Ok(true)
     }
 
     /// A user message followed by the opening of the assistant's reply.
@@ -3338,6 +3599,38 @@ mod tests {
             println!("[speculative:test] {toks} tokens in {secs:.3}s | stats: {:?} | reply: {reply:?}", target.spec_stats);
             assert!(target.spec_stats.0 > 0, "Expected accepted draft tokens");
         }
+    }
+
+    /// A system prompt loaded from the on-disk cache gives exactly the same reply as one
+    /// computed from scratch, and a changed prompt never reuses the old cache.
+    #[test]
+    fn prompt_cache_restores_identical_replies() {
+        let path = "smollm2-135m-q4_k_m.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let greedy = SamplerConfig { temperature: 0.0, ..SamplerConfig::default() };
+        let mut a = SmolLm2Engine::load(path).expect("load");
+        a.set_sampler(greedy);
+        let cache = a.prompt_cache_path();
+        let _ = std::fs::remove_file(&cache);
+        unsafe {
+            assert!(!a.prefill_system_with(&mut |_, _| {}), "first run computes the prompt");
+            assert!(cache.exists(), "and saves it");
+            let (ra, _, _) = a.generate_reply("Name three colors.", 16, false, &mut |_| {});
+
+            let mut b = SmolLm2Engine::load(path).expect("load");
+            b.set_sampler(greedy);
+            assert!(b.prefill_system_with(&mut |_, _| {}), "second run loads it");
+            assert_eq!((b.cur_pos, b.n_keep), (a.n_keep, a.n_keep));
+            let (rb, _, _) = b.generate_reply("Name three colors.", 16, false, &mut |_| {});
+            assert_eq!(ra, rb, "cached prompt must give the same reply");
+
+            b.reset_kv();
+            b.set_system_prompt("You are a terse assistant.");
+            assert!(!b.prefill_system_with(&mut |_, _| {}), "a different prompt is a miss");
+        }
+        let _ = std::fs::remove_file(&cache);
     }
 
     const LOOKUP_PROMPT: &str = "Copy this Rust function exactly, inside a rust code block:\n\n\

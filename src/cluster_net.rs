@@ -48,6 +48,19 @@ pub const FRAME_KV_INFO: u8 = 0x0C;
 /// answer). The client subtracts this from its round-trip time to get the network's share.
 /// Workers older than 1.1 don't answer; the client then stops asking.
 pub const FRAME_TIMING: u8 = 0x0D;
+/// Client -> worker (empty): asks for the worker's expert pick counts since it loaded.
+/// Reply: `FRAME_EXPERT_STATS` with `n_layers: u32`, then per layer `layer: u32,
+/// expert_bytes: u64, n_expert: u32, picks: n_expert x u32` (all LE). Older workers don't
+/// answer; the client then stops asking.
+pub const FRAME_EXPERT_STATS: u8 = 0x0E;
+/// Client -> worker: load or save the worker's part of the system prompt's KV entries.
+/// Payload: `op: u8` (`PROMPT_CACHE_LOAD` / `PROMPT_CACHE_SAVE`), `key: u64`, `n: u32`, then
+/// `n` token ids (u32 LE). Reply: `FRAME_PROMPT_CACHE` with one byte, 1 = done, 0 = no
+/// matching cache (load) or not saved. Older workers don't answer; the client then stops
+/// using the cache on that connection.
+pub const FRAME_PROMPT_CACHE: u8 = 0x0F;
+pub const PROMPT_CACHE_LOAD: u8 = 0;
+pub const PROMPT_CACHE_SAVE: u8 = 1;
 pub const FRAME_SHUTDOWN: u8 = 0xFF;
 
 #[repr(u8)]
@@ -479,6 +492,10 @@ pub struct ClusterClient {
     pub peer_max_seq: Option<usize>,
     /// Whether the worker answers `FRAME_TIMING` (`None` = not asked yet).
     pub timing_supported: Option<bool>,
+    /// Whether the worker answers `FRAME_EXPERT_STATS` (`None` = not asked yet).
+    pub expert_stats_supported: Option<bool>,
+    /// Whether the worker answers `FRAME_PROMPT_CACHE` (`None` = not asked yet).
+    pub prompt_cache_supported: Option<bool>,
 }
 
 impl ClusterClient {
@@ -538,6 +555,8 @@ impl ClusterClient {
             scratch_payload: Vec::with_capacity(32 * 1024),
             peer_max_seq: None,
             timing_supported: None,
+            expert_stats_supported: None,
+            prompt_cache_supported: None,
         };
         client.peer_max_seq = client.query_kv_info();
         Ok(client)
@@ -590,6 +609,63 @@ impl ClusterClient {
                 None
             }
         }
+    }
+
+    /// Asks the worker to load or save its part of the prompt cache. `Some(true)` = done,
+    /// `Some(false)` = no matching cache / not saved, `None` = the worker doesn't support it.
+    pub fn prompt_cache(&mut self, op: u8, key: u64, tokens: &[usize]) -> Option<bool> {
+        if self.prompt_cache_supported == Some(false) {
+            return None;
+        }
+        let first = self.prompt_cache_supported.is_none();
+        let mut p = Vec::with_capacity(13 + tokens.len() * 4);
+        p.push(op);
+        p.extend_from_slice(&key.to_le_bytes());
+        p.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+        for &t in tokens {
+            p.extend_from_slice(&(t as u32).to_le_bytes());
+        }
+        // Saving writes ~100 MB on the worker; give it time. The first ask (support check)
+        // gets a short timeout so an old worker can't stall startup.
+        let wait = if first { 3 } else if op == PROMPT_CACHE_SAVE { 60 } else { 30 };
+        self.stream.stream.set_read_timeout(Some(Duration::from_secs(wait))).ok()?;
+        let res = self.stream.send_frame(FRAME_PROMPT_CACHE, WireFormat::Fp32, &p).and_then(|_| self.stream.recv_frame());
+        let _ = self.stream.stream.set_read_timeout(None);
+        match res {
+            Ok((hdr, r)) if hdr.frame_type == FRAME_PROMPT_CACHE => {
+                self.prompt_cache_supported = Some(true);
+                Some(r.first() == Some(&1))
+            }
+            _ => {
+                self.prompt_cache_supported = Some(false);
+                None
+            }
+        }
+    }
+
+    /// The worker's expert pick counts (see `FRAME_EXPERT_STATS`), or `None` if it doesn't
+    /// report them.
+    pub fn worker_expert_picks(&mut self) -> Option<Vec<crate::smollm_chat::ExpertPicks>> {
+        if self.expert_stats_supported == Some(false) {
+            return None;
+        }
+        let first = self.expert_stats_supported.is_none();
+        if first {
+            self.stream.stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        }
+        let res = self
+            .stream
+            .send_frame(FRAME_EXPERT_STATS, WireFormat::Fp32, &[])
+            .and_then(|_| self.stream.recv_frame());
+        if first {
+            let _ = self.stream.stream.set_read_timeout(None);
+        }
+        let parsed = match res {
+            Ok((hdr, p)) if hdr.frame_type == FRAME_EXPERT_STATS => decode_expert_stats(&p),
+            _ => None,
+        };
+        self.expert_stats_supported = Some(parsed.is_some());
+        parsed
     }
 
     /// Mirrors the master's KV shift on the worker (see `FRAME_KV_SHIFT`).
@@ -725,6 +801,41 @@ impl ClusterClient {
     }
 }
 
+pub fn encode_expert_stats(layers: &[crate::smollm_chat::ExpertPicks]) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&(layers.len() as u32).to_le_bytes());
+    for l in layers {
+        p.extend_from_slice(&(l.layer as u32).to_le_bytes());
+        p.extend_from_slice(&l.expert_bytes.to_le_bytes());
+        p.extend_from_slice(&(l.picks.len() as u32).to_le_bytes());
+        for &c in &l.picks {
+            p.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+    p
+}
+
+pub fn decode_expert_stats(p: &[u8]) -> Option<Vec<crate::smollm_chat::ExpertPicks>> {
+    let u32_at = |i: usize| p.get(i..i + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u64_at = |i: usize| p.get(i..i + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let n = u32_at(0)? as usize;
+    let mut i = 4;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let layer = u32_at(i)? as usize;
+        let expert_bytes = u64_at(i + 4)?;
+        let ne = u32_at(i + 12)? as usize;
+        i += 16;
+        let mut picks = Vec::with_capacity(ne);
+        for _ in 0..ne {
+            picks.push(u32_at(i)?);
+            i += 4;
+        }
+        out.push(crate::smollm_chat::ExpertPicks { layer, picks, expert_bytes });
+    }
+    Some(out)
+}
+
 fn check_kv_bounds(engine: &SmolLm2Engine, start: usize, n: usize) -> std::io::Result<()> {
     if start + n > engine.max_seq || n == 0 {
         eprintln!(
@@ -824,6 +935,34 @@ pub fn serve_worker_connection(
             }
             FRAME_KV_INFO => {
                 cs.send_frame(FRAME_KV_INFO, WireFormat::Fp32, &(engine.max_seq as u32).to_le_bytes())?;
+            }
+            FRAME_PROMPT_CACHE => {
+                let ok = (|| -> Option<bool> {
+                    let op = *payload.first()?;
+                    let key = u64::from_le_bytes(payload.get(1..9)?.try_into().ok()?);
+                    let n = u32::from_le_bytes(payload.get(9..13)?.try_into().ok()?) as usize;
+                    let tokens: Vec<usize> = payload
+                        .get(13..13 + n * 4)?
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes(c.try_into().unwrap()) as usize)
+                        .collect();
+                    Some(match op {
+                        PROMPT_CACHE_LOAD => {
+                            let hit = engine.load_prompt_kv(key, &tokens).unwrap_or(false);
+                            if hit {
+                                println!("  System prompt loaded from cache ({n} tokens).");
+                            }
+                            hit
+                        }
+                        PROMPT_CACHE_SAVE => engine.save_prompt_kv(key, &tokens).is_ok(),
+                        _ => false,
+                    })
+                })()
+                .unwrap_or(false);
+                cs.send_frame(FRAME_PROMPT_CACHE, WireFormat::Fp32, &[ok as u8])?;
+            }
+            FRAME_EXPERT_STATS => {
+                cs.send_frame(FRAME_EXPERT_STATS, WireFormat::Fp32, &encode_expert_stats(&engine.expert_picks()))?;
             }
             FRAME_TIMING => {
                 let mut p = [0u8; 16];

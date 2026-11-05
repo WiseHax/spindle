@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Startup
+
+- The system prompt's KV entries are saved to disk after the first start (on the client and
+  on the worker, each for its own layers, next to the model as `<model>.kv-<layers>.bin`).
+  Later starts load them instead of recomputing: on Qwen3-0.6B over a local worker, the
+  902-token tools prompt went from 5.9 s to 61 ms. The cache key covers the spindle version,
+  the model file, the layer split, MoE pruning, the wire format and the prompt itself, so
+  any change computes it again. A test checks that the reply is identical either way. Set
+  `SPINDLE_NO_PROMPT_CACHE=1` to turn it off.
+
+### Measuring (more)
+
+- `--bench` on MoE models reports expert usage: how many experts per layer cover 50%, 90%,
+  95% and 99% of the picks, and how much RAM those experts take. On two PCs it includes the
+  worker's layers (`FRAME_EXPERT_STATS`, a new frame).
+
 ### Measuring
 
 - `/timing` (both interfaces) shows where the last reply's time went, per forward pass:

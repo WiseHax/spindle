@@ -1567,14 +1567,15 @@ fn main() -> Result<()> {
             if cli.raw.is_none() && !uses_tui {
                 let step = loader.as_ref().map(|l| l.step("Prompt", "processing the system prompt"));
                 let mut total = 0;
-                engine.prefill_system_with(&mut |done, all| {
+                let cached = engine.prefill_system_with(&mut |done, all| {
                     total = all;
                     if let Some(s) = step.as_ref() {
                         s.progress(done as u64, all as u64, format!("{} / {} tokens", loading::fmt_count(done), loading::fmt_count(all)));
                     }
                 });
                 if let Some(s) = step {
-                    s.done(&format!("system prompt cached ({} tokens) · context {} tokens", loading::fmt_count(total), loading::fmt_count(engine.max_seq)));
+                    let how = if cached { "loaded from disk" } else { "processed" };
+                    s.done(&format!("system prompt {how} ({} tokens) · context {} tokens", loading::fmt_count(total), loading::fmt_count(engine.max_seq)));
                 }
             }
             let startup = loader.as_ref().map(|l| l.results()).unwrap_or_default();

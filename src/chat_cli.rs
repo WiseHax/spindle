@@ -295,6 +295,7 @@ pub fn run_bench(engine: &mut SmolLm2Engine, runs: usize, max_tokens: usize) {
         ))
     );
     println!();
+    let picks0 = all_expert_picks(engine);
     let mut all = crate::smollm_chat::StepTiming::default();
     let mut all_secs = 0.0;
     let mut all_tokens = 0usize;
@@ -330,6 +331,48 @@ pub fn run_bench(engine: &mut SmolLm2Engine, runs: usize, max_tokens: usize) {
     engine.set_sampler(saved_sampler);
     println!();
     println!("{}", Breakdown::from_timing(&all, all_secs).table(all_tokens));
+    if engine.is_moe() {
+        let picks1 = all_expert_picks(engine);
+        let delta: Vec<_> = picks1
+            .iter()
+            .filter_map(|b| picks0.iter().find(|a| a.layer == b.layer).map(|a| b.since(a)))
+            .collect();
+        println!();
+        println!("{}", expert_report(&delta));
+    }
+}
+
+/// Expert pick counts for every MoE layer: this PC's, plus the worker's when it reports them.
+fn all_expert_picks(engine: &mut SmolLm2Engine) -> Vec<crate::smollm_chat::ExpertPicks> {
+    let mut v = engine.expert_picks();
+    if let Some(c) = engine.cluster_client.as_mut() {
+        if let Some(w) = c.worker_expert_picks() {
+            v.extend(w);
+        }
+    }
+    v.sort_by_key(|p| p.layer);
+    v
+}
+
+/// How many experts (and how much RAM) cover most of the picks, from benchmark counts.
+fn expert_report(layers: &[crate::smollm_chat::ExpertPicks]) -> String {
+    let shares = [0.5, 0.9, 0.95, 0.99, 1.0];
+    let cov = crate::smollm_chat::expert_coverage(layers, &shares);
+    if cov.total_picks == 0 {
+        return "Expert usage: no expert picks recorded.".into();
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut out = format!(
+        "Expert usage: {} picks over {} MoE layers ({} experts each)\n  share of picks   experts per layer   RAM for those experts\n",
+        cov.total_picks, cov.layers, cov.n_expert
+    );
+    for (share, k, bytes) in &cov.rows {
+        let label = if *share >= 1.0 { "all picks".to_string() } else { format!("{:.0}%", share * 100.0) };
+        out.push_str(&format!("  {label:<16} {k:>8.1}            {:>6.2} GiB\n", gib(*bytes)));
+    }
+    out.push_str(&format!("  every expert     {:>8}            {:>6.2} GiB\n", cov.n_expert, gib(cov.all_bytes)));
+    out.push_str("Counted on the benchmark prompts only; a wider mix of work uses more experts.");
+    out
 }
 
 fn add_timing(a: &crate::smollm_chat::StepTiming, b: &crate::smollm_chat::StepTiming) -> crate::smollm_chat::StepTiming {
