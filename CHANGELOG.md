@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Measuring
+
+- `/timing` (both interfaces) shows where the last reply's time went, per forward pass:
+  worker compute, network, local layers, LM head, sampling, drafts, text and interface, and
+  whatever is left unaccounted, plus the prompt processing speed.
+- The worker reports its own compute time (`FRAME_TIMING`, a new frame), so the client can
+  split worker time from network time. Workers older than this don't answer; the client
+  asks once, then stops.
+- `spindle --bench [runs]` runs three fixed prompts (prose, a copy-heavy code edit, a list)
+  in one session, greedy, each from the same starting point, and prints the median speed,
+  accepted drafts and the time breakdown. `tools\bench.ps1` wraps it and saves the result with
+  the commit, CPU and free RAM to `bench-logs\`.
+- When this PC's share of the weights doesn't fit in RAM, the startup display says how much
+  is needed and how much is free, instead of only "read from disk".
+- The RAM fit check uses the exact size of this PC's layers and LM head, not an estimate from
+  the file size.
+
 ## 1.0.0 (2026-11-05)
 
 First release. Spindle runs Qwen3-30B-A3B across two PCs on a home network (7–8 tok/s on a

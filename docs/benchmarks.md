@@ -4,6 +4,21 @@ Every number here was measured, and each section says how. Laptop clocks are noi
 expect about ±10% between runs. Free RAM matters a lot on an 8 GB machine. A model that
 fits in RAM on one run can stream from disk on the next, if a browser was open in between.
 
+## Running the benchmark
+
+`spindle --bench` runs three fixed prompts in one session: fresh prose, a copy-heavy code
+edit, and a list. It uses greedy sampling and starts each prompt from the same point, so runs
+are comparable. It prints the median speed per prompt, the accepted drafts, and where the
+time went per forward pass. It uses `spindle.toml` like a normal start, so on two PCs it
+measures the cluster.
+
+```powershell
+.\tools\bench.ps1            # 3 runs per prompt, saved to bench-logs\ with commit, CPU and free RAM
+.\tools\bench.ps1 -Runs 5 -Extra "--no-spec"
+```
+
+During a chat, `/timing` shows the same breakdown for the last reply.
+
 ## Machines
 
 | | Laptop (dev machine, client) | Desktop (worker) |
