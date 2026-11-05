@@ -26,27 +26,32 @@ model prune the same way. A change made during a chat applies to both.
 
 ## What it costs
 
-Pruning changes the model's computation, so it changes the output. The kept experts are the
-ones the router weighted most, so the change is usually small, but it is not zero. Unlike
-speculative decoding, pruning is not exact.
+Pruning changes the model's computation, so it changes the output. Unlike speculative
+decoding, it is not exact.
 
-Spindle 1.0 has no perplexity or benchmark-score measurements for pruning yet. What has been
-checked:
+Measured with `spindle --ppl tools/ppl_sample.txt` (883 tokens of prose and code) on
+Qwen3-30B-A3B Q4_K_M, split across two PCs with fp8 activations. Lower perplexity is better:
 
-- A unit test (`test_dynamic_moe_pruning`) runs a small random layer with and without
-  pruning and checks that the output stays finite. It does not measure quality.
-- Qwen3-30B-A3B with `moe_prune = 4` holds normal multi-turn conversations and tool use in
-  daily use on the two-PC setup.
+| Setting | Perplexity | vs all 8 experts |
+|---|---|---|
+| all 8 experts (`moe_prune = 0`) | 6.357 | — |
+| top 4 (`moe_prune = 4`) | 8.169 | +28.5% |
+| top 4 with `--resident-experts` | 8.520 | +34.0% |
 
-If answers look off, turn it off (`/moe-prune 0`) and compare. A fraction such as `0.05` drops
-experts only when the router really concentrates its weight, so it is the more cautious
-setting.
+Running half the experts costs noticeably more quality than the router weights suggest. For
+work where answers matter (code, reasoning, tool use), keep all experts unless speed is the
+only goal. A fraction such as `0.1` drops experts only when the router concentrates its weight,
+which should cost less. Measure it with `--ppl` the same way before relying on it.
+
+Also checked: a unit test (`test_dynamic_moe_pruning`) runs a small random layer with and
+without pruning and checks that the output stays finite.
 
 ## Where it helps
 
 Expert weights are read straight from the memory-mapped file. A pruned expert is never
 touched, and when the model streams from disk, it is never prefetched either. With 4 of 8
 experts, a Qwen3-30B-A3B token reads roughly a quarter fewer bytes. The experts are about
-1.8 of the 3.3 billion weights a token uses. How much of that becomes speed depends on what else the step waits for, such as attention, the LM head and the
-network. On the two-PC setup it is one of the settings behind the 7–8 tok/s figure in the
-README. A careful measurement with and without pruning is on the roadmap.
+1.8 of the 3.3 billion weights a token uses. How much of that becomes speed depends on what
+else the step waits for, such as attention, the LM head and the network. On the two-PC setup,
+top 4 on both PCs ran at 9.1 tok/s on prose. The same benchmark with all 8 experts on both
+PCs hasn't been measured yet.
