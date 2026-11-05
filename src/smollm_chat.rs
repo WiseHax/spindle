@@ -161,6 +161,27 @@ struct Moe {
     shared_gate: Option<usize>,
     /// Relative probability cutoff for dynamic MoE expert pruning (0.0 = disabled).
     moe_prune: f32,
+    /// Resident-only routing: when set, the router only picks experts whose bit is set
+    /// (the ones locked in RAM), so no expert is read from disk. Up to 256 experts.
+    resident: Option<[u64; 4]>,
+}
+
+/// Zeroes the router probability of every expert that is not resident, when resident-only
+/// routing is on and at least `n_used` experts are resident (otherwise routing is left as
+/// is). Top-k then picks among resident experts, and the chosen weights are renormalized as
+/// usual.
+#[inline]
+fn mask_non_resident(m: &Moe, probs: &mut [f32]) {
+    if let Some(mask) = m.resident {
+        let resident = |e: usize| mask[e / 64] >> (e % 64) & 1 == 1;
+        if (0..m.n_expert).filter(|&e| resident(e)).count() >= m.n_used {
+            for (e, p) in probs.iter_mut().enumerate() {
+                if !resident(e) {
+                    *p = 0.0;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,6 +252,7 @@ fn resolve_layers(idx: &GgufModelIndex, c: &ModelConfig, layer_range: std::ops::
                     shared,
                     shared_gate: vec_f32(&n("ffn_gate_inp_shexp.weight"))?,
                     moe_prune: 0.0,
+                    resident: None,
                 })
             } else if find(&n("ffn_gate.0.weight")).is_some() {
                 return Err(invalid("old per-expert Mixtral layout (ffn_gate.N) is not supported; re-convert the GGUF".into()));
@@ -477,8 +499,10 @@ pub struct MoeStats {
 }
 
 /// What `pin_weights` locked into RAM.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct PinPlan {
+    /// `(global layer, expert)` of every expert locked in RAM.
+    pub pinned: Vec<(usize, usize)>,
     /// Attention, norms, routers, shared experts and the LM head.
     pub dense_bytes: usize,
     /// Routed experts, chosen by earlier usage.
@@ -502,6 +526,17 @@ const EXPERT_STATS_MAGIC: &[u8; 4] = b"SPEX";
 /// numerics of the KV entries change.
 const PROMPT_CACHE_MAGIC: &[u8; 4] = b"SPKV";
 const PROMPT_CACHE_VERSION: u32 = 1;
+
+/// `key` combined with `extra`; unchanged when `extra` is 0.
+fn mix_key(key: u64, extra: u64) -> u64 {
+    if extra == 0 {
+        return key;
+    }
+    let mut h = Fnv64::new();
+    h.u64(key);
+    h.u64(extra);
+    h.finish()
+}
 
 /// 64-bit FNV-1a, for cache keys.
 struct Fnv64(u64);
@@ -626,6 +661,7 @@ unsafe fn moe_forward_batch(
         probs.iter_mut().for_each(|p| *p = (*p - max).exp());
         let sum: f32 = probs.iter().sum();
         probs.iter_mut().for_each(|p| *p /= sum);
+        mask_non_resident(m, probs);
 
         let mut chosen: Vec<usize> = (0..m.n_expert).collect();
         chosen.select_nth_unstable_by(m.n_used - 1, |&a, &b| probs[b].total_cmp(&probs[a]));
@@ -859,6 +895,7 @@ unsafe fn moe_forward(
     probs.iter_mut().for_each(|p| *p = (*p - max).exp());
     let sum: f32 = probs.iter().sum();
     probs.iter_mut().for_each(|p| *p /= sum);
+    mask_non_resident(m, probs);
 
     let mut stack_chosen = [0usize; 256];
     let mut heap_chosen;
@@ -1226,6 +1263,10 @@ pub struct SmolLm2Engine {
     pub prior_picks: Vec<u32>,
     /// When the pick counts were last written to disk.
     stats_saved_at: Option<std::time::Instant>,
+    /// Experts locked in RAM by `pin_weights` (`(global layer, expert)`).
+    resident_experts: Vec<(usize, usize)>,
+    /// Resident-only routing is on (see `set_resident_only`).
+    pub resident_only: bool,
     /// Reads layers `first..` into private buffers when they don't fit in RAM.
     streamer: Option<crate::layer_stream::LayerStreamer>,
     /// Explicit in-RAM expert cache for streaming MoE weights from disk.
@@ -1575,6 +1616,8 @@ impl SmolLm2Engine {
             free_at_load: avail_ram,
             prior_picks: Vec::new(),
             stats_saved_at: None,
+            resident_experts: Vec::new(),
+            resident_only: false,
             prefetcher,
             streamer: None,
             expert_cache: None,
@@ -1967,6 +2010,7 @@ impl SmolLm2Engine {
             total += bytes;
             chosen.extend(spans);
             plan.experts += 1;
+            plan.pinned.push((layer, e));
             covered += count as u64;
         }
         if total == 0 || !crate::memory_guard::allow_locking((total + 64 * 1024 * 1024) as u64) {
@@ -1983,6 +2027,105 @@ impl SmolLm2Engine {
         plan.coverage = (total_prior > 0).then(|| covered as f64 / total_prior as f64);
         plan.has_stats = total_prior > 0;
         plan
+    }
+
+    /// Records which experts `pin_weights` locked, for resident-only routing.
+    pub fn set_resident_experts(&mut self, experts: &[(usize, usize)]) {
+        self.resident_experts = experts.to_vec();
+        if self.resident_only {
+            self.apply_resident_masks();
+        }
+    }
+
+    /// Resident-only routing: each MoE layer picks only among the experts locked in RAM, so
+    /// nothing is read from disk while generating. It changes the output (like `moe_prune`),
+    /// so it is off by default. It has no effect when nothing was pinned (the whole share fits
+    /// in RAM, or there is no usage history yet). On a cluster the worker applies it to its
+    /// own layers with its own pinned set. Returns whether routing is restricted here.
+    pub fn set_resident_only(&mut self, on: bool) -> bool {
+        self.resident_only = on;
+        if let Some(c) = self.cluster_client.as_mut() {
+            let _ = c.set_resident_only(on);
+        }
+        self.apply_resident_masks()
+    }
+
+    fn apply_resident_masks(&mut self) -> bool {
+        let start = self.layer_range.start;
+        let on = self.resident_only && !self.resident_experts.is_empty();
+        let mut any = false;
+        for (i, ly) in self.layers.iter_mut().enumerate() {
+            if let FfnKind::Moe(m) = &mut ly.ffn {
+                m.resident = None;
+                if on && m.n_expert <= 256 {
+                    let mut mask = [0u64; 4];
+                    for &(l, e) in &self.resident_experts {
+                        if l == start + i {
+                            mask[e / 64] |= 1 << (e % 64);
+                        }
+                    }
+                    m.resident = Some(mask);
+                    any = true;
+                }
+            }
+        }
+        any
+    }
+
+    /// Identifies the resident set when resident-only routing is on (0 when it is off), so
+    /// prompt caches saved under one routing are never loaded under another.
+    pub fn resident_hash(&self) -> u64 {
+        if !self.resident_only || self.resident_experts.is_empty() {
+            return 0;
+        }
+        let mut v = self.resident_experts.clone();
+        v.sort_unstable();
+        let mut h = Fnv64::new();
+        h.bytes(b"resident");
+        for (l, e) in v {
+            h.u64((l as u64) << 32 | e as u64);
+        }
+        h.finish()
+    }
+
+    /// Perplexity of the model on `text` (no chat framing), over at most `max_tokens`
+    /// tokens: exp of the mean negative log-likelihood of each next token. Lower is better.
+    /// Used to measure what settings that change the output (MoE pruning, resident-only
+    /// routing, wire format) cost in quality. Clears the conversation. Returns
+    /// `(perplexity, tokens scored)`.
+    pub unsafe fn perplexity(&mut self, text: &str, max_tokens: usize, progress: &mut dyn FnMut(usize, usize)) -> (f64, usize) {
+        self.reset_kv();
+        let mut ids: Vec<usize> = self.bos.into_iter().collect();
+        ids.extend(self.encode_bpe_segment(text));
+        ids.truncate(max_tokens.min(self.max_seq));
+        let n = ids.len();
+        if n < 2 {
+            return (f64::NAN, 0);
+        }
+        let vocab = self.cfg.vocab;
+        let scale = self.cfg.logit_scale;
+        let (mut nll, mut scored) = (0.0f64, 0usize);
+        let mut pos = 0;
+        for chunk in ids.chunks(32) {
+            let hs = self.verify_forward(chunk, pos);
+            self.compute_logits_batch(&hs);
+            for i in 0..chunk.len() {
+                let next = pos + i + 1;
+                if next >= n {
+                    break;
+                }
+                let row = &self.batch_logits[i * vocab..(i + 1) * vocab];
+                let max = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b / scale)) as f64;
+                let lse = max + row.iter().map(|&x| ((x / scale) as f64 - max).exp()).sum::<f64>().ln();
+                nll += lse - (row[ids[next]] / scale) as f64;
+                scored += 1;
+            }
+            pos += chunk.len();
+            self.cur_pos = pos;
+            progress(pos, n);
+        }
+        self.reset_kv();
+        ((nll / scored.max(1) as f64).exp(), scored)
     }
 
     /// This node's experts that earlier sessions picked, most picked first:
@@ -3124,6 +3267,7 @@ impl SmolLm2Engine {
     /// can't leave a half file behind.
     pub fn save_prompt_kv(&self, key: u64, tokens: &[usize]) -> std::io::Result<()> {
         use std::io::Write;
+        let key = mix_key(key, self.resident_hash());
         let n = tokens.len();
         let kv = self.cfg.kv_dim;
         if n == 0 || n > self.max_seq || self.cur_pos < n {
@@ -3159,6 +3303,7 @@ impl SmolLm2Engine {
     /// same `key` and the same tokens. Returns false (and changes nothing) otherwise.
     pub fn load_prompt_kv(&mut self, key: u64, tokens: &[usize]) -> std::io::Result<bool> {
         use std::io::Read;
+        let key = mix_key(key, self.resident_hash());
         let n = tokens.len();
         let kv = self.cfg.kv_dim;
         if n == 0 || n > self.max_seq {
@@ -3742,6 +3887,41 @@ mod tests {
         }
     }
 
+    /// Resident-only routing with every expert resident changes nothing; with only some
+    /// experts resident it changes the result but stays a valid model (finite perplexity).
+    #[test]
+    fn resident_only_routing_is_exact_when_all_experts_are_resident() {
+        let path = "granite-moe-1b-q8_0.gguf";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let text = "The river had been rising for three days before anyone in the valley took it seriously. On the first morning it was only a little higher than usual.";
+        let mut e = SmolLm2Engine::load(path).expect("load");
+        let n_exp = e.cfg.n_expert;
+        let n_layers = e.cfg.n_layers;
+        unsafe {
+            let (base, n) = e.perplexity(text, 64, &mut |_, _| {});
+            assert!(base.is_finite() && n > 10);
+
+            let all: Vec<(usize, usize)> = (0..n_layers).flat_map(|l| (0..n_exp).map(move |x| (l, x))).collect();
+            e.set_resident_experts(&all);
+            assert!(e.set_resident_only(true));
+            let (same, _) = e.perplexity(text, 64, &mut |_, _| {});
+            assert_eq!(base, same, "all experts resident must not change anything");
+
+            let half: Vec<(usize, usize)> = (0..n_layers).flat_map(|l| (0..n_exp / 2).map(move |x| (l, x))).collect();
+            e.set_resident_experts(&half);
+            let (restricted, _) = e.perplexity(text, 64, &mut |_, _| {});
+            assert!(restricted.is_finite());
+            assert_ne!(base, restricted, "half the experts must change the result");
+
+            assert!(!e.set_resident_only(false));
+            let (back, _) = e.perplexity(text, 64, &mut |_, _| {});
+            assert_eq!(base, back, "turning it off restores full routing");
+            println!("[test:resident] ppl full {base:.3} · half the experts resident {restricted:.3}");
+        }
+    }
+
     /// A system prompt loaded from the on-disk cache gives exactly the same reply as one
     /// computed from scratch, and a changed prompt never reuses the old cache.
     #[test]
@@ -4001,6 +4181,7 @@ mod tests {
                 shared: shared.then_some(sh),
                 shared_gate: shared.then_some(sh_gate),
                 moe_prune: 0.0,
+                resident: None,
             };
             let mut got = vec![0.0f32; dim];
             let mut tmp = vec![0.0f32; dim];
@@ -4079,6 +4260,7 @@ mod tests {
             shared: None,
             shared_gate: None,
             moe_prune: 0.0,
+            resident: None,
         };
         let moe_pruned = Moe {
             router,
@@ -4089,6 +4271,7 @@ mod tests {
             shared: None,
             shared_gate: None,
             moe_prune: 0.10,
+            resident: None,
         };
 
         let mut out_full = vec![0.0f32; dim];

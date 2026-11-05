@@ -791,6 +791,11 @@ struct CliConfig {
     tools: bool,
     /// `--bench [runs]`: run the fixed benchmark prompts and exit.
     bench: Option<usize>,
+    /// `--ppl <file>`: print the model's perplexity on a text file and exit.
+    ppl: Option<String>,
+    /// `--resident-experts` / `resident_experts = true`: route MoE tokens only among the
+    /// experts locked in RAM when a share doesn't fit (changes output; measure with --ppl).
+    resident_experts: bool,
     /// `--tui`: launches the full-screen interface (the default; `--no-tui` turns it off).
     tui: bool,
 }
@@ -806,6 +811,7 @@ Usage:
   spindle <model.gguf> --prompt \"...\"   answer one prompt and exit
   spindle <file> --probe                measure RAM and disk read speed
   spindle [model.gguf] --bench [runs]   run fixed benchmark prompts (default 3 runs each)
+  spindle [model.gguf] --ppl <file>     perplexity on a text file (quality check; -n tokens)
 
 Cluster:
   --peer <ip:port>            worker to connect to (client side)
@@ -822,6 +828,8 @@ Model and speed:
   --no-spec                   turn off prompt-lookup speculative decoding
   --draft <model.gguf>        use a small model for speculative drafts instead
   --draft-len <n>             draft tokens per verify step (1..16, default 4)
+  --resident-experts          when this PC's share doesn't fit in RAM, route MoE tokens only
+                              among the experts kept in RAM (no disk reads; changes output)
 
 Chat:
   --tools                     let the model read and edit files and run commands
@@ -891,6 +899,7 @@ fn load_config_file(cfg: &mut CliConfig) {
                 "speculate" => cfg.speculate = val.parse().ok(),
                 "ctx" | "context" => cfg.ctx = val.parse().ok(),
                 "system_prompt" => cfg.system_prompt = Some(val.to_string()),
+                "resident_experts" => cfg.resident_experts = val.parse().unwrap_or(false),
                 _ => {}
             }
         }
@@ -949,6 +958,8 @@ fn parse_cli() -> CliConfig {
         tools: false,
         tui: true,
         bench: None,
+        ppl: None,
+        resident_experts: false,
     };
 
     // Load defaults from spindle.toml if present in current directory
@@ -1089,6 +1100,18 @@ fn parse_cli() -> CliConfig {
                 cfg.draft_len = args[i + 1].parse().ok();
                 i += 2;
             }
+            "--ppl" if i + 1 < args.len() => {
+                cfg.ppl = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--resident-experts" => {
+                cfg.resident_experts = true;
+                i += 1;
+            }
+            "--all-experts" => {
+                cfg.resident_experts = false;
+                i += 1;
+            }
             "--bench" => {
                 let runs = args.get(i + 1).and_then(|v| v.parse::<usize>().ok());
                 cfg.bench = Some(runs.unwrap_or(3).clamp(1, 20));
@@ -1226,6 +1249,7 @@ fn setup_memory(cli: &CliConfig, engine: &mut smollm_chat::SmolLm2Engine, loader
                 }
             });
             pinned = plan.total() as u64;
+            engine.set_resident_experts(&plan.pinned);
             let msg = match (plan.has_stats, plan.coverage) {
                 (true, Some(c)) => format!(
                     "{} in RAM: attention + {} most-used experts ({:.0}% of past picks); the rest read from disk",
@@ -1555,6 +1579,8 @@ fn main() -> Result<()> {
             if let Some(p) = cli.moe_prune {
                 engine.set_moe_prune(p);
             }
+            // Must be set before the system prompt is processed: it changes the KV entries.
+            let resident_active = cli.resident_experts && engine.set_resident_only(true);
             if let Some(prompt) = &cli.system_prompt {
                 engine.set_system_prompt(prompt);
             }
@@ -1577,6 +1603,11 @@ fn main() -> Result<()> {
                     let p = engine.moe_prune();
                     parts.push(if p >= 1.0 { format!("top {} experts", p as usize) } else { format!("expert pruning {p}") });
                 }
+                if resident_active {
+                    parts.push("resident-only experts".into());
+                } else if cli.resident_experts {
+                    parts.push("resident-only experts requested (all fit in RAM: no change)".into());
+                }
                 if engine.enable_tools {
                     parts.push("tools on".into());
                 }
@@ -1585,6 +1616,38 @@ fn main() -> Result<()> {
             // Process the system prompt now, while a progress display is up, rather than as a
             // silent pause before the first reply. The full-screen UI does this on its own
             // loading screen; the line-based chat and one-shot prompts do it here.
+            if let Some(file) = &cli.ppl {
+                let text = match std::fs::read_to_string(file) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("{}", ui::warn(&format!("could not read {file}: {e}")));
+                        std::process::exit(1);
+                    }
+                };
+                let limit = if cli.max_tokens == 32 { 1024 } else { cli.max_tokens };
+                let step = loader.as_ref().map(|l| l.step("Perplexity", &format!("scoring {file}")));
+                let t0 = Instant::now();
+                let (ppl, n) = engine.perplexity(&text, limit, &mut |done, all| {
+                    if let Some(s) = step.as_ref() {
+                        s.progress(done as u64, all as u64, format!("{} / {} tokens", loading::fmt_count(done), loading::fmt_count(all)));
+                    }
+                });
+                if let Some(s) = step {
+                    s.done(&format!("{} tokens scored", loading::fmt_count(n)));
+                }
+                let mut setting = vec![format!("moe_prune {}", engine.moe_prune())];
+                if resident_active {
+                    setting.push("resident-only experts".into());
+                }
+                if let Some(c) = engine.cluster_client.as_ref() {
+                    setting.push(format!("wire {:?}", c.wire_format).to_lowercase());
+                }
+                println!();
+                println!("  {}  {}", ui::bold(&format!("Perplexity {ppl:.3}")), ui::dim(&format!("over {n} tokens · {} · {:.1} s", setting.join(" · "), t0.elapsed().as_secs_f64())));
+                println!("  {}", ui::dim("Lower is better. Compare runs of the same file with different settings."));
+                let _ = engine.save_expert_stats();
+                return Ok(());
+            }
             let uses_tui = cli.tui && cli.chat_mode && cli.raw.is_none() && cli.bench.is_none();
             if cli.raw.is_none() && !uses_tui {
                 let step = loader.as_ref().map(|l| l.step("Prompt", "processing the system prompt"));

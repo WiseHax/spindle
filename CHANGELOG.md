@@ -25,8 +25,20 @@
 - A "Pinning" step on the loading screen shows the progress, what was kept in RAM, and the
   share of past expert picks it covers.
 
+- `--resident-experts` (or `resident_experts = true`), opt-in: when a PC's share doesn't
+  fit, MoE layers pick only among the experts locked in RAM, so nothing is read from disk.
+  This changes the output. On Granite 1B-A400M with pinned experts covering 54% of past picks
+  it ran 2.2x faster but perplexity rose from 7.7 to 29.8, so it is off by default. Measure
+  it on your model and split with `--ppl` before using it. With every expert resident it is
+  exact (tested). On a cluster the worker restricts its own layers to its own pinned set
+  (`FRAME_SET_EXPERT_MODE`, a new frame).
+
 ### Measuring (more)
 
+- `--ppl <file>` prints the model's perplexity on a text file (no chat framing, up to 1,024
+  tokens by default, `-n` to change). Use it to compare settings that change the output:
+  `moe_prune`, `--resident-experts`, the wire format. `tools/ppl_sample.txt` is a ready
+  sample with prose and code.
 - `--bench` on MoE models reports expert usage: how many experts per layer cover 50%, 90%,
   95% and 99% of the picks, and how much RAM those experts take. On two PCs it includes the
   worker's layers (`FRAME_EXPERT_STATS`, a new frame).

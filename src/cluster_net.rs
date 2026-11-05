@@ -59,6 +59,10 @@ pub const FRAME_EXPERT_STATS: u8 = 0x0E;
 /// matching cache (load) or not saved. Older workers don't answer; the client then stops
 /// using the cache on that connection.
 pub const FRAME_PROMPT_CACHE: u8 = 0x0F;
+/// Client -> worker: turn resident-only expert routing on (1) or off (0) for the worker's
+/// layers, using the experts the worker locked in RAM. Reply: `FRAME_SET_EXPERT_MODE` with
+/// one byte, 1 if routing is now restricted on the worker. Older workers don't answer.
+pub const FRAME_SET_EXPERT_MODE: u8 = 0x10;
 pub const PROMPT_CACHE_LOAD: u8 = 0;
 pub const PROMPT_CACHE_SAVE: u8 = 1;
 pub const FRAME_SHUTDOWN: u8 = 0xFF;
@@ -611,6 +615,21 @@ impl ClusterClient {
         }
     }
 
+    /// Turns resident-only routing on or off on the worker. `Some(true)` = restricted there,
+    /// `Some(false)` = not (nothing pinned), `None` = the worker doesn't support it.
+    pub fn set_resident_only(&mut self, on: bool) -> Option<bool> {
+        self.stream.stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+        let res = self
+            .stream
+            .send_frame(FRAME_SET_EXPERT_MODE, WireFormat::Fp32, &[on as u8])
+            .and_then(|_| self.stream.recv_frame());
+        let _ = self.stream.stream.set_read_timeout(None);
+        match res {
+            Ok((hdr, r)) if hdr.frame_type == FRAME_SET_EXPERT_MODE => Some(r.first() == Some(&1)),
+            _ => None,
+        }
+    }
+
     /// Asks the worker to load or save its part of the prompt cache. `Some(true)` = done,
     /// `Some(false)` = no matching cache / not saved, `None` = the worker doesn't support it.
     pub fn prompt_cache(&mut self, op: u8, key: u64, tokens: &[usize]) -> Option<bool> {
@@ -937,6 +956,17 @@ pub fn serve_worker_connection(
             }
             FRAME_KV_INFO => {
                 cs.send_frame(FRAME_KV_INFO, WireFormat::Fp32, &(engine.max_seq as u32).to_le_bytes())?;
+            }
+            FRAME_SET_EXPERT_MODE => {
+                let on = payload.first() == Some(&1);
+                let active = engine.set_resident_only(on);
+                if on {
+                    println!(
+                        "  Resident-only routing {}.",
+                        if active { "on: experts are picked among those in RAM" } else { "requested, but nothing is pinned here, so routing is unchanged" }
+                    );
+                }
+                cs.send_frame(FRAME_SET_EXPERT_MODE, WireFormat::Fp32, &[active as u8])?;
             }
             FRAME_PROMPT_CACHE => {
                 let ok = (|| -> Option<bool> {

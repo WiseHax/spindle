@@ -1,0 +1,39 @@
+The river had been rising for three days before anyone in the valley took it seriously. On the first morning it was only a little higher than usual, brown at the edges where the rain had washed soil from the fields upstream. By the second evening it had covered the lower path that the farmers used to reach the mill, and the children were told to keep away from the bank. On the third day the water reached the bottom step of the old stone bridge, and the people who lived closest to it began moving their animals and their grain to the barns on the hill.
+
+Nobody remembered a flood like the one their grandparents described, but everybody knew the stories. The valley was shaped by water long before the first houses were built. Each spring the snow on the mountains melted, and the river carried sand, gravel and whole trees down toward the plain. Over thousands of years it cut through the rock and spread the loose material across the valley floor. That soil was the reason the farms were so rich, and also the reason the river could change its course without warning.
+
+The engineer who arrived from the city on the fourth day did not talk about stories. She walked along the bank with a measuring pole and a notebook, and she asked the farmers precise questions. How high had the water been at noon? Had the color changed? Were there new channels cutting through the meadow on the far side? When she had enough numbers, she sat at the kitchen table of the mill and drew a simple diagram: the old bed of the river, the new water line, and the narrow place under the bridge where the flow was forced to speed up.
+
+"The bridge is not the problem," she said. "The problem is that the river wants to be wider than the bridge allows. If we give it somewhere to go, it will stop pushing so hard against the stones."
+
+They spent the next week digging a shallow channel across the meadow. It was hard, muddy work, and at first it looked as if it would make no difference. Then, on a quiet evening, the water found the new path. It spread out across the grass, slowed down, and dropped the sand it had been carrying. By morning the level at the bridge had fallen by almost a meter.
+
+Here is a small program that does the kind of calculation the engineer did by hand. It estimates how long a reservoir takes to fill when water flows in at a steady rate and some of it leaves through an outlet.
+
+```python
+def hours_to_fill(capacity_m3, inflow_m3_per_h, outflow_m3_per_h, start_m3=0.0):
+    """Return the number of hours until the reservoir is full, or None if it never fills."""
+    net = inflow_m3_per_h - outflow_m3_per_h
+    if net <= 0:
+        return None
+    remaining = capacity_m3 - start_m3
+    if remaining <= 0:
+        return 0.0
+    return remaining / net
+
+
+def describe(capacity, inflow, outflow):
+    hours = hours_to_fill(capacity, inflow, outflow)
+    if hours is None:
+        return "The reservoir never fills: more water leaves than arrives."
+    days = hours / 24
+    return f"Full in {hours:.1f} hours ({days:.1f} days)."
+
+
+print(describe(50_000, 1_200, 400))
+print(describe(50_000, 300, 400))
+```
+
+The first call prints that the reservoir is full in a little over sixty hours. The second shows the case the farmers feared most: when the outlet takes more than the river brings, the level never rises at all, and the fields downstream stay dry. Good planning is mostly about knowing which of those two situations you are in, and how quickly one can turn into the other.
+
+Years later, the channel in the meadow had become a small stream of its own, lined with willows. Children fished in it in summer. Most of them did not know it had been dug by hand, or that it had saved the bridge. The river, as always, kept carving its slow path through the valley, carrying a little of the mountains toward the sea.
